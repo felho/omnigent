@@ -33,10 +33,12 @@ def _replace_check_constraint(codes: str) -> None:
         # CRDB must publish the drop before reusing the constraint name.
         existing = {row["name"] for row in sa.inspect(bind).get_check_constraints(_TABLE)}
         if _CONSTRAINT in existing:
-            op.drop_constraint(_CONSTRAINT, _TABLE, type_="check")
+            with op.batch_alter_table(_TABLE) as batch_op:
+                batch_op.drop_constraint(_CONSTRAINT, type_="check")
             bind.commit()
             bind.execute(sa.text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
-        op.create_check_constraint(_CONSTRAINT, _TABLE, condition)
+        with op.batch_alter_table(_TABLE) as batch_op:
+            batch_op.create_check_constraint(_CONSTRAINT, condition)
         bind.commit()
         bind.execute(sa.text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
         return

@@ -1941,8 +1941,11 @@ def pi_native_provider_launch(
         ``"high"``. Passed as ``--thinking`` on the primary provider; ignored
         (with a warning) on a gateway-routed model, whose thinking must stay
         off for text to surface.
-    :param selection: Optional picker value used to select a generated provider.
+    :param selection: Optional picker value naming a generated provider and
+        model. When that provider no longer serves the model, the provider that
+        does is used instead.
     :returns: The launch env, CLI args and any effort warning.
+    :raises ValueError: If no generated provider serves the selected model.
     """
     # Render once and reuse: rendering logs how an uncataloged model was routed,
     # and this function both writes the config and reads it back for --provider.
@@ -1957,14 +1960,20 @@ def pi_native_provider_launch(
     )
     if selection_parts is not None:
         candidate_provider, candidate_model = selection_parts
-        configured = rendered["providers"].get(candidate_provider)
-        if not configured or not any(
-            model.get("id") == candidate_model for model in configured.get("models", [])
-        ):
+        serving = [
+            provider_id
+            for provider_id, configured in rendered["providers"].items()
+            if any(model.get("id") == candidate_model for model in configured.get("models", []))
+        ]
+        if not serving:
             raise ValueError(
                 f"Pi model selection {selection!r} is not available in managed configuration"
             )
-        model_provider_id = candidate_provider
+        # A selection names the provider that served the model when it was
+        # picked. The workspace listing may since have routed the model to another
+        # surface, or discovery may have failed and folded it back into the
+        # primary; follow the model, which the rendered config already routed.
+        model_provider_id = candidate_provider if candidate_provider in serving else serving[0]
         selected_model = candidate_model
     else:
         for extra_id, extra_cfg in rendered["providers"].items():

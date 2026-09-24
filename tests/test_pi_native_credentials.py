@@ -938,6 +938,48 @@ def test_provider_launch_accepts_provider_qualified_selection(tmp_path: Path) ->
     ]
 
 
+@pytest.mark.parametrize(
+    ("listing", "selection", "expected_provider"),
+    [
+        # A pre-upgrade selection named the single-family primary; the workspace
+        # listing now serves the model from the Responses surface.
+        (
+            ([{"id": "system.ai.claude-opus-5"}], [{"id": "system.ai.gpt-5"}], [], []),
+            "omnigent/system.ai.gpt-5",
+            "omnigent-openai",
+        ),
+        # The picker offered the model on the Responses surface; discovery then
+        # failed at launch and the single-family fallback owns it again.
+        (None, "omnigent-openai/system.ai.gpt-5", "omnigent"),
+    ],
+    ids=["saved-primary-selection-after-discovery", "picker-selection-after-discovery-failure"],
+)
+def test_inline_databricks_gateway_selection_follows_the_model_across_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    listing: tuple[list, list, list, list] | None,
+    selection: str,
+    expected_provider: str,
+) -> None:
+    """A saved selection launches whichever provider serves its model now."""
+
+    def _fetch(host: str, token: str):
+        if listing is None:
+            raise RuntimeError("workspace listing unavailable")
+        return listing
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _fetch)
+    config = _databricks_openai_gateway_config()
+
+    provider = creds.resolve_pi_native_provider(model=selection, config_loader=lambda: config)
+    assert provider is not None
+    _, args, _ = creds.pi_native_provider_launch(
+        tmp_path / "pi-agent", provider, selection=selection
+    )
+
+    assert args[:4] == ["--provider", expected_provider, "--model", "system.ai.gpt-5"]
+
+
 def test_provider_launch_rejects_unavailable_qualified_selection(tmp_path: Path) -> None:
     """A stale picker value must not silently launch the provider default."""
     provider = creds.PiProviderConfig(

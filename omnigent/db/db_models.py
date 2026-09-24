@@ -1382,14 +1382,8 @@ class SqlHost(OmnigentBase):
         host has never reported it (older host build) — unknown, not
         "nothing configured". Surfaced via ``GET /v1/hosts`` so the web
         agent picker can warn about unconfigured harnesses.
-    :param connect_generation: Epoch-microseconds token stamped by each
-        connect's upsert. Conditional cleanup writes (a failed connect
-        marking its own row offline) compare against it at the DB level,
-        so a superseded connection's guarded cleanup cannot overwrite a
-        newer connect's row — including from another server replica.
-        Offline writes that skip the guard (the registered-connection
-        deregister paths) are not covered. ``NULL`` on rows last written
-        before the column existed.
+    :param connect_generation: Per-connect token for guarded pre-registry
+        cleanup; ``NULL`` on legacy rows. Registered disconnects are unguarded.
     """
 
     __tablename__ = "hosts"

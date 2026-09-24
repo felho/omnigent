@@ -253,10 +253,7 @@ def create_host_tunnel_router(
 
         await ws.accept()
         conn: HostConnection | None = None
-        # Generation token from THIS connect's upsert. Non-None means the row
-        # was persisted; the pre-registry cleanup passes it back so a newer
-        # connect's re-stamped row is left alone (compare-and-update in the
-        # store, so the guard also holds across server replicas).
+        # Keep this upsert's token for pre-registry cleanup.
         host_generation: int | None = None
         stage = "hello"
         try:
@@ -433,10 +430,7 @@ def create_host_tunnel_router(
                 if host_registry.deregister(host_id, conn=conn):
                     await asyncio.to_thread(host_store.set_offline, host_id)
             elif host_generation is not None:
-                # Persisted but never registered: clean up the ghost-online
-                # row — unless a newer connect already re-stamped it, in
-                # which case that connection owns the row and this stale
-                # cleanup must not flip it offline.
+                # Clear this failed connect's ghost-online row if still owned.
                 await asyncio.to_thread(
                     host_store.set_offline_if_generation, host_id, host_generation
                 )

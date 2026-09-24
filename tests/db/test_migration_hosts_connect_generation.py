@@ -1,13 +1,4 @@
-"""Tests for the ``hosts.connect_generation`` column (gb2c3d4e5f6a).
-
-The column holds the epoch-microseconds token stamped by each connect's
-``upsert_on_connect``. Cleanup paths that hold no live registry connection
-mark the row offline via a compare-and-update against this token
-(``HostStore.set_offline_if_generation``), so a superseded connection
-cannot overwrite a newer connect's online row. NULL means the row was
-last written before the column existed — a NULL token never matches, so
-legacy rows are never conditionally offlined.
-"""
+"""Schema checks for nullable host connect-generation tokens."""
 
 from __future__ import annotations
 
@@ -28,11 +19,7 @@ from omnigent.db.utils import (
 
 @pytest.fixture
 def db_engine(tmp_path: Path) -> Iterator[Engine]:
-    """Fresh SQLite database with the full migration chain applied.
-
-    :param tmp_path: Pytest-managed temp directory for the SQLite file.
-    :returns: Engine pointed at the migrated database.
-    """
+    """Fresh SQLite database with the full migration chain applied."""
     db_path = tmp_path / "test.db"
     uri = f"sqlite:///{db_path}"
     engine = get_or_create_engine(uri)
@@ -43,14 +30,7 @@ def db_engine(tmp_path: Path) -> Iterator[Engine]:
 
 
 def test_connect_generation_column_present_and_nullable(db_engine: Engine) -> None:
-    """The migration adds ``hosts.connect_generation`` as nullable BIGINT.
-
-    (1) The column must exist — without it every connect's upsert crashes
-    on the ORM mapping. (2) It must be nullable — rows last written before
-    the column existed carry no token, and NULL-never-matches is the
-    documented legacy behaviour. (3) It must be a big integer: epoch-µs
-    exceeds int32.
-    """
+    """The migration adds a nullable BIGINT, including for legacy rows."""
     cols = sa.inspect(db_engine).get_columns("hosts")
     matches = [c for c in cols if c["name"] == "connect_generation"]
     assert len(matches) == 1, (
@@ -73,7 +53,6 @@ def test_downgrade_drops_connect_generation(tmp_path: Path) -> None:
     uri = f"sqlite:///{db_path}"
     engine = get_or_create_engine(uri)
 
-    # Sanity: head state before downgrade.
     cols = {c["name"] for c in sa.inspect(engine).get_columns("hosts")}
     assert "connect_generation" in cols
 

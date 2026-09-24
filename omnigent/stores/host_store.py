@@ -89,12 +89,8 @@ class Host:
         ``{"claude-sdk": True, "codex": False}``. ``None`` when the
         host has never reported it (older host build) — unknown, not
         "nothing configured".
-    :param connect_generation: Token identifying the connect that last
-        upserted this row (epoch microseconds). Guards conditional
-        writes such as :meth:`HostStore.set_offline_if_generation` so a
-        superseded connection's cleanup cannot clobber a newer
-        connect's row. ``None`` for rows never connected since the
-        column was added.
+    :param connect_generation: Per-connect epoch-µs token for guarded cleanup;
+        ``None`` on legacy rows.
     """
 
     host_id: str
@@ -318,14 +314,10 @@ class HostStore:
         :param managed_token: Raw launch token for a managed host. When set,
             registration atomically revalidates the current credential instead
             of performing the external-host upsert path.
-        :returns: The upserted :class:`Host`. Its ``connect_generation``
-            identifies THIS connect's write; cleanup paths pass it to
-            :meth:`set_offline_if_generation` so a superseded connect
-            cannot clobber a newer one's row.
+        :returns: The upserted :class:`Host` with this connect's token.
         """
         now = now_epoch()
-        # Epoch-µs so two connects for the same host within one second
-        # still get distinct, ordered generations.
+        # The cleanup guard compares tokens for equality, not time ordering.
         connect_generation = now_epoch_us()
         harnesses_json = (
             json.dumps(configured_harnesses) if configured_harnesses is not None else None
@@ -353,9 +345,6 @@ class HostStore:
                             status=encode_host_status("online"),
                             updated_at=now,
                             configured_harnesses=harnesses_json,
-                            # Managed connects stamp a generation like every
-                            # other connect path, so a superseded managed
-                            # connect's cleanup cannot clobber a newer one.
                             connect_generation=connect_generation,
                         )
                     ),
@@ -663,28 +652,10 @@ class HostStore:
         run_write_transaction(self._session_immediate, "set_host_offline", write)
 
     def set_offline_if_generation(self, host_id: str, generation: int | None) -> bool:
-        """
-        Mark a host offline only if its row still belongs to *generation*.
+        """Offline only this connect's row, returning whether the DB row changed.
 
-        The generation-safe variant of :meth:`set_offline` for cleanup
-        that may have been superseded: a connect that persisted its row
-        (``upsert_on_connect``) but failed before registering holds no
-        :class:`~omnigent.server.host_registry.HostConnection` to guard
-        with, so its offline cleanup compares the row's
-        ``connect_generation`` at the DB level instead. If a newer
-        connect already re-stamped the row, the UPDATE matches nothing
-        and the newer connection's online status survives — including
-        when that connect landed on another server replica, which an
-        in-memory registry check could never see.
-
-        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
-        :param generation: The ``connect_generation`` this cleanup's
-            connect stamped (from the :class:`Host` that
-            ``upsert_on_connect`` returned). ``None`` never matches —
-            a caller without a token must not blind-write.
-        :returns: ``True`` when the row was marked offline; ``False``
-            when a newer generation owns the row (or it no longer
-            exists), i.e. this cleanup was superseded.
+        The SQL comparison works across replicas; ``None`` never matches.
+        Registered disconnects use the separate unguarded :meth:`set_offline`.
         """
         if generation is None:
             return False

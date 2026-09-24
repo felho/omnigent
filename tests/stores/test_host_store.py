@@ -462,13 +462,7 @@ def test_set_offline_noop_for_unknown_host(
 def test_upsert_stamps_a_fresh_connect_generation(
     host_store: HostStore,
 ) -> None:
-    """Every connect's upsert must stamp a new, ordered generation token.
-
-    The token is what lets a failed connect's cleanup detect that a
-    newer connect owns the row. If reconnects reused or regressed the
-    generation, a stale cleanup would still match and clobber the newer
-    row.
-    """
+    """Reconnects stamp distinct tokens for guarded cleanup."""
     first = host_store.upsert_on_connect(
         host_id="5f2e1d0c9b8a77665544332211009988",
         name="laptop",
@@ -482,20 +476,14 @@ def test_upsert_stamps_a_fresh_connect_generation(
         user_id="dana@example.com",
     )
     assert second.connect_generation is not None
-    # Distinctness is the invariant the guard needs (equality match), not
-    # ordering — the token is wall-clock and could step backwards.
+    # Equality drives the guard; wall time need not increase.
     assert second.connect_generation != first.connect_generation
 
 
 def test_set_offline_if_generation_matches_current_row(
     host_store: HostStore,
 ) -> None:
-    """The guarded offline write applies when the row is still this connect's.
-
-    A connect that persisted its row and then failed before registering
-    is the last writer — its cleanup must still be able to clear the
-    ghost-online row.
-    """
+    """Guarded cleanup offlines its still-current row."""
     host = host_store.upsert_on_connect(
         host_id="6a3f2e1d0c9b88776655443322110099",
         name="laptop",
@@ -511,12 +499,7 @@ def test_set_offline_if_generation_matches_current_row(
 def test_set_offline_if_generation_skips_superseded_writer(
     host_store: HostStore,
 ) -> None:
-    """A stale generation must not offline a row a newer connect re-stamped.
-
-    This is the A-fails/B-connects/A-cleans-up race at the store layer:
-    A's held cleanup runs after B's upsert, so A's token no longer
-    matches and B's online row must survive.
-    """
+    """A stale token cannot offline a newer connect's row."""
     stale = host_store.upsert_on_connect(
         host_id="7b4a3f2e1d0c99887766554433221100",
         name="laptop",
@@ -538,12 +521,7 @@ def test_set_offline_if_generation_skips_superseded_writer(
 def test_set_offline_if_generation_rejects_none_token(
     host_store: HostStore,
 ) -> None:
-    """A caller without a token must never blind-write offline.
-
-    ``None`` (a legacy row's generation, or a connect that never
-    persisted) matching anything would reintroduce the unguarded write
-    this method exists to prevent.
-    """
+    """A missing token cannot authorize an offline write."""
     host = host_store.upsert_on_connect(
         host_id="8c5b4a3f2e1d00998877665544332211",
         name="laptop",
@@ -564,13 +542,7 @@ def test_set_offline_if_generation_false_for_unknown_host(
 
 
 def test_managed_connect_stamps_fresh_connect_generation(db_uri: str) -> None:
-    """Managed connects stamp generations like external ones.
-
-    The managed-token path updates the row directly instead of going
-    through the external upsert; if it skipped the generation stamp,
-    two managed connects would share a stale token and a superseded
-    one's cleanup could offline the newer connection's row.
-    """
+    """Managed-token connects also stamp fresh cleanup tokens."""
     store = HostStore(db_uri)
     store.register_managed_host(
         host_id="ad7e6f5a4b3c22110099887766554433",
@@ -597,10 +569,8 @@ def test_managed_connect_stamps_fresh_connect_generation(db_uri: str) -> None:
         managed_token="raw-launch-token-gen",
     )
     assert second.connect_generation is not None
-    # Distinctness, not ordering — see test_upsert_stamps_a_fresh_connect_generation.
     assert second.connect_generation != first.connect_generation
 
-    # The superseded connect's guarded cleanup must not offline the row.
     assert store.set_offline_if_generation(first.host_id, first.connect_generation) is False
     fetched = store.get_host(first.host_id)
     assert fetched is not None

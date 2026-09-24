@@ -42,6 +42,8 @@ def _isolate_cli_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     # ~/.databrickscfg, or gcloud ADC would otherwise flip these verdicts.
     for var in (
         "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
         "OPENAI_API_KEY",
         "OPENROUTER_API_KEY",
         "ANTIGRAVITY_API_KEY",
@@ -974,6 +976,28 @@ def test_sdk_harness_ready_via_global_auth_block(
     result = configured_harness_map()
     assert result["claude-sdk"] is True
     assert result["openai-agents"] is True
+
+
+@pytest.mark.parametrize("token_var", ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN"])
+def test_claude_sdk_ready_via_ambient_claude_token_env(
+    monkeypatch: pytest.MonkeyPatch,
+    token_var: str,
+) -> None:
+    """Ambient Claude token env credentials count for claude-sdk readiness.
+
+    The host forwards ``CLAUDE_CODE_OAUTH_TOKEN`` (``claude setup-token``
+    subscription auth) and ``ANTHROPIC_AUTH_TOKEN`` (gateway bearer, paired
+    with ``ANTHROPIC_BASE_URL``) to its runners, and Claude Code resolves them
+    directly, so a token-only host must not read ``needs-auth``.
+    """
+    _no_clis_installed(monkeypatch)
+    monkeypatch.setenv(token_var, "token-test-value")
+    if token_var == "ANTHROPIC_AUTH_TOKEN":
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gateway.example.com")
+    result = configured_harness_map()
+    assert result["claude-sdk"] is True
+    # The token serves only the anthropic family; openai-agents stays warned.
+    assert result["openai-agents"] == "needs-auth"
 
 
 def test_sdk_harness_ready_via_non_default_family_provider(

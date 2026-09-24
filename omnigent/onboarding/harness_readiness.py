@@ -477,6 +477,26 @@ def _ambient_family_env_key_configured(family: str) -> bool:
     return False
 
 
+def _claude_token_env_configured() -> bool:
+    """Whether an ambient Claude token env credential is visible.
+
+    The host forwards these to its runners (the harness credential allowlist
+    in :mod:`omnigent.host.connect`) and Claude Code resolves them directly:
+    ``CLAUDE_CODE_OAUTH_TOKEN`` (``claude setup-token`` subscription auth) and
+    ``ANTHROPIC_AUTH_TOKEN`` (gateway bearer, usually paired with
+    ``ANTHROPIC_BASE_URL``), including their ``OMNIGENT_``-prefixed variants.
+    Env reads only; never raises.
+
+    :returns: ``True`` when either token variable is set and non-empty.
+    """
+    from omnigent.util.env_credentials import getenv_nonempty_with_omnigent_prefix
+
+    return any(
+        getenv_nonempty_with_omnigent_prefix(var) is not None
+        for var in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN")
+    )
+
+
 def _claude_code_login_configured() -> bool:
     """Whether Claude Code's own subscription login is present on this machine.
 
@@ -655,7 +675,9 @@ def _sdk_harness_availability(canonical: str) -> HarnessAvailability:
     if family is not None and _ambient_family_env_key_configured(family):
         return True
     if family == ANTHROPIC_FAMILY and (
-        _claude_managed_gateway_configured() or _claude_code_login_configured()
+        _claude_token_env_configured()
+        or _claude_managed_gateway_configured()
+        or _claude_code_login_configured()
     ):
         return True
     if _databricks_workspace_configured():

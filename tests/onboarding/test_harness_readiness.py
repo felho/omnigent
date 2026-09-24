@@ -57,8 +57,8 @@ def _isolate_cli_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
         monkeypatch.delenv(var, raising=False)
         monkeypatch.delenv(f"OMNIGENT_{var}", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))  # ~/.databrickscfg, gcloud ADC, …
-    import omnigent.onboarding.ambient as _ambient
     import omnigent.onboarding.databricks_config as _dbc
+    from omnigent.onboarding import ambient as _ambient
 
     monkeypatch.setattr(_ambient, "_claude_login_detected", lambda: False)
     monkeypatch.setattr(
@@ -885,7 +885,7 @@ def test_claude_sdk_ready_via_claude_code_login(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Claude Code's own login serves claude-sdk (the SDK drives that CLI)."""
-    import omnigent.onboarding.ambient as ambient
+    from omnigent.onboarding import ambient
 
     _no_clis_installed(monkeypatch)
     monkeypatch.setattr(ambient, "_claude_login_detected", lambda: True)

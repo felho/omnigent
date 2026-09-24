@@ -1,39 +1,4 @@
-"""E2E: no phantom "1 other agent working in this directory" on default launch.
-
-On a default launch the user ends up with exactly one session — the one the
-launch itself created — and it sits idle with its runner attached. Opening
-the new-session composer and browsing the directory selector to that same
-default directory shows the warning "1 other agent is working in this
-directory. Write operations may conflict — name a git branch to work in an
-isolated copy." even though the user has no other session and nothing is
-working.
-
-Mechanism under test: ``NewChatDialog.occupancyByDir`` counts every session
-on the selected host whose runner tunnel is online (``runnerHealth``), with
-no working/idle distinction, and ``WorkspacePicker`` phrases that count as
-"N other agent(s) ... working". A sole idle session therefore reads as a
-phantom "other agent".
-
-Journey (all through the real SPA against the live test server; the host
-side is an in-test host connected over the real ``/v1/hosts/{id}/tunnel``
-WebSocket that serves the *real local filesystem* and spawns *real runner
-processes* on launch frames — the same contract as ``omnigent host``):
-
-1. Default-launch state: from the landing, pick the ``hello_world`` agent,
-   the host, and the ``project`` directory; send a prompt. The server
-   launches a real runner through the host, the mock-LLM turn completes,
-   and the session goes idle with its runner still online.
-2. New session (default state): click "New chat", select the same host, and
-   open the directory selector at the same directory.
-3. Expected: no conflict warning — the only session there is the user's own
-   and it is idle, so no *other* agent is *working* in the directory.
-   Buggy build: the ``workspace-picker-conflict`` banner claims "1 other
-   agent is working in this directory".
-
-The async-in-a-fresh-thread shape is inherited from
-``test_start_session.py`` (pytest-asyncio can't start a loop on the main
-thread once a sync pytest-playwright test has run in the session).
-"""
+"""An idle session must not trigger the directory-conflict warning."""
 
 from __future__ import annotations
 
@@ -96,16 +61,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _resolve(path: str, home: Path) -> Path:
-    """Resolve a host-frame path against the fake host's home directory.
-
-    Mirrors what ``omnigent host`` does on a POSIX machine: ``""`` and
-    ``"~"`` mean the host owner's home, ``"~/x"`` expands under it, and an
-    absolute path is taken as-is.
-
-    :param path: Path as received in a host frame.
-    :param home: The fake host's home directory (a real local dir).
-    :returns: The resolved local filesystem path.
-    """
+    """Resolve a host-frame path against the test host's home directory."""
     if path in ("", "~"):
         return home
     if path.startswith("~/"):
@@ -114,13 +70,7 @@ def _resolve(path: str, home: Path) -> Path:
 
 
 class _LocalHost:
-    """A host daemon stand-in serving the real local filesystem.
-
-    Answers filesystem frames from the real disk and spawns **real runner
-    processes** on launch frames — the same observable contract as a real
-    ``omnigent host`` daemon, so the server-side session rows (host_id,
-    workspace, runner binding) are produced by the production code paths.
-    """
+    """Answer host frames from disk and launch real runner subprocesses."""
 
     def __init__(self, base_url: str, mock_llm_url: str, home: Path, log_dir: Path) -> None:
         self.base_url = base_url
@@ -132,8 +82,7 @@ class _LocalHost:
     def _spawn_runner(self, frame: HostLaunchRunnerFrame) -> str:
         """Spawn a real runner for a launch frame and return its runner id."""
         runner_id = token_bound_runner_id(frame.binding_token)
-        # Start from a clean env: drop any ambient runner/host wiring so the
-        # child doesn't take a zygote/tunnel path meant for another process.
+        # Do not inherit another runner's or host's identity.
         env = {
             k: v
             for k, v in os.environ.items()
@@ -141,11 +90,7 @@ class _LocalHost:
         }
         env.update(
             {
-                # Import omnigent from this worktree, not a stale install.
-                # ``sdks/python-client`` and ``sdks/ui`` are needed by the
-                # runner's managed owner-JWT mint (``omnigent_client`` and
-                # ``omnigent_ui_sdk`` imports), the auth path a host-launched
-                # runner takes with no stored credential.
+                # Include candidate SDKs used by managed runner auth.
                 "PYTHONPATH": os.pathsep.join(
                     [
                         str(_REPO_ROOT),
@@ -159,7 +104,6 @@ class _LocalHost:
                 "OMNIGENT_RUNNER_WORKSPACE": frame.workspace,
                 "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
                 "RUNNER_SERVER_URL": self.base_url,
-                # Route the harness at the suite's mock LLM server.
                 "OPENAI_BASE_URL": f"{self.mock_llm_url}/v1",
                 "OPENAI_API_KEY": "mock-key",
             }
@@ -269,19 +213,14 @@ class _LocalHost:
 
 
 async def _serve_host(ws: Any, host: _LocalHost) -> None:
-    """Answer host frames on the tunnel like the host daemon does.
-
-    :param ws: The connected ``websockets`` client connection.
-    :param host: The local-host state (filesystem root + spawned runners).
-    """
+    """Serve host frames over the real tunnel with the local test host."""
     async for raw in ws:
         if not isinstance(raw, str):
             continue
         try:
             frame = decode_host_frame(raw)
         except ValueError:
-            # Tunnel keepalive: the server pings with the runner-tunnel
-            # encoding; answer with a pong the way the real daemon does.
+            # The server uses runner-tunnel encoding for keepalive pings.
             try:
                 runner_frame = decode_frame(raw)
             except ValueError:
@@ -296,12 +235,7 @@ async def _serve_host(ws: Any, host: _LocalHost) -> None:
 
 @contextlib.asynccontextmanager
 async def _local_host(host: _LocalHost) -> AsyncIterator[str]:
-    """Connect the local host to the live server's host tunnel.
-
-    :param host: The local-host state to serve.
-    :returns: Async context manager yielding the host id the server's REST
-        surface reports for this host (the spelling the SPA's testids use).
-    """
+    """Connect the test host and yield its server-assigned ID."""
     import websockets
 
     host_id = uuid.uuid4().hex
@@ -313,8 +247,7 @@ async def _local_host(host: _LocalHost) -> AsyncIterator[str]:
                     version="0.0.0-e2e",
                     frame_protocol_version=1,
                     name=_HOST_NAME,
-                    # hello_world's harness must read as configured on this
-                    # host or the landing warns and the launch is refused.
+                    # The landing requires hello_world's harness to be configured.
                     configured_harnesses={
                         "openai-agents": True,
                         "agents_sdk": True,
@@ -350,21 +283,13 @@ async def _local_host(host: _LocalHost) -> AsyncIterator[str]:
 
 
 def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* to completion in a dedicated thread with its own event loop.
-
-    Same rationale as ``test_start_session.py``: once a sync
-    pytest-playwright test has run in the session, pytest-asyncio can't
-    start a loop on the main thread. Exceptions (assertion failures
-    included) re-raise on the caller's thread.
-
-    :param coro: The coroutine to drive.
-    """
+    """Use a fresh loop after sync Playwright; re-raise worker failures."""
     error: list[BaseException] = []
 
     def _worker() -> None:
         try:
             asyncio.run(coro)
-        except BaseException as exc:  # noqa: BLE001 — re-raised below
+        except BaseException as exc:
             error.append(exc)
 
     thread = threading.Thread(target=_worker, daemon=True)
@@ -375,12 +300,7 @@ def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
 
 
 async def _wait_session_idle(base_url: str, session_id: str, *, timeout_s: float = 90.0) -> None:
-    """Poll the session until the server reports it idle.
-
-    :param base_url: Live server base URL.
-    :param session_id: The session to watch.
-    :param timeout_s: Max seconds to wait before failing the test.
-    """
+    """Poll until the session becomes idle or the deadline expires."""
     deadline = time.monotonic() + timeout_s
     last = "<never fetched>"
     async with httpx.AsyncClient() as client:
@@ -395,12 +315,7 @@ async def _wait_session_idle(base_url: str, session_id: str, *, timeout_s: float
 
 
 async def _drive(base_url: str, mock_llm_url: str, tmp_path: Path) -> None:
-    """Drive the full user journey and assert the default state stays clean.
-
-    :param base_url: Live server base URL.
-    :param mock_llm_url: Mock LLM server base URL.
-    :param tmp_path: Per-test temp dir (fake host home + runner logs).
-    """
+    """Launch, idle, reopen the picker, and check for a warning."""
     marker = uuid.uuid4().hex[:8]
     prompt = f"idle-occupancy hello {marker}"
     reply = f"idle-occupancy-reply-{marker}"
@@ -415,7 +330,6 @@ async def _drive(base_url: str, mock_llm_url: str, tmp_path: Path) -> None:
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
 
-    # The hello_world agent the spawned server pre-registers.
     async with httpx.AsyncClient() as client:
         agents = (await client.get(f"{base_url}/v1/agents", timeout=10.0)).json()["data"]
     agent_id = next(a["id"] for a in agents if a["name"] == "hello_world")
@@ -426,25 +340,20 @@ async def _drive(base_url: str, mock_llm_url: str, tmp_path: Path) -> None:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
         try:
-            # ── Step 1: the default-launch session ──────────────────────
             await page.goto(base_url)
             await expect(page.get_by_test_id("new-chat-landing")).to_be_visible(timeout=15_000)
 
-            # Agent: hello_world (a session-discovered custom agent — it may
-            # sit top-level or under the "Custom agents" flyout).
+            # Custom agents may be nested in the flyout.
             await page.get_by_test_id("new-chat-landing-agent-select").click()
             agent_row = page.get_by_test_id(f"new-chat-landing-agent-{agent_id}")
             if not await agent_row.is_visible():
                 await page.get_by_test_id("new-chat-landing-custom-agents").click()
             await agent_row.click()
 
-            # Host: the connected local host.
             await page.get_by_test_id("new-chat-landing-host-chip").click()
             await page.get_by_test_id(f"new-chat-landing-host-{host_id}").click()
 
-            # Directory: browse home → project in the picker. Let the chip
-            # settle on the resolved host home first — opening the popover
-            # mid-resolution detaches its "Open folder" row.
+            # Opening before home resolves can detach the picker row.
             workspace_chip = page.get_by_test_id("new-chat-landing-workspace-chip")
             await expect(workspace_chip).to_contain_text(home.name, timeout=15_000)
             await expect(workspace_chip).to_be_enabled()
@@ -459,21 +368,16 @@ async def _drive(base_url: str, mock_llm_url: str, tmp_path: Path) -> None:
             )
             await commit_landing_workspace_picker(page)
 
-            # Send the first prompt — the server launches a real runner
-            # through the host and runs the turn against the mock LLM.
             await page.get_by_test_id("new-chat-landing-input").fill(prompt)
             await page.get_by_test_id("new-chat-landing-submit").click()
             await page.wait_for_url("**/c/**", timeout=60_000)
             await expect(page.get_by_text(reply)).to_be_visible(timeout=180_000)
-            # The SPA navigates to an optimistic temp:* URL first; the real
-            # session id replaces it once the server acknowledges the create.
+            # Wait for the optimistic temp URL to become a persisted session ID.
             await page.wait_for_url(re.compile(r"/c/(?!temp)"), timeout=30_000)
             session_id = page.url.rstrip("/").split("/c/")[-1].split("?")[0]
             await _wait_session_idle(base_url, session_id)
 
-            # Precondition (keeps the final assertion pinned to THIS bug):
-            # exactly one session occupies the project dir on this host, it
-            # is the user's own, it is idle, and its runner is online.
+            # Verify that the sole occupant is this idle, connected session.
             async with httpx.AsyncClient() as client:
                 listed = (
                     await client.get(f"{base_url}/v1/sessions?limit=200", timeout=10.0)
@@ -491,13 +395,11 @@ async def _drive(base_url: str, mock_llm_url: str, tmp_path: Path) -> None:
                 ).json()
             assert health["sessions"][session_id]["runner_online"] is True, health
 
-            # ── Step 2: new session, default state ──────────────────────
             await page.get_by_test_id("new-chat-button").click()
             await expect(page.get_by_test_id("new-chat-landing")).to_be_visible(timeout=15_000)
             await page.get_by_test_id("new-chat-landing-host-chip").click()
             await page.get_by_test_id(f"new-chat-landing-host-{host_id}").click()
 
-            # Directory selector at the same (default) directory.
             await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_be_enabled(
                 timeout=15_000
             )
@@ -511,10 +413,7 @@ async def _drive(base_url: str, mock_llm_url: str, tmp_path: Path) -> None:
                 timeout=10_000
             )
 
-            # ── Step 3: no phantom "other agent" warning ────────────────
-            # The dwell covers a full runner-health poll cycle (10s) so the
-            # occupancy signal has certainly resolved before we conclude
-            # the banner stays absent.
+            # Observe through one runner-health poll before concluding.
             conflict = page.get_by_test_id("workspace-picker-conflict")
             appeared = True
             try:
@@ -546,15 +445,5 @@ def test_default_state_directory_picker_has_no_conflict_warning(
     mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
-    """A sole idle session must not trip the "other agent working" warning.
-
-    After a default launch (one session of the user's own, idle, runner
-    attached), opening the new-session directory selector at that session's
-    directory must NOT warn "1 other agent is working in this directory" —
-    nothing else is working there.
-
-    :param live_server: Spawned server fixture (base URL).
-    :param mock_llm_server_url: Session-scoped mock LLM server URL.
-    :param tmp_path: Per-test temp dir for the host home and runner logs.
-    """
+    """A sole idle session must not trigger an occupied-directory hint."""
     _run_in_fresh_loop(_drive(live_server, mock_llm_server_url, tmp_path))

@@ -546,16 +546,9 @@ describe("normalizeWorkspacePath", () => {
   });
 });
 
-// The warning's count comes from this filter. The table pins both the positive
-// match (incl. trailing-slash normalization on either side) and every reason
-// a session must NOT count — wrong host, wrong dir, null workspace, offline
-// runner, parked idle — so the warning can't fire on unrelated/dead/idle
-// sessions. `offline` lists ids whose runner is down; the rest are treated as
-// online.
+// `offline` lists runner IDs that cannot occupy the directory.
 describe("sessionsSharingDirectory", () => {
-  // Working online sessions sharing /repo on host_1 = a + b; the rest are
-  // decoys, each covering one non-match reason (all running, so nothing is
-  // excluded for a second reason).
+  // Only a and b work in /repo on host_1.
   const base: Conversation[] = [
     conv({ id: "a", host_id: "host_1", workspace: "/repo", status: "running" }),
     conv({ id: "b", host_id: "host_1", workspace: "/repo/", status: "running" }),
@@ -626,9 +619,6 @@ describe("sessionsSharingDirectory", () => {
       expected: ["a"],
     },
     {
-      // A session parked idle after its turn isn't working in the directory,
-      // even though its runner stays attached — otherwise a default launch
-      // would always warn about the user's own sole session.
       name: "excludes a session parked idle whose runner is still online",
       sessions: [conv({ id: "i", host_id: "host_1", workspace: "/repo", status: "idle" })],
       hostId: "host_1",
@@ -637,9 +627,7 @@ describe("sessionsSharingDirectory", () => {
       expected: [],
     },
     {
-      // openui excludes only *disconnected* agents, not errored ones — a
-      // failed session whose runner is still online occupies the dir. The
-      // idle exclusion must not over-reach to errored sessions.
+      // Failed-but-connected sessions still occupy the directory.
       name: "counts a failed session whose runner is still online",
       sessions: [conv({ id: "f", host_id: "host_1", workspace: "/repo", status: "failed" })],
       hostId: "host_1",
@@ -648,8 +636,7 @@ describe("sessionsSharingDirectory", () => {
       expected: ["f"],
     },
     {
-      // No status on the row (older server / focused test router) — fail
-      // safe toward warning rather than silently dropping the hint.
+      // Older rows without status err toward warning.
       name: "counts a session with no status field",
       sessions: [conv({ id: "u", host_id: "host_1", workspace: "/repo", status: undefined })],
       hostId: "host_1",
@@ -4853,9 +4840,6 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("shows a conflict banner in the file browser for an occupied directory", async () => {
-    // A session actively working in the seeded workspace
-    // ("/Users/corey/repo") on the auto-selected host occupies the directory
-    // the picker opens at.
     useDirectorySessionsMock.mockReturnValue({
       data: [
         conv({ id: "s1", host_id: "host_1", workspace: "/Users/corey/repo", status: "running" }),
@@ -4877,9 +4861,6 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("shows no conflict banner when the directory's only session sits idle", async () => {
-    // The default-launch shape: the user's sole session finished its turn and
-    // parked idle in the seeded workspace with its runner still attached.
-    // Nothing is working there, so browsing to it must not warn.
     useDirectorySessionsMock.mockReturnValue({
       data: [conv({ id: "s1", host_id: "host_1", workspace: "/Users/corey/repo", status: "idle" })],
     } as unknown as ReturnType<typeof useDirectorySessions>);

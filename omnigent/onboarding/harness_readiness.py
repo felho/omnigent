@@ -390,6 +390,41 @@ def _family_provider_configured(harness: str) -> bool:
     return provider is not None and provider.kind != SUBSCRIPTION_KIND
 
 
+def _family_fallback_provider_configured(harness: str) -> bool:
+    """Whether ANY non-subscription provider entry serves *harness*'s family.
+
+    Mirrors the launch-time last resort: with no family default configured,
+    the runner's spawn-env resolution still credentials the head from the
+    first configured provider serving the family
+    (:func:`~omnigent.onboarding.provider_config.first_available_provider`,
+    consumed with ``for_launch=True`` in :mod:`omnigent.runtime.workflow`), so
+    such an entry is a real credential source even though it is not the
+    default. ``subscription``-kind entries are skipped for the same reason as
+    in :func:`_family_provider_configured`. Local config reads only; never
+    raises.
+
+    :param harness: A canonical SDK harness id, e.g. ``"claude-sdk"``.
+    :returns: ``True`` when a non-subscription provider entry serves the
+        harness's family.
+    """
+    family = _HARNESS_FAMILY.get(harness)
+    if family is None:
+        return False
+    try:
+        from omnigent.onboarding.provider_config import first_available_provider
+
+        provider = first_available_provider(load_config(), family)
+    except Exception as exc:
+        # Class-only: provider config errors may embed credential material.
+        _logger.debug(
+            "readiness: fallback provider check failed for %r (%s)",
+            harness,
+            type(exc).__name__,
+        )
+        return False
+    return provider is not None and provider.kind != SUBSCRIPTION_KIND
+
+
 def _claude_managed_gateway_configured() -> bool:
     """Whether Claude Code's own settings chain carries a usable credential.
 
@@ -611,6 +646,8 @@ def _sdk_harness_availability(canonical: str) -> HarnessAvailability:
     if canonical == "antigravity":
         return True if _antigravity_credential_configured() else HARNESS_NEEDS_AUTH
     if _family_provider_configured(canonical):
+        return True
+    if _family_fallback_provider_configured(canonical):
         return True
     if _global_auth_configured():
         return True

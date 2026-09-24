@@ -976,6 +976,41 @@ def test_sdk_harness_ready_via_global_auth_block(
     assert result["openai-agents"] is True
 
 
+def test_sdk_harness_ready_via_non_default_family_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured non-default family provider counts as an SDK credential.
+
+    Launch resolution falls back to the first provider entry serving the
+    family when no default is configured (``first_available_provider``,
+    consumed with ``for_launch=True`` in the runtime), so readiness must not
+    report ``needs-auth`` for a host whose only credential is a non-default
+    provider entry serving the harness's family.
+    """
+    _no_clis_installed(monkeypatch)
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "providers": {
+                    "work-anthropic": {
+                        "kind": "key",
+                        "anthropic": {
+                            "base_url": "https://api.example.com/v1",
+                            "api_key_ref": "env:WORK_ANTHROPIC_KEY",
+                        },
+                    }
+                }
+            }
+        )
+    )
+    result = configured_harness_map()
+    assert result["claude-sdk"] is True
+    # No provider serves the openai family here, so openai-agents must still
+    # read needs-auth - the fallback is per-family, not a global pass.
+    assert result["openai-agents"] == "needs-auth"
+
+
 def test_malformed_databricks_config_contents_never_reach_logs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

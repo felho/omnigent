@@ -12482,3 +12482,106 @@ async def test_overlapping_duplicates_share_the_first_dispatch_outcome(
     finally:
         await fake_runner.aclose()
         pending_inputs.reset_for_tests()
+
+
+async def test_stable_id_naming_a_different_item_is_rejected(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
+) -> None:
+    """
+    A chosen stable_id must be this very message, not any existing item.
+
+    The store dedupes on the id, so without this check a new prompt posted
+    under an assistant message's id (or another user message's id) would be
+    forwarded and run while the transcript keeps only the old item. Such a
+    collision is refused before anything is dispatched.
+    """
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.runtime import pending_inputs
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    forwards: list[httpx.Request] = []
+
+    def runner_handler(request: httpx.Request) -> httpx.Response:
+        forwards.append(request)
+        return httpx.Response(202, json={"queued": True})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(runner_handler), base_url="http://runner"
+    )
+
+    async def get_runner_client(_session_id: str, _runner_router: object) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr("omnigent.server.routes.sessions._get_runner_client", get_runner_client)
+    assistant_id = "5" * 32
+    other_user_id = "6" * 32
+    store = SqlAlchemyConversationStore(db_uri)
+    store.append(
+        session["id"],
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_prev",
+                data=MessageData(
+                    role="assistant",
+                    agent="tester",
+                    content=[{"type": "output_text", "text": "earlier reply"}],
+                ),
+                stable_id=assistant_id,
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_prev2",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "older ask"}]
+                ),
+                stable_id=other_user_id,
+            ),
+        ],
+    )
+    pending_inputs.reset_for_tests()
+    try:
+        for stolen in (assistant_id, other_user_id):
+            response = await client.post(
+                f"/v1/sessions/{session['id']}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "run this instead"}],
+                        "stable_id": stolen,
+                    },
+                },
+            )
+            assert response.status_code == 400, response.text
+        # The genuine re-send of the older user message still resolves.
+        again = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "older ask"}],
+                    "stable_id": other_user_id,
+                },
+            },
+        )
+        assert again.status_code == 202, again.text
+    finally:
+        await fake_runner.aclose()
+        pending_inputs.reset_for_tests()
+    # Nothing under a stolen id reached the runner; the genuine re-send did (its
+    # first delivery never ran, so it dispatches once).
+    assert len(forwards) == 1
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    texts = [
+        block["text"]
+        for item in items
+        if item["type"] == "message"
+        for block in item.get("content", [])
+        if "text" in block
+    ]
+    assert "run this instead" not in texts

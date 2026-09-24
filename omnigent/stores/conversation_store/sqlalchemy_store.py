@@ -2048,25 +2048,28 @@ class SqlAlchemyConversationStore(ConversationStore):
             decoded = self._decode_item_data_batch([r.data for r in ordered])
             return [_to_item(r, d) for r, d in zip(ordered, decoded, strict=True)]
 
-    def has_item(self, conversation_id: str, item_id: str) -> bool:
+    def get_item(self, conversation_id: str, item_id: str) -> ConversationItem | None:
         """
-        Whether ``item_id`` is persisted in ``conversation_id``.
+        Fetch one persisted item by id, or ``None`` when absent.
 
         A point lookup on the ``(workspace_id, conversation_id, id)`` primary key.
 
         :param conversation_id: The conversation to look in.
         :param item_id: The item id, e.g. a web client's ``stable_id``.
-        :returns: ``True`` when the item exists.
+        :returns: The item, or ``None``.
         """
-        with self._conv_session("has_item") as session:
-            found = session.execute(
-                select(SqlConversationItem.id).where(
+        with self._conv_session("get_item") as session:
+            row = session.execute(
+                select(SqlConversationItem).where(
                     SqlConversationItem.workspace_id == current_workspace_id(),
                     SqlConversationItem.conversation_id == conversation_id,
                     SqlConversationItem.id == item_id,
                 )
             ).scalar_one_or_none()
-        return found is not None
+            if row is None:
+                return None
+            [data] = self._decode_item_data_batch([row.data])
+            return _to_item(row, data)
 
     def list_items(
         self,

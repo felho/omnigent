@@ -7203,6 +7203,18 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       //   3. No pending entry — render the event payload as a fresh
       //      committed bubble (TUI-typed message, marker, or another
       //      client).
+      // A failed bubble acknowledged by its receipt is delivered: release its
+      // re-send registration and the reload record too, or a later reload could
+      // revive a message the server already has.
+      let acknowledgedFailed: PendingUserMessage | undefined;
+      const noteAcknowledged = (
+        pending: PendingUserMessage[],
+        index: number,
+      ): PendingUserMessage[] => {
+        const bubble = pending[index];
+        if (bubble?.failed !== undefined) acknowledgedFailed = bubble;
+        return pending.filter((_, i) => i !== index);
+      };
       applyToConversation((s) => {
         if (hasCommittedItem(s.blocks, event.itemId)) {
           // The committed copy is already in `blocks` — the forwarder-mirrored
@@ -7230,7 +7242,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           if (eventContent !== null && isSystemUserContent(eventContent)) return {};
           const ack = pickPendingForConsumed(s.pendingUserMessages, event.itemId);
           if (ack < 0) return {};
-          return { pendingUserMessages: s.pendingUserMessages.filter((_, i) => i !== ack) };
+          return { pendingUserMessages: noteAcknowledged(s.pendingUserMessages, ack) };
         }
 
         // 1. Drop by id when the server names the drained entry.
@@ -7282,7 +7294,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           const content = committedContentFor(event, head.content);
           if (content === null) return {};
           return {
-            pendingUserMessages: s.pendingUserMessages.filter((_, i) => i !== headIdx),
+            pendingUserMessages: noteAcknowledged(s.pendingUserMessages, headIdx),
             // stableKey = the popped optimistic bubble's temp id so the
             // promoted bubble keeps the same React key (no remount/flink).
             blocks: [
@@ -7308,6 +7320,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           ],
         };
       });
+      if (acknowledgedFailed !== undefined) {
+        failedSends.delete(acknowledgedFailed.tempId);
+        const conversationId = streamConversationId ?? useChatStore.getState().conversationId;
+        if (conversationId !== null && acknowledgedFailed.stableId !== undefined) {
+          forgetPendingSend(conversationId, acknowledgedFailed.stableId);
+        }
+      }
       return;
     case "slash_command":
       // Claude-native: a `/skill-name` or surfaced CLI command typed

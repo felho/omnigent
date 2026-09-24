@@ -7784,10 +7784,10 @@ def test_get_conversation_keeps_distinct_query_names(
     ], names
 
 
-def test_has_item_is_scoped_to_the_conversation(
+def test_get_item_is_a_point_lookup_scoped_to_the_conversation(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """A web re-send is recognised by its stable id only within its own conversation."""
+    """A web re-send is matched to its stored item by id only within its own conversation."""
     conv = conversation_store.create_conversation()
     other = conversation_store.create_conversation()
     stable = "cd" * 16
@@ -7802,6 +7802,10 @@ def test_has_item_is_scoped_to_the_conversation(
             )
         ],
     )
-    assert conversation_store.has_item(conv.id, stable) is True
-    assert conversation_store.has_item(other.id, stable) is False
-    assert conversation_store.has_item(conv.id, "ef" * 16) is False
+    found = conversation_store.get_item(conv.id, stable)
+    assert found is not None
+    assert found.id == stable
+    assert isinstance(found.data, MessageData)
+    assert found.data.content == [{"type": "input_text", "text": "hi"}]
+    assert conversation_store.get_item(other.id, stable) is None
+    assert conversation_store.get_item(conv.id, "ef" * 16) is None

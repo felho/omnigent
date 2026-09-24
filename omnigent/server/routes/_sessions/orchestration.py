@@ -5516,6 +5516,15 @@ async def _forward_event_to_runner(
         session_id,
         [item],
     )
+    if web_stable_id is not None and persisted_items[0].deduplicated:
+        # The id already names an item. It must be this very message; a
+        # different item under a chosen id must not have this body forwarded
+        # and recorded against it.
+        if not _same_web_submission(persisted_items[0], item, created_by):
+            raise OmnigentError(
+                "stable_id already identifies a different item in this session",
+                code=ErrorCode.INVALID_INPUT,
+            )
     if web_stable_id is not None and pending_inputs.dispatch_done(session_id, web_stable_id):
         # The item is persisted before it is forwarded, so "already stored" is
         # not "already delivered": only a re-send of a message the runner
@@ -6247,6 +6256,33 @@ def _list_status_with_starting(
     return status
 
 
+def _same_web_submission(
+    stored: ConversationItem, item: NewConversationItem, created_by: str | None
+) -> bool:
+    """
+    Whether a stored item is the submission a client-chosen ``stable_id`` names.
+
+    A re-send carries the same type, role, content and author as the message
+    it repeats. Anything else under that id — an assistant message, another
+    author's message, different text — is a collision, and forwarding the new
+    body under the old id would run a prompt the transcript never records.
+
+    :param stored: The item already persisted under the id.
+    :param item: The submission being posted now.
+    :param created_by: The posting actor, or ``None`` in single-user mode.
+    :returns: ``True`` when they describe the same user message.
+    """
+    if stored.type != "message" or item.type != "message":
+        return False
+    if not isinstance(stored.data, MessageData) or not isinstance(item.data, MessageData):
+        return False
+    if stored.data.role != "user" or item.data.role != "user":
+        return False
+    if stored.data.content != item.data.content:
+        return False
+    return stored.created_by is None or created_by is None or stored.created_by == created_by
+
+
 def _web_stable_id(body: SessionEventInput) -> str | None:
     """
     Return the web client's ``stable_id`` for a user message POST, or ``None``.
@@ -6518,11 +6554,24 @@ async def _dispatch_session_event_to_runner_uncoalesced(
             live_pending_id = pending_inputs.pending_id_for(session_id, web_stable_id)
             if live_pending_id is not None:
                 return _SessionEventDispatchResult(item_id=None, pending_id=live_pending_id)
-            # The caches above are process-local. After a restart or expiry
-            # the committed copy is still in the store under the stable id
-            # (a forwarder without a source_id persists the mirrored message
-            # under it), so a late re-send resolves there instead of pasting.
-            if await asyncio.to_thread(conversation_store.has_item, session_id, web_stable_id):
+            # The caches above are process-local. When the mirrored message was
+            # persisted under the stable id (a forwarder that sends no
+            # source_id), a late re-send after a restart or expiry resolves
+            # from the store instead of pasting. Terminal forwarders that do
+            # send a source_id persist under a derived id and are not covered.
+            stored = await asyncio.to_thread(
+                conversation_store.get_item, session_id, web_stable_id
+            )
+            if stored is not None:
+                if not _same_web_submission(
+                    stored,
+                    _build_new_item(body, "stable-id-check", created_by=created_by),
+                    created_by,
+                ):
+                    raise OmnigentError(
+                        "stable_id already identifies a different item in this session",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
                 return _SessionEventDispatchResult(item_id=web_stable_id, pending_id=None)
         ensure_outcome = (
             _NativeTerminalEnsureOutcome(error=None)

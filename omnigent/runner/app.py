@@ -9901,10 +9901,30 @@ def create_runner_app(
             message_body = dict(body)
             message_body["conversation_id"] = conversation_id
 
-            persisted_item_id = message_body.get("persisted_item_id")
-            if isinstance(persisted_item_id, str) and persisted_item_id:
-                started = _started_item_ids.setdefault(conversation_id, deque(maxlen=64))
-                if persisted_item_id in started:
+            if _is_native_harness(conversation_id):
+                resource_registry.note_session_turn_started(conversation_id)
+
+            _seq = _ingest_next_seq.get(conversation_id, 0)
+            _ingest_next_seq[conversation_id] = _seq + 1
+            _cond = _ingest_cond.get(conversation_id)
+            if _cond is None:
+                _cond = asyncio.Condition()
+                _ingest_cond[conversation_id] = _cond
+            async with _cond:
+                while _ingest_now_serving.get(conversation_id, 0) != _seq:
+                    await _cond.wait()
+            try:
+                # Sequenced with the other messages of this conversation, so a
+                # re-forward of a message that is still being accepted waits for
+                # that acceptance instead of racing it. The record itself is
+                # written only where the message is actually taken (buffered or
+                # started): a request cancelled before that leaves nothing behind,
+                # and its retry is a fresh delivery.
+                persisted_item_id = message_body.get("persisted_item_id")
+                if not isinstance(persisted_item_id, str) or not persisted_item_id:
+                    persisted_item_id = None
+                started_ids = _started_item_ids.setdefault(conversation_id, deque(maxlen=64))
+                if persisted_item_id is not None and persisted_item_id in started_ids:
                     _logger.info(
                         "post_session_events: message %s already started a turn for conv=%s; "
                         "not running it again",
@@ -9919,21 +9939,11 @@ def create_runner_app(
                             "detail": "Message already started a turn; not running it again.",
                         },
                     )
-                started.append(persisted_item_id)
 
-            if _is_native_harness(conversation_id):
-                resource_registry.note_session_turn_started(conversation_id)
+                def _accept_message() -> None:
+                    if persisted_item_id is not None:
+                        started_ids.append(persisted_item_id)
 
-            _seq = _ingest_next_seq.get(conversation_id, 0)
-            _ingest_next_seq[conversation_id] = _seq + 1
-            _cond = _ingest_cond.get(conversation_id)
-            if _cond is None:
-                _cond = asyncio.Condition()
-                _ingest_cond[conversation_id] = _cond
-            async with _cond:
-                while _ingest_now_serving.get(conversation_id, 0) != _seq:
-                    await _cond.wait()
-            try:
                 _raw_content = message_body.get("content")
                 if isinstance(_raw_content, list):
                     message_body["content"] = await _resolve_forwarded_message_content(
@@ -9997,6 +10007,7 @@ def create_runner_app(
                                 exc_info=True,
                                 extra={"session_id": conversation_id},
                             )
+                    _accept_message()
                     return JSONResponse(
                         status_code=202,
                         content={
@@ -10028,6 +10039,7 @@ def create_runner_app(
                             conversation_id,
                             extra={"session_id": conversation_id},
                         )
+                        _accept_message()
                         return JSONResponse(
                             status_code=202,
                             content={
@@ -10052,6 +10064,7 @@ def create_runner_app(
                     loaded.append(new_item)
                     _session_histories[conversation_id] = loaded
 
+                _accept_message()
                 _begin_turn_slot(conversation_id)
                 _logger.info(
                     "post_session_events: starting background turn conv=%s",

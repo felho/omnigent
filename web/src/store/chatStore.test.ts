@@ -5633,6 +5633,34 @@ describe("chatStore — send (failed send)", () => {
     expect(state.pendingUserMessages.map((p) => p.posted)).toEqual([true, true]);
   });
 
+  it("releases a failed send's recovery records when its receipt arrives late", async () => {
+    // The stream's receipt can settle a failed bubble after its re-send
+    // registration and reload record were written. Both must go with it, or
+    // a reload or reconnect would try to deliver a message the server has.
+    installFlakyPost(Infinity, () => mockResponse({ queued: true }));
+    const sending = useChatStore.getState().send("late receipt", "agent_xyz");
+    await vi.advanceTimersByTimeAsync(1_000);
+    await sending;
+    const failed = useChatStore.getState().pendingUserMessages[0]!;
+    expect(failed.failed).toEqual({ attempts: 2 });
+    expect(readPendingSends("conv_existing")).toHaveLength(1);
+
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: failed.stableId!,
+      itemType: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "late receipt" }] },
+    });
+
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(readPendingSends("conv_existing")).toEqual([]);
+    // Nothing left to re-send when connectivity returns.
+    const bodies = installFlakyPost(0, () => mockResponse({ queued: true }));
+    window.dispatchEvent(new Event("online"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(bodies).toEqual([]);
+  });
+
   it("does not revive a remembered send the server already shows, matching by identity only", () => {
     const content = [{ type: "input_text" as const, text: "already there" }];
     // The first attempt landed after all: the snapshot replays it as a pending

@@ -91,10 +91,7 @@ logger = logging.getLogger(__name__)
 # freshly-launched ``omnigent run`` sessions don't burn a
 # fixed 500 ms before noticing the server is ready, then back off
 # slightly while still remaining responsive on slower cold starts.
-# Boots that outlive the slow window are cold starts on a loaded
-# machine where sub-100ms detection no longer matters; polling drops
-# to the slow interval so many concurrent boots (e2e shards) don't
-# starve each other with probe traffic.
+# Cold boots poll less often so readiness checks do not compete with startup.
 _SERVER_READY_INITIAL_POLL_SECONDS = 0.05
 _SERVER_READY_BACKOFF_POLL_SECONDS = 0.1
 _SERVER_READY_FAST_POLL_WINDOW_SECONDS = 1.0
@@ -103,20 +100,7 @@ _SERVER_READY_SLOW_POLL_SECONDS = 0.5
 
 
 def _server_ready_poll_interval(elapsed: float) -> float:
-    """
-    Choose the readiness-probe sleep for a boot *elapsed* seconds in.
-
-    Three tiers: probe aggressively inside the fast window (a healthy
-    boot becomes ready within a second and should be noticed at once),
-    back off slightly through the slow window, then settle at the slow
-    interval. Each ``httpx.get`` probe costs real CPU (a fresh client +
-    transport per call), so a boot that is *already* slow — a loaded CI
-    box running several boots at once — must not keep probing at 10Hz
-    and steal cycles from the very server process it is waiting on.
-
-    :param elapsed: Seconds since polling began, e.g. ``2.5``.
-    :returns: Seconds to sleep before the next probe.
-    """
+    """Slow readiness probes as boot time grows to avoid CPU contention."""
     if elapsed < _SERVER_READY_FAST_POLL_WINDOW_SECONDS:
         return _SERVER_READY_INITIAL_POLL_SECONDS
     if elapsed < _SERVER_READY_SLOW_POLL_WINDOW_SECONDS:
@@ -124,15 +108,7 @@ def _server_ready_poll_interval(elapsed: float) -> float:
     return _SERVER_READY_SLOW_POLL_SECONDS
 
 
-# The local-boot budget: how long ``omnigent run`` waits for its own
-# spawned server + runner before giving up. This is a last-resort
-# guard against a genuinely wedged boot, so it must sit ABOVE every
-# consumer-facing launch budget (the REPL e2e tests hold boot to
-# 60-120s) — otherwise a merely-slow boot on a loaded machine is
-# killed by this internal budget first and reported as a hard
-# "Server failed to start", turning boot starvation into a spurious
-# failure. Matches the 120s launch budget the REPL e2e tests hold
-# boot to (tests/e2e/test_repl_approval_e2e.py::_LAUNCH_TIMEOUT).
+# Give cold boots at least the longest consumer-facing launch budget.
 _LOCAL_BOOT_TIMEOUT_SECONDS = 120.0
 
 # Remote ``--server`` runners are disposable subprocesses created for
@@ -2065,20 +2041,13 @@ def _poll_remote_runner(
     status_url = f"{base_url}/v1/runners/{runner_id}/status"
     last_error: Exception | None = None
     last_status: int | None = None
-    # One client for the whole wait: constructing a fresh client (and
-    # its transport/SSL context) per probe costs CPU each probe, which
-    # at the fast poll rate steals cycles from the booting runner this
-    # loop is waiting on. Loopback targets skip env proxy setup (which
-    # must never route loopback traffic); non-loopback targets keep
-    # httpx's default proxy handling.
+    # Reuse a client; only loopback probes bypass ambient proxies.
     try:
         client = httpx.Client(
             headers=headers, timeout=2.0, trust_env=not is_loopback_url(status_url)
         )
     except httpx.InvalidURL as exc:
-        # Construction-time proxy-env parse failure (not an HTTPError,
-        # e.g. NO_PROXY=fe80::/10): deterministic, so fail fast with the
-        # actionable error instead of burning the timeout.
+        # Invalid proxy settings cannot recover by polling again.
         raise _unparseable_proxy_env_error(base_url, exc) from exc
     with client:
         while time.monotonic() < deadline:
@@ -3819,21 +3788,14 @@ def _wait_for_server(
     base_url = f"http://127.0.0.1:{port}"
     start = time.monotonic()
     deadline = time.monotonic() + timeout
-    # One client for the whole wait: constructing a fresh client (and
-    # its transport/SSL context) per probe costs ~20ms of CPU each,
-    # which at the fast poll rate becomes a significant share of a
-    # loaded machine's cycles — stolen from the very server/runner
-    # processes this loop is waiting on. trust_env=False keeps this
-    # loopback traffic off any ambient env proxy.
+    # Reuse one client and keep loopback probes off ambient proxies.
     with httpx.Client(base_url=base_url, timeout=2.0, trust_env=False) as client:
         while time.monotonic() < deadline:
             if server.proc.poll() is not None:
                 _raise_server_failed(server)
             runner_proc = server.runner_proc
             if runner_proc is not None and runner_proc.poll() is not None:
-                # The sibling runner died; without this check the loop
-                # waits out the full boot budget before failing with a
-                # generic message that blames the (healthy) server.
+                # Report a runner crash before the boot deadline expires.
                 from omnigent._runner_startup import format_runner_log_tail
 
                 raise click.ClickException(
@@ -3852,9 +3814,7 @@ def _wait_for_server(
                     if runner_resp.status_code == 200 and runner_resp.json().get("online") is True:
                         return
             except httpx.TransportError:
-                # Refused connects AND transient timeouts (a loaded boot
-                # can be slow to accept) ride the retry loop instead of
-                # aborting the whole wait.
+                # Refused connects and transient timeouts can recover.
                 pass
             time.sleep(_server_ready_poll_interval(time.monotonic() - start))
     _raise_server_failed(server)

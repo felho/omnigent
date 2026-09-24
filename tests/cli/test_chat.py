@@ -297,16 +297,7 @@ def test_wait_for_server_uses_fast_poll_before_backoff(
 
 
 def test_server_ready_poll_interval_slows_down_on_cold_boots() -> None:
-    """
-    Readiness probing must relax for boots that outlive the slow window.
-
-    A boot that is already several seconds in is a cold start on a
-    loaded machine; probing it at 10Hz steals CPU from the very
-    server/runner processes the loop is waiting on (each probe costs
-    real cycles), which under concurrent e2e shard load compounds into
-    boot starvation. The three-tier schedule keeps sub-second boots
-    snappy while easing off on the slow tail.
-    """
+    """Cold boots use slower polling without delaying fast boots."""
     assert _server_ready_poll_interval(0.0) == _SERVER_READY_INITIAL_POLL_SECONDS, (
         "sub-window probes must stay aggressive for fast boots"
     )
@@ -326,17 +317,7 @@ def test_server_ready_poll_interval_slows_down_on_cold_boots() -> None:
 
 
 def test_local_boot_budget_covers_consumer_launch_budgets() -> None:
-    """
-    The CLI's internal local-boot budget must not undercut its consumers.
-
-    The REPL e2e tests hold ``omnigent run`` boot to a 60-120s launch
-    budget. When ``_wait_for_server``'s default timeout sat below that
-    (45s), a merely-slow boot on a loaded machine was killed by the
-    internal budget first and misreported as a hard "Server failed to
-    start" — boot starvation counted as failure. The internal budget is
-    a last-resort wedge guard, so it must sit at or above every
-    consumer-facing launch budget.
-    """
+    """The internal boot deadline must cover consumer launch budgets."""
     import inspect
 
     default_timeout = inspect.signature(_wait_for_server).parameters["timeout"].default
@@ -496,14 +477,7 @@ def test_wait_for_server_waits_for_runner_tunnel_status(
 def test_wait_for_server_retries_through_transient_timeouts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    A probe timeout must ride the retry loop, not abort the wait.
-
-    A loaded boot can accept the TCP connect and then be too slow to
-    answer within the probe timeout; ``httpx`` raises ``ReadTimeout``
-    (a ``TransportError`` that is *not* a ``ConnectError``). Treating
-    that as fatal turns a merely-slow boot into a hard failure.
-    """
+    """A slow probe response must not abort a recoverable boot."""
 
     class _Resp:
         """Minimal response stub exposing ``status_code``."""
@@ -554,13 +528,7 @@ def test_wait_for_server_retries_through_transient_timeouts(
 def test_wait_for_server_fails_fast_when_runner_dies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    A dead sibling runner must fail the wait immediately.
-
-    Without this, a runner that crashes at spawn leaves the loop
-    polling a healthy server (whose runner will never come online)
-    for the full boot budget, then blames the server generically.
-    """
+    """A dead sibling runner fails promptly with its own log path."""
 
     class _Resp:
         """Minimal response stub exposing status and JSON body."""
@@ -613,9 +581,7 @@ def test_wait_for_server_fails_fast_when_runner_dies(
 
     with pytest.raises(click.ClickException, match="runner exited early with code 1") as exc_info:
         _wait_for_server(8123, server, timeout=5.0)
-    # The runner's own captured log is the durable record of a
-    # crash-at-spawn, so the error must point at it, not only at the
-    # (healthy) server's log.
+    # A crash-at-spawn should point at the runner log.
     assert "/tmp/runner-dead.log" in exc_info.value.message
 
 
@@ -986,10 +952,7 @@ def test_wait_for_remote_runner_early_exit_surfaces_log_path(
             return None
 
         def get(self, url: str) -> object:
-            """Fail the test if the poll loop reaches httpx.
-
-            :raises AssertionError: Always.
-            """
+            """Fail if a dead runner is still probed."""
             raise AssertionError("should not reach httpx when runner already exited")
 
     monkeypatch.setattr("omnigent.chat.httpx.Client", _FakeClient)

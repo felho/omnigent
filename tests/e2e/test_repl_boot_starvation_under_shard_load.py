@@ -1,39 +1,7 @@
-"""
-REPL pexpect boot-starvation regression guard.
+"""Real-time regression for concurrent REPL boots under CPU oversubscription.
 
-The REPL pexpect e2e cluster (``test_repl_approval_e2e.py``,
-``test_repl_sessions_approval_e2e.py``, ...) passes in isolation but
-starves on boot under full e2e shard load and times out at
-``_wait_for_prompt_ready`` — boot starvation is counted as a test
-failure, so those tests cannot be reliably un-suppressed.
-
-This test reproduces that starvation deterministically on one box by
-emulating the full-shard condition instead of depending on whatever
-else CI happens to run concurrently:
-
-- CPU burners oversubscribe every core (the co-located concurrent
-  shards / heavy loadscope-worker neighbors), and
-- several ``omnigent run`` REPLs boot at the same time (each REPL
-  pexpect module boots its own daemon + local server + runner).
-
-It then holds each boot to the same ``60s`` prompt-ready budget the
-suppressed tests used, and fails with the per-REPL outcome when any
-boot starves past it. Under this load the CLI's *own* local-boot
-budget (``_wait_for_server`` in ``omnigent/chat.py``, for server
-health + runner online) was typically exhausted first, so the REPL
-exits with ``Server failed to start`` (EOF) even though the runner
-was healthily retrying its tunnel — the sharpest form of "boot
-starvation counted as a test failure".
-
-On an unloaded box the same boot reaches prompt-ready in ~12s, so a
-harness fix (lighter boot, a readiness signal decoupled from full
-boot, or a serial lane for REPL pexpect modules) turns this test
-green without touching the assertion.
-
-Usage::
-
-    python -m pytest tests/e2e/test_repl_boot_starvation_under_shard_load.py \
-        -v -o addopts="" --timeout=300
+Four local REPL/server/runner boots use a mock LLM and must reach a prompt
+within 60 elapsed seconds of the test start.
 """
 
 from __future__ import annotations
@@ -58,23 +26,14 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ASK_DEMO_YAML = _REPO_ROOT / "tests" / "resources" / "agents" / "ask-demo" / "ask-demo.yaml"
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
-# The launch budget the suppressed REPL pexpect tests held boot to
-# (``_wait_for_prompt_ready(child, timeout=60)``) — the exact ceiling
-# the shard-load starvation blows through. Deliberately NOT inflated:
-# the point of this test is that boot must fit the budget under load,
-# not that the budget be raised until starvation stops counting.
+# Keep the original prompt-ready budget rather than hiding starvation.
 _PROMPT_READY_BUDGET_S = 60.0
 
-# Full-shard emulation shape. Each REPL pexpect module boots its own
-# daemon + local server + runner, and the box concurrently runs the
-# other e2e shards — approximated by several simultaneous boots plus
-# CPU oversubscription on every core.
+# Approximate co-located shards with concurrent boots and CPU contention.
 _CONCURRENT_BOOTS = 4
 _BURNERS_PER_CORE = 3
 
-# Burner child: peg one core, but self-exit if this test process is
-# SIGKILL'd (reparenting changes getppid), so burners never outlive a
-# hard-killed run.
+# Exit burners if their parent is killed.
 _BURNER_SRC = "import os\np = os.getppid()\nwhile os.getppid() == p:\n    pass\n"
 
 
@@ -84,14 +43,7 @@ def _strip_ansi(text: str) -> str:
 
 
 def _build_repl_env(mock_llm_server_url: str, tmp_home: Path) -> dict[str, str]:
-    """Build the pexpect environment dict for one REPL boot.
-
-    Mirrors the suppressed modules' env: mock LLM routing, a fake
-    ``HOME`` seeded with a persisted theme (so the first-launch theme
-    picker never blocks the PTY), and this worktree's SDK paths on
-    ``PYTHONPATH`` so the spawned runner subprocess resolves
-    ``omnigent`` from source rather than a sibling install.
-    """
+    """Use a mock LLM, isolated home, and this checkout for each REPL."""
     sdk_paths = [
         str(_REPO_ROOT),
         str(_REPO_ROOT / "sdks" / "python-client"),
@@ -123,17 +75,13 @@ def _build_repl_env(mock_llm_server_url: str, tmp_home: Path) -> dict[str, str]:
         "LINES": "40",
         "COLUMNS": "120",
         "PROMPT_TOOLKIT_NO_CPR": "1",
-        # Loopback traffic (mock LLM, local server) must never route
-        # through an ambient corporate proxy.
+        # Keep mock and local server traffic off ambient proxies.
         "NO_PROXY": "127.0.0.1,localhost",
         "no_proxy": "127.0.0.1,localhost",
     }
     for k in ("ANTHROPIC_API_KEY", "CLAUDE_CODE", "CLAUDECODE", "CODEX", "DATABRICKS_TOKEN"):
         env.pop(k, None)
-    # A REPL spawned from inside a hosted Omnigent runner inherits that
-    # runner's identity/tunnel env, which silently rewires the fresh boot
-    # this test must perform. Strip every runner-scoped ambient so the
-    # boot is hermetic wherever the test runs.
+    # Strip ambient runner identity so each REPL makes a fresh boot.
     runner_ambients = {
         "OMNIGENT",
         "OMNIGENT_USER_ID",
@@ -163,15 +111,7 @@ def test_repl_boot_reaches_prompt_ready_under_full_shard_load(
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> None:
-    """Every concurrent REPL boot must reach prompt-ready within the
-    60s budget while the box is under full-shard CPU load.
-
-    This is the regression guard for the boot starvation: the
-    suppressed REPL pexpect tests fail exactly here — the REPL never
-    reaches the input-ready prompt (``❯``) within 60s under shard
-    load (or the CLI aborts its own boot first with ``Server failed
-    to start``), while the identical boot takes ~12s unloaded.
-    """
+    """Every loaded REPL boot must show its prompt within 60 real seconds."""
     if os.environ.get("PYTEST_XDIST_WORKER_COUNT", "1") != "1":
         pytest.skip(
             "pegs every core with CPU burners; run standalone (see module "
@@ -181,9 +121,7 @@ def test_repl_boot_reaches_prompt_ready_under_full_shard_load(
     reset_mock_llm(mock_llm_server_url)
 
     ncpu = os.cpu_count() or 2
-    # Spawn inside the try: a mid-spawn failure (fork/EAGAIN is plausible
-    # on the loaded box this test creates) must still reach the cleanup
-    # for the burners already started.
+    # Clean up burners even if process creation fails midway.
     burners: list[subprocess.Popen[bytes]] = []
     children: list[Any] = []
     results: list[tuple[int, float, str, str]] = []
@@ -200,12 +138,10 @@ def test_repl_boot_reaches_prompt_ready_under_full_shard_load(
 
         def _wait_prompt_ready(idx: int, child: Any) -> None:
             try:
-                # The input-ready prompt marker the suppressed modules
-                # wait for (`_wait_for_prompt_ready`).
+                # Use the same input-ready marker as the REPL tests.
                 child.expect("❯", timeout=_PROMPT_READY_BUDGET_S)
                 dt = time.monotonic() - t0
-                # Enforce the budget from t0, not from when expect()
-                # started: spawn stagger must not grant extra time.
+                # Spawn stagger must not grant extra time.
                 status = "ready" if dt <= _PROMPT_READY_BUDGET_S else "ready past budget"
                 results.append((idx, dt, status, ""))
             except pexpect.TIMEOUT:
@@ -224,10 +160,7 @@ def test_repl_boot_reaches_prompt_ready_under_full_shard_load(
         for t in threads:
             t.join()
     finally:
-        # Unload the box before tearing the REPLs down, then give the
-        # graceful HUP/INT escalation real time ahead of the SIGKILL
-        # fallback — a force-killed REPL can't reap its spawned
-        # server/runner tree.
+        # Unload first; let each REPL reap its server/runner before force-kill.
         for b in burners:
             b.kill()
         for child in children:

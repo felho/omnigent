@@ -65,6 +65,8 @@ from omnigent.onboarding.provider_config import (
     _EXECUTOR_TYPE_HARNESS_ALIASES,
     _HARNESS_FAMILY,
     ANTHROPIC_FAMILY,
+    BEDROCK_KIND,
+    CLI_CONFIG_KIND,
     GEMINI_FAMILY,
     OPENAI_FAMILY,
     PI_SURFACE,
@@ -354,31 +356,56 @@ _AUTH_AWARE_NATIVE_HARNESSES: dict[str, str] = {
 }
 
 
-def _provider_entry_locally_credentialed(provider: ProviderEntry, family: str | None) -> bool:
+# Provider kinds the in-process SDK executors cannot consume. Launch's
+# spawn-env builder (``configure_agent_harness_with_provider`` in
+# :mod:`omnigent.runtime.workflow`) rejects a ``cli-config`` entry for
+# anything but the ``codex`` CLI harness (it pins a provider table inside
+# ``~/.codex/config.toml`` that only that CLI reads) and accepts ``bedrock``
+# only for native ``omnigent claude``; a ``subscription`` is the CLI's own
+# login, unusable outside that CLI. Counting any of them for an SDK harness
+# would report ready for a source the launch would reject.
+_SDK_UNUSABLE_PROVIDER_KINDS: frozenset[str] = frozenset(
+    {SUBSCRIPTION_KIND, CLI_CONFIG_KIND, BEDROCK_KIND}
+)
+
+
+def _provider_entry_locally_credentialed(
+    provider: ProviderEntry,
+    family: str | None,
+    unusable_kinds: frozenset[str] = frozenset({SUBSCRIPTION_KIND}),
+) -> bool:
     """Whether *provider* is a credential source that resolves on this host.
 
-    A provider entry only readies a harness when the secret it references
-    actually resolves locally: launch resolves the entry's family through
-    :meth:`~omnigent.onboarding.provider_config.ProviderEntry.family` (which
-    expands ``$VAR`` / ``api_key_ref`` via :func:`resolve_secret`) and fails
-    rather than skipping the provider, so an entry pointing at an unset
-    ``env:`` variable or a missing keychain secret is a first-turn auth
-    failure, not a credential. Kinds that carry no inline family config
-    (``databricks`` / ``cli-config``) resolve their credential elsewhere at
-    launch and keep counting as sources here. ``subscription`` kinds never
-    count (the CLI's own login is judged separately by
-    :func:`harness_cli_logged_in`). Local env/keychain resolution only — no
-    network I/O — and never raises.
+    A provider entry only readies a harness when launch could actually
+    consume it:
+
+    - Its kind must be usable by the consuming harness (*unusable_kinds*
+      names the kinds launch rejects for it — always ``subscription``, whose
+      CLI login is judged separately by :func:`harness_cli_logged_in`, plus
+      :data:`_SDK_UNUSABLE_PROVIDER_KINDS` for the in-process SDK harnesses).
+    - The secret it references must resolve locally: launch resolves the
+      entry's family through
+      :meth:`~omnigent.onboarding.provider_config.ProviderEntry.family`
+      (which expands ``$VAR`` / ``api_key_ref`` via :func:`resolve_secret`)
+      and fails rather than skipping the provider, so an entry pointing at an
+      unset ``env:`` variable or a missing keychain secret is a first-turn
+      auth failure, not a credential. Usable kinds that carry no inline
+      family config (``databricks``) resolve their credential elsewhere at
+      launch and keep counting as sources here.
+
+    Local env/keychain resolution only — no network I/O — and never raises.
 
     :param provider: The selected
         :class:`~omnigent.onboarding.provider_config.ProviderEntry`.
     :param family: The family the harness consumes (``"anthropic"`` /
         ``"openai"``), or ``None`` for an unmapped harness (``pi``), which
         may consume either family.
-    :returns: ``True`` when the entry's credential resolves locally (or needs
-        no local resolution), else ``False``.
+    :param unusable_kinds: Provider kinds launch rejects for the consuming
+        harness.
+    :returns: ``True`` when the entry is launch-consumable and its credential
+        resolves locally (or needs no local resolution), else ``False``.
     """
-    if provider.kind == SUBSCRIPTION_KIND:
+    if provider.kind in unusable_kinds:
         return False
     candidates = (family,) if family is not None else (ANTHROPIC_FAMILY, OPENAI_FAMILY)
     inline = [name for name in candidates if name in provider.families]
@@ -432,7 +459,14 @@ def _family_provider_configured(harness: str) -> bool:
         provider = default_provider_for_harness(load_config(), harness)
         if provider is None:
             return False
-        return _provider_entry_locally_credentialed(provider, _HARNESS_FAMILY.get(harness))
+        unusable = (
+            _SDK_UNUSABLE_PROVIDER_KINDS
+            if harness in _SDK_HARNESSES
+            else frozenset({SUBSCRIPTION_KIND})
+        )
+        return _provider_entry_locally_credentialed(
+            provider, _HARNESS_FAMILY.get(harness), unusable
+        )
     except Exception as exc:
         # Readiness must never raise; a broken/unreadable config fails to
         # "no credential" (yellow) rather than crashing the refresh.
@@ -454,9 +488,10 @@ def _family_fallback_provider_configured(harness: str) -> bool:
     detection merge
     (:func:`~omnigent.onboarding.detected.effective_config_with_detected`),
     so automatically detected local providers — a reachable keyless Ollama —
-    count exactly as they do at launch. ``subscription``-kind entries are
-    skipped for the same reason as in :func:`_family_provider_configured`,
-    and an entry counts only when its credential resolves locally
+    count exactly as they do at launch. Provider kinds the SDK launch would
+    reject (:data:`_SDK_UNUSABLE_PROVIDER_KINDS` — ``subscription``,
+    ``cli-config``, ``bedrock``) are skipped, and an entry counts only when
+    its credential resolves locally
     (:func:`_provider_entry_locally_credentialed`). Local config/env reads
     plus ambient detection's localhost-only probes; never raises.
 
@@ -475,7 +510,7 @@ def _family_fallback_provider_configured(harness: str) -> bool:
         for entry in load_providers(config).values():
             if family not in provider_families(entry):
                 continue
-            if _provider_entry_locally_credentialed(entry, family):
+            if _provider_entry_locally_credentialed(entry, family, _SDK_UNUSABLE_PROVIDER_KINDS):
                 return True
     except Exception as exc:
         # Class-only: provider config errors may embed credential material.
@@ -582,14 +617,18 @@ def _databricks_file_has_credentialed_profile(path: str) -> bool:
 
     Checks the locally required configuration fields rather than section or
     file existence: a profile counts only when it names a workspace ``host``
-    AND carries authentication material — a ``token`` PAT, an OAuth
-    ``client_id``/``client_secret`` pair, a legacy ``username``/``password``
-    pair, or an explicit ``auth_type`` naming a locally resolvable method
-    (``databricks-cli``, ``external-browser``, …). A file that merely exists,
-    or a section that carries neither a workspace nor authentication
-    (``[work]`` alone), proves nothing. Applied to both the default
-    ``~/.databrickscfg`` and a ``DATABRICKS_CONFIG_FILE`` override. Local
-    file read only; never raises.
+    AND its authentication method's locally stored material is present — a
+    ``token`` PAT, an OAuth ``client_id``/``client_secret`` pair, or a legacy
+    ``username``/``password`` pair. An explicit ``auth_type`` selects one
+    method: a material-bearing method (``pat`` / ``basic`` / ``oauth-m2m`` /
+    ``azure-client-secret``) counts only when its fields are actually
+    present, while an externally resolved method (``databricks-cli``,
+    ``external-browser``, ``metadata-service``, …) keeps its material outside
+    this file and counts on declaration. A file that merely exists, or a
+    section that carries neither a workspace nor authentication (``[work]``
+    alone, or ``auth_type = pat`` with no token), proves nothing. Applied to
+    both the default ``~/.databrickscfg`` and a ``DATABRICKS_CONFIG_FILE``
+    override. Local file read only, no network requests; never raises.
 
     :param path: The config file path to inspect.
     :returns: ``True`` when the file parses and declares at least one profile
@@ -609,14 +648,44 @@ def _databricks_file_has_credentialed_profile(path: str) -> bool:
             section = parser[name]
             if not section.get("host", "").strip():
                 continue
-            if section.get("token", "").strip():
-                return True
-            if section.get("client_id", "").strip() and section.get("client_secret", "").strip():
-                return True
-            if section.get("username", "").strip() and section.get("password", "").strip():
-                return True
-            if section.get("auth_type", "").strip():
-                return True
+            has_pat = bool(section.get("token", "").strip())
+            has_oauth = bool(
+                section.get("client_id", "").strip() and section.get("client_secret", "").strip()
+            )
+            has_basic = bool(
+                section.get("username", "").strip() and section.get("password", "").strip()
+            )
+            auth_type = section.get("auth_type", "").strip().lower()
+            if not auth_type:
+                if has_pat or has_oauth or has_basic:
+                    return True
+                continue
+            # An explicit auth_type selects ONE method; require that method's
+            # locally stored material rather than trusting the declaration.
+            if auth_type == "pat":
+                if has_pat:
+                    return True
+                continue
+            if auth_type == "basic":
+                if has_basic:
+                    return True
+                continue
+            if auth_type in ("oauth-m2m", "oauth"):
+                if has_oauth:
+                    return True
+                continue
+            if auth_type == "azure-client-secret":
+                if (
+                    section.get("azure_client_id", "").strip()
+                    and section.get("azure_client_secret", "").strip()
+                    and section.get("azure_tenant_id", "").strip()
+                ):
+                    return True
+                continue
+            # Externally resolved methods (databricks-cli, external-browser,
+            # metadata-service, github-oidc, azure-cli, …) keep their material
+            # outside this file; the declaration is the local signal.
+            return True
         return False
     except Exception as exc:
         # Log only the exception class: configparser errors can embed the

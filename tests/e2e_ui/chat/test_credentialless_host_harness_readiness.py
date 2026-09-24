@@ -22,11 +22,13 @@ a hand-written wire body — is what the picker renders.
   is configured, the picker warns for it, and ``claude-native`` is a readiness
   entry distinct from ``claude-sdk``.
 
-Since #7882 the picker renders a not-ready agent's menu row disabled (with a
-per-row warning badge) rather than selectable-with-a-warning, so both tests
-seed the persisted last pick (``omnigent:last-agent-id``) to select the agent
-and accept either warning surface — the disabled row's badge or the
-under-composer notice — as the pre-launch signal.
+SDK-harness ``needs-auth`` is advisory: the daemon cannot see agent-level
+credentials (``executor.auth``) and never blocks an SDK launch, so the picker
+keeps the row selectable and warns via the under-composer notice. The SDK test
+therefore drives the normal picker path (click the row, observe the notice,
+launch). CLI-backed harnesses (pi) keep #7882's blocking treatment — their row
+is disabled with a warning badge — so the pi test seeds the persisted last pick
+(``omnigent:last-agent-id``) to keep the launch journey drivable.
 
 The async-in-a-fresh-thread shape is inherited from
 ``start_session/test_start_session.py``: once a pytest-playwright sync test has
@@ -180,10 +182,9 @@ def _register_harness_agent(base_url: str, name: str, harness: str, model: str) 
 async def _reveal_agent_row(page: Any, agent_id: str) -> Any:
     """Open the landing picker's agent menu and reveal *agent_id*'s row.
 
-    Returns the row locator without clicking it: since #7882 the picker
-    renders a not-ready agent's row *disabled* (with a per-row warning
-    badge), so whether the row is clickable is itself part of what the
-    tests observe.
+    Returns the row locator without clicking it: whether the row is enabled
+    (advisory SDK ``needs-auth``) or disabled with a warning badge (blocking
+    CLI ``needs-auth``, #7882) is itself part of what the tests observe.
     """
     picker = page.get_by_test_id("new-chat-landing-agent-select")
     await picker.click()
@@ -215,11 +216,13 @@ async def _dismiss_agent_menu(page: Any) -> None:
 async def _seed_last_agent(page: Any, agent_id: str) -> None:
     """Persist *agent_id* as the landing picker's last pick before page load.
 
-    Since #7882 the picker menu *disables* a not-ready agent's row instead of
-    merely warning about it, so the fixed state can no longer click the row to
-    select the agent. Seeding the persisted last pick selects it the same way
-    a returning user lands on their previous agent, keeping the launch journey
-    (which warns but does not block) drivable.
+    Used by the CLI (pi) journey: #7882's picker *disables* a not-ready CLI
+    agent's row instead of merely warning about it, so that test cannot click
+    the row to select the agent. Seeding the persisted last pick selects it
+    the same way a returning user lands on their previous agent, keeping the
+    launch journey (which warns but does not block) drivable. The SDK journey
+    does NOT seed: SDK ``needs-auth`` is advisory, so the row stays clickable
+    and the test exercises the normal picker path.
     """
     await page.add_init_script(
         f'window.localStorage.setItem("omnigent:last-agent-id", {json.dumps(agent_id)})'
@@ -262,41 +265,31 @@ async def _drive_sdk_readiness(base_url: str, host: dict[str, Any]) -> None:
         page = await browser.new_page()
         try:
             await _seed_recent_workspace(page, host["host_id"], host["workspace"])
-            await _seed_last_agent(page, agent_id)
             await page.goto(f"{base_url}/")
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
 
-            # Post-fix (with #7882's picker), the needs-auth agent's menu row
-            # is disabled and carries a warning badge — the strongest form of
-            # the pre-launch warning. In the regression state (the daemon
-            # claims the SDK harness is ready) the row is enabled with no
-            # badge, so click it exactly as the reported journey did.
+            # Normal picker path, exactly as the reported journey did: SDK
+            # needs-auth is advisory (the daemon cannot see agent-level
+            # ``executor.auth`` credentials and never blocks an SDK launch),
+            # so the row must stay enabled and clickable — selecting the
+            # agent must not require a previously persisted pick.
             row = await _reveal_agent_row(page, agent_id)
-            if await row.is_enabled():
-                await row.click()
-            else:
-                badge = page.get_by_test_id(f"new-chat-landing-agent-warning-{agent_id}")
-                await expect(badge).to_be_visible()
-                warned_before_launch = True
+            assert await row.is_enabled(), (
+                "the needs-auth SDK agent's picker row must stay selectable "
+                "(advisory warning), not disabled"
+            )
+            await row.click()
             await _dismiss_agent_menu(page)
 
-            # The under-composer readiness notice for the selected agent on
-            # the selected host (the agent is selected either by the click
-            # above or by the seeded last pick). In the regression state it
-            # never appears for an SDK harness; after the fix it must.
+            # The under-composer readiness notice for the just-selected agent
+            # on the selected host. In the regression state it never appears
+            # for an SDK harness; after the fix it must — it is the advisory
+            # pre-launch warning surface for a selectable SDK row.
             warning = page.get_by_test_id("new-chat-landing-harness-warning")
-            try:
-                await expect(warning).to_be_visible(timeout=15_000)
-                warned_before_launch = True
-            except AssertionError:
-                # No under-composer notice within the window. That is fine
-                # when the disabled menu row already carried the warning badge
-                # (warned_before_launch is then already True); otherwise the
-                # final warned_before_launch assertion fails and reports the
-                # captured first-turn error as evidence.
-                pass
+            await expect(warning).to_be_visible(timeout=15_000)
+            warned_before_launch = True
 
             # Launch anyway (the readiness signal warns, it does not block) and
             # watch the first turn. Today it dies with an auth error the picker

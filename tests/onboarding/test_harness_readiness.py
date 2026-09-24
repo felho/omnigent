@@ -958,6 +958,15 @@ def test_sdk_harness_ready_via_databricks_workspace(
     assert result["claude-sdk"] is True
     assert result["openai-agents"] is True
 
+    # An externally resolved method (its material lives in the databricks
+    # CLI's own OAuth token cache, not this file) counts on declaration.
+    config_file.write_text(
+        "[work]\nhost = https://example.cloud.databricks.com\nauth_type = databricks-cli\n"
+    )
+    result = configured_harness_map()
+    assert result["claude-sdk"] is True
+    assert result["openai-agents"] is True
+
 
 def test_databricks_workspace_url_alone_is_not_a_credential(
     monkeypatch: pytest.MonkeyPatch,
@@ -1131,6 +1140,74 @@ def test_openai_agents_ready_via_detected_local_ollama(
     assert result["claude-sdk"] == "needs-auth"
 
 
+def test_codex_cli_config_provider_does_not_ready_sdk_harnesses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A codex ``cli-config`` provider is not an SDK credential source.
+
+    Launch rejects kind ``cli-config`` for anything but the codex CLI harness
+    (the spawn-env builder fails loud: the provider table + credential live in
+    ``~/.codex/config.toml``, which only that CLI reads), so a host whose only
+    openai-family source is a codex config.toml provider must keep warning for
+    openai-agents rather than report ready for a source launch would reject.
+    """
+    import omnigent.onboarding.detected as detected_mod
+    from omnigent.onboarding.ambient import DetectedProvider
+
+    _no_clis_installed(monkeypatch)
+    monkeypatch.setattr(
+        detected_mod,
+        "detect_providers",
+        lambda: [
+            DetectedProvider(
+                name="codex-databricks",
+                kind="cli-config",
+                family="openai",
+                source="~/.codex/config.toml",
+                model_provider="Databricks",
+                display_name="Databricks AI Gateway",
+            )
+        ],
+    )
+    result = configured_harness_map()
+    assert result["openai-agents"] == "needs-auth"
+    assert result["claude-sdk"] == "needs-auth"
+
+
+def test_claude_native_unresolved_provider_reference_reports_needs_auth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The native-harness path also rejects unresolvable provider references.
+
+    ``_family_provider_configured`` is shared with the auth-aware native
+    harnesses: claude-native with a default provider whose ``api_key_ref``
+    points at an unset env var (and no CLI login) must read ``needs-auth``,
+    not ready.
+    """
+    _all_clis_installed(monkeypatch)
+    monkeypatch.setattr(hi, "harness_cli_logged_in", lambda _key, **_kw: False)
+    monkeypatch.delenv("MISSING_READINESS_TEST_KEY", raising=False)
+    monkeypatch.delenv("OMNIGENT_MISSING_READINESS_TEST_KEY", raising=False)
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "providers": {
+                    "work": {
+                        "kind": "key",
+                        "default": True,
+                        "anthropic": {
+                            "base_url": "https://api.example.com/v1",
+                            "api_key_ref": "env:MISSING_READINESS_TEST_KEY",
+                        },
+                    }
+                }
+            }
+        )
+    )
+    assert configured_harness_map()["claude-native"] == "needs-auth"
+
+
 def test_malformed_databricks_config_contents_never_reach_logs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1195,6 +1272,11 @@ def test_databricks_profileless_config_override_is_not_a_credential(
         "[work]\nhost = https://example.cloud.databricks.com\n",
         # Auth material without a workspace cannot mint a gateway bearer.
         "[work]\ntoken = dapi-test\n",
+        # An explicit method declaration without that method's material: PAT
+        # authentication requires the (missing) token.
+        "[work]\nhost = https://example.cloud.databricks.com\nauth_type = pat\n",
+        # Same for an OAuth service-principal declaration without its pair.
+        "[work]\nhost = https://example.cloud.databricks.com\nauth_type = oauth-m2m\n",
     ],
 )
 def test_databricks_uncredentialed_profile_is_not_a_credential(

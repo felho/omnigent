@@ -18,6 +18,7 @@ covered by ``web/electron/e2e/desktop_fullscreen_sidebar_controls.e2e.js``.
 
 from __future__ import annotations
 
+import contextlib
 import os
 
 from playwright.sync_api import Page, expect
@@ -105,10 +106,8 @@ def test_fullscreen_realigns_sidebar_header_controls(page: Page, live_server: st
     # The window goes fullscreen: the lights are gone, so the cluster must
     # realign with the left edge instead of keeping the dead 5.5rem strip.
     page.evaluate("window.__omniFullScreen.set(true)")
-    try:
+    with contextlib.suppress(PlaywrightTimeoutError):
         _wait_for_cluster_x(page, "<", FULLSCREEN_ALIGNED_MAX_X)
-    except PlaywrightTimeoutError:
-        pass  # Assert below with the measured position for a clear failure.
     fullscreen_x = _cluster_x(page)
     assert fullscreen_x < FULLSCREEN_ALIGNED_MAX_X, (
         "sidebar header controls still reserve the traffic-light strip in "
@@ -118,10 +117,8 @@ def test_fullscreen_realigns_sidebar_header_controls(page: Page, live_server: st
 
     # Leaving fullscreen restores the clearance (the lights are back).
     page.evaluate("window.__omniFullScreen.set(false)")
-    try:
+    with contextlib.suppress(PlaywrightTimeoutError):
         _wait_for_cluster_x(page, ">=", TRAFFIC_LIGHT_CLEARANCE_PX - 8)
-    except PlaywrightTimeoutError:
-        pass
     restored_x = _cluster_x(page)
     assert restored_x >= TRAFFIC_LIGHT_CLEARANCE_PX - 8, (
         f"windowed traffic-light clearance not restored, got x={restored_x}"

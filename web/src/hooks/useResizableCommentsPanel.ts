@@ -29,11 +29,7 @@ const MIN_WIDTH_PX = 200;
 const MAX_WIDTH_PX = 640;
 /** Keep at least this much room for the code/diff viewer beside the panel. */
 const MIN_VIEWER_PX = 240;
-/**
- * Viewer width below which the panel stacks under the code/diff viewer instead
- * of sitting beside it — must track the `@md/viewer` (28rem) container
- * breakpoint used in FileViewer / CommentsPanel.
- */
+/** Matches the `@md/viewer` (28rem) container breakpoint. */
 const SIDE_BY_SIDE_MIN_PX = 448;
 
 // ---------------------------------------------------------------------------
@@ -94,19 +90,8 @@ export function resetCommentsWidthStoreForTesting(): void {
 }
 
 /**
- * Makes the CommentsPanel resizable via a drag handle on its left edge.
- *
- * While `sideBySide` is true (the viewer row is wide enough to host the panel
- * beside the code/diff viewer) apply `width` as an inline style and render the
- * drag handle. Otherwise the panel stacks full-width below the viewer (the
- * `w-full` class wins) and the handle should not be rendered. The decision is
- * made from the panel's parent row, not the viewport: inside a narrow
- * workspace rail the row can be far narrower than the window, and a
- * fixed-width panel there would overflow the rail and cover the editor.
- *
- * `containerRef` must be attached to the panel root so drag math can anchor
- * to the panel's right edge, and the dynamic max can leave room for the
- * sibling viewer.
+ * Stack comments when the viewer row is too narrow for side-by-side panes.
+ * Attach `containerRef` to the panel to measure the row and anchor drag math.
  */
 export function useResizableCommentsPanel() {
   const raw = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
@@ -144,15 +129,13 @@ export function useResizableCommentsPanel() {
     return Math.max(MIN_WIDTH_PX, Math.min(candidate, max));
   }, []);
 
-  // Track the parent row's width: it changes with the rail's own resize handle
-  // (no window resize fires), so a media query or resize listener can't see it.
+  // A rail resize changes row width without resizing the window.
   useLayoutEffect(() => {
     const row = containerRef.current?.parentElement;
     if (!row) return;
     const update = () => {
       setSideBySide(row.getBoundingClientRect().width >= SIDE_BY_SIDE_MIN_PX);
-      // Re-derive the effective width from the persisted preference so a row
-      // resize re-clamps the panel (and restores the choice when space returns).
+      // Restore the preferred width as space returns.
       setStoredWidth((prev) => {
         const base = preferredWidth ?? prev;
         return base !== null ? clampWidth(base) : prev;

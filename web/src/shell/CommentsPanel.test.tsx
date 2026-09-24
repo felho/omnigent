@@ -406,11 +406,7 @@ describe("CommentsPanel show more / less", () => {
 
 // ── Resize affordance (side-by-side width handle) ───────────────────────────
 //
-// The panel is resizable via a left-edge drag handle while it sits beside the
-// viewer, and stacks full-width (no inline width, no handle) when the viewer
-// row is too narrow to host both. The decision comes from the parent row's
-// measured width, not the viewport — inside a narrow workspace rail the row is
-// far narrower than the window.
+// Parent-row width, not viewport width, controls the resize handle.
 
 /** Render the panel inside a parent row that reports the given pixel width. */
 function renderPanelInRow(rowWidth: number) {
@@ -456,8 +452,6 @@ describe("CommentsPanel resize affordance", () => {
   });
 
   it("omits the handle and inline width when the viewer row is too narrow", () => {
-    // A rail-hosted row well under the side-by-side minimum: the panel must
-    // stack full-width instead of overflowing the rail and covering the editor.
     renderPanelInRow(220);
     expect(screen.queryByRole("separator", { name: "Resize comments panel" })).toBeNull();
     const panel = screen.getByText("Comments").closest("div")?.parentElement as HTMLElement;

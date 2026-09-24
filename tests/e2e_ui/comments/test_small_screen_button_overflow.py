@@ -1,26 +1,4 @@
-"""E2E: file-viewer comment controls must not overflow a smaller screen.
-
-Reproduces a responsive-layout failure on the session page's workspace rail.
-On a smaller desktop window (~1024px wide and below, still above the mobile
-breakpoint), opening a markdown file in the rich-text editor and starting a
-comment breaks the layout instead of shrinking it:
-
-- the comments panel's controls (Add Comment, Address All, the Open /
-  Addressed tabs, the comment textarea) extend past the right edge of the
-  window, so parts of them cannot be seen or clicked;
-- the panel is laid over the editor's formatting toolbar, so panel buttons
-  and toolbar buttons paint on top of each other;
-- the editor column itself is squeezed to a sliver (tens of pixels), making
-  the surface the user is commenting on unusable;
-- the workspace tab strip clips its tab buttons (Files / Changes / GitHub /
-  Agents) with no way to scroll them into reach, letting them paint over the
-  chat header's controls.
-
-The journey is driven fresh at each window size (viewport set before load,
-as a user on that screen would arrive), and every assertion is a geometry
-fact about visible interactive controls, so any reasonable layout fix -
-shrinking, stacking, or collapsing the panes - turns the test green.
-"""
+"""Keep file-viewer comment controls usable at narrow desktop widths."""
 
 from __future__ import annotations
 
@@ -51,14 +29,11 @@ let it run on staged files via git commit). Fix any issues it reports so the
 commit lands clean - CI runs the same checks.
 """
 
-# Desktop-layout widths where the overflow shows: a small-laptop /
-# iPad-landscape-class window and a half-screen window. Both sit above the
-# mobile breakpoint, so the desktop layout (sidebar + chat + rail) renders.
+# Both widths use the desktop layout.
 _WIDTHS = [1024, 900]
 _HEIGHT = 860
 
-# The editor the user is actively selecting text in must keep a usable
-# column; below this it renders one word (or one character) per line.
+# Guard against a one-word-wide editor column.
 _MIN_EDITOR_WIDTH = 80
 
 
@@ -82,21 +57,16 @@ def seeded_markdown_session(
 
 
 def _open_editor_with_pending_comment(page: Page, base_url: str, session_id: str) -> Locator:
-    """Load the session, open the markdown file in the editor, and start a comment.
-
-    Returns the visible FileViewer locator with the comments panel open on a
-    pending selection (composer textarea + Add Comment button showing).
-    """
+    """Open the seeded file and begin a comment in the visible viewer."""
     page.goto(f"{base_url}/c/{session_id}")
     open_right_rail(page)
 
-    # Two FileViewer instances mount with the same testid (hidden mobile
-    # drawer + desktop rail); scope everything to the visible one.
+    # The hidden mobile drawer also mounts a FileViewer.
     file_viewer = page.locator('[data-testid="file-viewer"]:visible')
     if not file_viewer.is_visible():
-        file_button = page.get_by_role(
-            "button", name=re.compile(re.escape(_FILE_PATH))
-        ).filter(has_text=_FILE_PATH)
+        file_button = page.get_by_role("button", name=re.compile(re.escape(_FILE_PATH))).filter(
+            has_text=_FILE_PATH
+        )
         expect(file_button.first).to_be_visible(timeout=30_000)
         file_button.first.click()
     expect(file_viewer).to_be_visible()
@@ -105,7 +75,6 @@ def _open_editor_with_pending_comment(page: Page, base_url: str, session_id: str
     expect(editor_content).to_be_visible(timeout=10_000)
     expect(editor_content).to_contain_text(_SELECTABLE_TEXT)
 
-    # Drag-select the paragraph; the floating "Add comment" button appears.
     selectable = editor_content.get_by_text(_SELECTABLE_TEXT)
     expect(selectable).to_be_visible()
     selectable.select_text()
@@ -143,10 +112,7 @@ def _horizontal_violations(page: Page, file_viewer: Locator, width: int) -> list
                 f"x={box['x']:.0f} right={right:.0f} vs window width {width}"
             )
 
-    # Panel controls must not paint on top of the editor's formatting
-    # toolbar buttons - two simultaneously-clickable controls in the same
-    # spot. Toolbar buttons are the title-carrying buttons in the toolbar
-    # row above the contenteditable surface.
+    # An overlapping toolbar button makes either control unusable.
     toolbar_buttons = file_viewer.locator(
         "button[title='Bold (⌘B)'], button[title='Italic (⌘I)'],"
         " button[title='Strikethrough'], button[title='Normal'],"
@@ -234,18 +200,7 @@ def test_comment_controls_stay_on_screen_on_smaller_window(
     page: Page,
     seeded_markdown_session: tuple[str, str],
 ) -> None:
-    """On a smaller window, comment controls stay on screen and off the toolbar.
-
-    Steps, per window size (fresh load at that size):
-    1. Open the session page with the workspace rail open.
-    2. Open the seeded markdown file; it renders in the rich-text editor.
-    3. Select a paragraph and click the floating "Add comment" button; the
-       comments panel opens with the pending-selection composer.
-    4. Assert every comments-panel control sits fully inside the window,
-       no panel control paints on top of an editor toolbar button, the
-       editor column keeps a usable width, and no workspace tab button is
-       clipped unreachable by a non-scrollable strip.
-    """
+    """Keep controls, editor, and tabs usable at both desktop widths."""
     base_url, session_id = seeded_markdown_session
 
     all_violations: list[str] = []
@@ -259,6 +214,4 @@ def test_comment_controls_stay_on_screen_on_smaller_window(
         for violation in _tab_strip_violations(page):
             all_violations.append(f"[{width}x{_HEIGHT}] {violation}")
 
-    assert not all_violations, "button overflow on smaller screen:\n" + "\n".join(
-        all_violations
-    )
+    assert not all_violations, "button overflow on smaller screen:\n" + "\n".join(all_violations)

@@ -26,10 +26,8 @@ function formatCommentTime(createdAt: number, now: Date): string {
 }
 
 // ---------------------------------------------------------------------------
-// CommentsPanel — right panel for adding and viewing comments. Sits beside the
-// viewer when the viewer row is wide enough (resizable via a left-edge drag
-// handle — see useResizableCommentsPanel) and stacks full-width below it
-// otherwise; the chosen width persists across panel remounts within a session.
+// Comments sit beside a wide viewer row and stack under narrow rows.
+// The drag width persists across panel remounts.
 // ---------------------------------------------------------------------------
 
 export type { ActiveSelection };
@@ -169,7 +167,7 @@ export function CommentsPanel({
       style={sideBySide ? { width } : undefined}
       className="relative flex shrink-0 flex-col overflow-hidden border-border w-full h-64 border-t @md/viewer:h-auto @md/viewer:border-t-0 @md/viewer:border-l"
     >
-      {/* Resize handle — side-by-side only (a narrow viewer stacks the panel full-width below) */}
+      {/* Resize handle appears only beside the viewer. */}
       {sideBySide && (
         <div
           {...handleProps}

@@ -1554,9 +1554,7 @@ function FileViewerBody({
         </div>
       </div>
 
-      {/* Editor + comments row — side-by-side only when the viewer itself is
-          wide enough (@md/viewer container query, not the viewport): inside a
-          narrow workspace rail the panel stacks below instead of overflowing. */}
+      {/* Comments stack when the viewer container is narrow. */}
       <div className="min-h-0 flex-1 flex flex-col @md/viewer:flex-row overflow-hidden">
         <div
           ref={contentAreaRef}

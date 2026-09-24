@@ -46,13 +46,12 @@ def _spec_with_worker(
     return SimpleNamespace(sub_agents=[SimpleNamespace(name="worker", executor=executor)])
 
 
-def _stub_opencode_launchable(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Let an opencode-native dispatch pass preflight in a CLI-less test env.
+def _stub_worker_launchable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let a native-harness dispatch pass preflight in a CLI-less test env.
 
     The dispatch rejects a worker whose harness CLI is missing; stub that probe
     present (the inheritance gate is under test, not the binary) and clear the
-    ambient Databricks profile so the opencode servability rule reads the spec
-    alone.
+    ambient Databricks profile so the servability rules read the spec alone.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
@@ -336,7 +335,7 @@ async def test_opencode_worker_skips_bare_id_inheritance(
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    _stub_opencode_launchable(monkeypatch)
+    _stub_worker_launchable(monkeypatch)
     bodies = await _dispatch_without_model(
         monkeypatch,
         agent_spec=_spec_with_worker("opencode-native"),
@@ -361,7 +360,7 @@ async def test_opencode_worker_inherits_provider_prefixed_id(
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    _stub_opencode_launchable(monkeypatch)
+    _stub_worker_launchable(monkeypatch)
     bodies = await _dispatch_without_model(
         monkeypatch,
         agent_spec=_spec_with_worker("opencode-native"),
@@ -386,7 +385,7 @@ async def test_opencode_worker_with_profile_inherits_gateway_id(
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    _stub_opencode_launchable(monkeypatch)
+    _stub_worker_launchable(monkeypatch)
     bodies = await _dispatch_without_model(
         monkeypatch,
         agent_spec=_spec_with_worker("opencode-native", worker_profile="oss"),
@@ -413,7 +412,7 @@ async def test_pi_worker_inherits_claude_id(
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    _stub_worker_launchable(monkeypatch)
     bodies = await _dispatch_without_model(
         monkeypatch,
         agent_spec=_spec_with_worker("pi"),

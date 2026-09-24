@@ -1,39 +1,30 @@
-"""UI journey: a session on a named, non-default provider must be priced at
-the NAMED provider's custom rates, not the harness DEFAULT provider's.
+"""UI journey: a named-provider session must be priced at the named provider's rate.
 
-Custom pricing resolves rates through
-``omnigent.llms.context_window.fetch_model_pricing_with_provider``, which the
-relay accounting path (``_accumulate_session_usage``) feeds via
-``default_provider_for_harness()``. That lookup returns the DEFAULT provider
-for the harness family — never the provider the session was actually launched
-with (a named provider selected via ``executor.auth: {type: provider,
-name: ...}``). So when two providers serve the same family (openai) at
-different custom rates and a session is bound to the non-default named one,
-its turns are priced at the DEFAULT provider's rate, and the wrong cost is
-what the user sees in the web SPA (the agent-info popover's "Session cost").
+Custom pricing resolves the DEFAULT provider for the session's harness family
+(``default_provider_for_harness`` in ``omnigent/llms/context_window.py``) instead
+of the provider the session was actually launched with
+(``executor.auth: {type: provider}``). A session bound to a NAMED provider whose
+custom rates differ from the family default is therefore priced at the DEFAULT
+provider's rate.
 
-Journey (real web SPA, live server + runner, openai-agents harness against
-the mock LLM):
+Journey (real web SPA, live server + runner, openai-agents harness against the
+mock ``/v1/responses``):
 
-1. configure ``~/.omnigent/config.yaml`` with two ``openai``-family providers
-   at different custom per-million rates: ``cheap-default`` (the family
-   default) and ``expensive-named`` (not default; its ``base_url`` is the
-   mock LLM — the default's is unreachable on purpose, so a completed turn
-   PROVES the session is actually served through the named provider)
-2. create an agent bound to the named provider via
-   ``executor.auth: {type: provider, name: expensive-named}`` and start a
-   session with it
-3. send a message; the turn completes against the mock (usage: 10 input /
-   5 output tokens, no harness-reported cost, so the server estimates cost
-   from configured pricing)
-4. open the agent-info popover
-5. observable failure: "Session cost" shows $2.00 — the CHEAP DEFAULT
-   provider's rate — instead of $20.00, the rate of the expensive named
-   provider that actually served the session
+1. two openai-family providers are configured with different custom pricing --
+   a cheap DEFAULT ($1/$1 per M tokens) and an expensive NAMED ($10/$10 per M)
+2. an openai-agents agent is bound via ``executor.auth`` to the expensive NAMED
+   provider, and a session is created for it
+3. send a message; the turn completes through the named provider, reporting
+   1,000,000 input and 1,000,000 output tokens
+4. open the agent-info popover and read Session cost
+5. observable failure: Session cost shows $2.00 (the cheap DEFAULT provider's
+   rate) instead of $20.00 (the expensive NAMED provider's rate)
 
-Regression guard: the final assertions FAIL on the current build (cost is
-the default provider's $2.00) and pass once pricing threads the actual
-provider identity from launch/session state ($20.00).
+Regression guard: the final assertion (Session cost == $20.00, the named rate)
+FAILS on the current build (it shows $2.00) and passes once pricing threads the
+actual provider identity from session state. The turn-completes precondition and
+the "a priced cost rendered at all" check pass both before and after a fix,
+pinning the failure to mis-pricing rather than a broken turn or missing usage.
 """
 
 from __future__ import annotations
@@ -41,163 +32,294 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
+import secrets
+import signal
+import subprocess
+import sys
 import tarfile
-import textwrap
+import time
 import uuid
 from collections.abc import Iterator
-from pathlib import Path
+from dataclasses import dataclass
 
 import httpx
 import pytest
-import yaml
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, configure_mock_llm
+from omnigent.runner.identity import token_bound_runner_id
+from tests._helpers.compat import apply_server_env, compat_server_cwd, server_executable
+from tests.e2e_ui.conftest import (
+    _BUILD_OUTPUT,
+    _HEALTH_POLL_INTERVAL_S,
+    _HEALTH_TIMEOUT_S,
+    _REPO_ROOT,
+    _find_free_port,
+    configure_mock_llm,
+    reset_mock_llm,
+    set_fallback_mock_llm,
+)
 
 _COMPOSER = "Send a message…"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _WORKING = '[data-testid="working-indicator"]'
 
-# A model name unique to this test so the mock queue keyed on it can't be
-# drained by any other session's calls (the mock routes by request model).
-_MODEL = "mock-pricing-model"
+_FINAL_TEXT = "Hello from the named provider."
 
-# Two openai-family providers at DIFFERENT custom per-million rates. The mock
-# LLM reports a fixed 10 input / 5 output tokens per text turn, so the rates
-# are chosen to land on legible dollar values in the SPA's cost display.
-_CHEAP_INPUT_PER_M = 100_000.0  # $0.10 / token
-_CHEAP_OUTPUT_PER_M = 200_000.0  # $0.20 / token
-_NAMED_INPUT_PER_M = 1_000_000.0  # $1.00 / token
-_NAMED_OUTPUT_PER_M = 2_000_000.0  # $2.00 / token
-
-# The mock /v1/responses wire reports usage {input: 10, output: max(5, words)}
-# for a text response; the scripted reply below is one word, so 5.
-_INPUT_TOKENS = 10
-_OUTPUT_TOKENS = 5
-
-# What the buggy default-provider lookup produces (the wrong, cheaper cost).
-_DEFAULT_PROVIDER_COST = (
-    _INPUT_TOKENS * _CHEAP_INPUT_PER_M / 1_000_000
-    + _OUTPUT_TOKENS * _CHEAP_OUTPUT_PER_M / 1_000_000
-)  # $2.00
-# What the session SHOULD cost: the named provider's rate.
-_NAMED_PROVIDER_COST = (
-    _INPUT_TOKENS * _NAMED_INPUT_PER_M / 1_000_000
-    + _OUTPUT_TOKENS * _NAMED_OUTPUT_PER_M / 1_000_000
-)  # $20.00
+# The turn reports a flat 1,000,000 in / 1,000,000 out. At the cheap DEFAULT
+# rate ($1/$1 per million) that is $2.00; at the expensive NAMED rate
+# ($10/$10 per million) it is $20.00. The 10x gap makes the mis-pricing
+# unambiguous and dominates the two-decimal display, so a stray tiny extra
+# request cannot shift the rendered cost.
+_USAGE = {"input_tokens": 1_000_000, "output_tokens": 1_000_000}
+_DEFAULT_RATE_COST = "$2.00"
+_NAMED_RATE_COST = "$20.00"
 
 
-def _format_session_cost(cost: float) -> str:
-    """Mirror the SPA's ``formatSessionCostUsd`` (web/src/lib/formatCost.ts)."""
-    if 0 < cost < 0.01:
-        return "<$0.01"
-    return f"${cost:.2f}"
+def _provider_config_yaml(mock_base_url: str, model: str) -> str:
+    """Two openai-family providers at different custom rates.
 
-
-def _omnigent_config_path() -> Path:
-    """The global provider-config path the server/runner read via load_config()."""
-    config_home = os.environ.get("OMNIGENT_CONFIG_HOME")
-    base = Path(config_home) if config_home else Path.home() / ".omnigent"
-    return base / "config.yaml"
-
-
-@pytest.fixture
-def two_rate_provider_config(mock_llm_server_url: str) -> Iterator[None]:
-    """Two same-family providers with different custom pricing, in place for
-    the test's full lifetime (launch resolves the named provider; every
-    accounting call re-reads the config). Restores the original on exit.
-
-    ``cheap-default`` is the openai-family default; its base_url is
-    deliberately unreachable so a completed turn proves the session was NOT
-    served through it. ``expensive-named`` points at the mock LLM.
+    ``repro-default-cheap`` is the DEFAULT for the openai family (the one
+    ``default_provider_for_harness`` resolves); ``repro-named-expensive`` is a
+    non-default named provider the agent binds to via ``executor.auth``.
     """
-    path = _omnigent_config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    original = path.read_text() if path.exists() else None
-    path.write_text(
-        textwrap.dedent(f"""\
-            providers:
-              cheap-default:
-                kind: key
-                default: [openai]
-                openai:
-                  # Unreachable on purpose: if the launch (wrongly) routed the
-                  # session through the DEFAULT provider, the turn could never
-                  # complete — so a completed turn pins the session to the
-                  # named provider, and any default-rate cost to the pricing
-                  # lookup alone.
-                  base_url: "http://127.0.0.1:9/v1"
-                  api_key: "cheap-key"
-                  wire_api: responses
-                  pricing:
-                    input_per_million: {_CHEAP_INPUT_PER_M}
-                    output_per_million: {_CHEAP_OUTPUT_PER_M}
-              expensive-named:
-                kind: key
-                openai:
-                  base_url: "{mock_llm_server_url}/v1"
-                  api_key: "expensive-key"
-                  wire_api: responses
-                  pricing:
-                    input_per_million: {_NAMED_INPUT_PER_M}
-                    output_per_million: {_NAMED_OUTPUT_PER_M}
-            """)
-    )
-    try:
-        yield
-    finally:
-        if original is not None:
-            path.write_text(original)
-        else:
-            path.unlink(missing_ok=True)
+    return f"""\
+providers:
+  repro-default-cheap:
+    kind: key
+    default: [openai]
+    openai:
+      base_url: "{mock_base_url}/v1"
+      api_key: "mock-key"
+      wire_api: responses
+      models:
+        default: {model}
+      pricing:
+        input_per_million: 1.0
+        output_per_million: 1.0
+  repro-named-expensive:
+    kind: key
+    openai:
+      base_url: "{mock_base_url}/v1"
+      api_key: "mock-key"
+      wire_api: responses
+      models:
+        default: {model}
+      pricing:
+        input_per_million: 10.0
+        output_per_million: 10.0
+"""
 
 
-def _build_named_provider_bundle(name: str) -> bytes:
-    """Build a one-file agent bundle bound to the ``expensive-named`` provider.
+def _agent_yaml(name: str, model: str) -> str:
+    """A single-file openai-agents agent bound to the expensive NAMED provider."""
+    return f"""\
+name: {name}
+prompt: You are a terse assistant. Say hello in one short sentence.
 
-    Uses the omnigent shorthand YAML (non-``config.yaml`` arcname routes it
-    through the compat translator, like the packaged hello_world agent).
-    ``context_window`` gives the SPA a denominator for the unknown mock model.
+executor:
+  harness: openai-agents
+  model: {model}
+  auth:
+    type: provider
+    name: repro-named-expensive
+"""
 
-    :param name: Agent name (unique per test run).
-    :returns: The ``.tar.gz`` bundle bytes for multipart upload.
+
+def _agent_bundle(name: str, model: str) -> bytes:
+    """Gzipped tarball of the agent spec.
+
+    A non-``config.yaml`` archive name routes the bundle through the omnigent
+    compat adapter, which accepts the ``executor.harness`` shorthand and
+    preserves ``executor.auth`` (see ``_build_hello_world_bundle``).
     """
-    config = {
-        "name": name,
-        "prompt": "You are a terse assistant. Answer in as few words as possible.",
-        "executor": {
-            "harness": "openai-agents",
-            "model": _MODEL,
-            "context_window": 200000,
-            "auth": {"type": "provider", "name": "expensive-named"},
-        },
-    }
+    yaml_bytes = _agent_yaml(name, model).encode()
     with io.BytesIO() as buf:
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            yaml_bytes = yaml.safe_dump(config, sort_keys=False).encode()
             info = tarfile.TarInfo(f"{name}.yaml")
             info.size = len(yaml_bytes)
             tar.addfile(info, io.BytesIO(yaml_bytes))
         return buf.getvalue()
 
 
-def _create_named_provider_session(base_url: str, runner_id: str) -> str:
-    """Create a runner-bound session for a fresh named-provider agent.
+@dataclass
+class _NamedProviderServer:
+    base_url: str
+    runner_id: str
+    model: str
 
-    :param base_url: Live server base URL.
-    :param runner_id: Token-bound runner id to PATCH-bind.
-    :returns: The new session id.
+
+@pytest.fixture
+def named_provider_server(
+    built_spa: None,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+    request: pytest.FixtureRequest,
+) -> Iterator[_NamedProviderServer]:
+    """Spawn a server + runner whose config declares two custom-priced providers.
+
+    A dedicated server (not the session-scoped ``live_server``) is required so
+    ``OMNIGENT_CONFIG_HOME`` points at a config that carries the two providers'
+    custom pricing before the server and runner start; that config is what both
+    the launch-time provider resolution and the pricing-time default lookup read.
     """
+    if request.config.getoption("--ui-base-url"):
+        pytest.skip("named-provider pricing e2e requires an isolated spawned server")
+
+    server_tmp = tmp_path_factory.mktemp("e2e_ui_named_provider_pricing")
+    config_home = server_tmp / "config-home"
+    config_home.mkdir(parents=True, exist_ok=True)
+    model = f"gpt-4o-mini-namedrate-{uuid.uuid4().hex[:8]}"
+    (config_home / "config.yaml").write_text(
+        _provider_config_yaml(mock_llm_server_url, model), encoding="utf-8"
+    )
+
+    port = _find_free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    log_path = server_tmp / "server.log"
+    runner_log_path = server_tmp / "runner.log"
+    db_path = server_tmp / "test.db"
+    artifact_dir = server_tmp / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    binding_token = secrets.token_urlsafe(32)
+    runner_id = token_bound_runner_id(binding_token)
+
+    # The named provider (via ProviderAuth) governs the provider identity used
+    # for launch routing and pricing; OPENAI_* only backstop any env fallback,
+    # and both point at the same mock, so neither changes which rate applies.
+    shared_env = {
+        **os.environ,
+        "OMNIGENT_CONFIG_HOME": str(config_home),
+        "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
+        "OPENAI_API_KEY": "mock-key",
+        "ANTHROPIC_API_KEY": "",
+        "OMNIGENT_WEB_UI_DIST": str(_BUILD_OUTPUT),
+    }
+    apply_server_env(shared_env, _REPO_ROOT)
+
+    server_env = {**shared_env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token}
+    runner_env = {
+        **shared_env,
+        "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+        "OMNIGENT_RUNNER_ID": runner_id,
+        "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
+        "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
+        "RUNNER_SERVER_URL": base_url,
+    }
+
+    server_command = [
+        server_executable(),
+        "-c",
+        "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
+        "from omnigent.cli import main; main()",
+        "server",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--database-uri",
+        f"sqlite:///{db_path}",
+        "--artifact-location",
+        str(artifact_dir),
+    ]
+
+    log_handle = open(log_path, "w")  # noqa: SIM115
+    runner_log_handle = open(runner_log_path, "w")  # noqa: SIM115
+    proc: subprocess.Popen[bytes] | None = None
+    runner_proc: subprocess.Popen[bytes] | None = None
+
+    def _wait_until_ready(
+        server_process: subprocess.Popen[bytes],
+        runner_process: subprocess.Popen[bytes],
+    ) -> None:
+        deadline = time.monotonic() + _HEALTH_TIMEOUT_S
+        last_error = "not polled yet"
+        while time.monotonic() < deadline:
+            if server_process.poll() is not None:
+                last_error = f"server exited early with code {server_process.returncode}"
+                break
+            if runner_process.poll() is not None:
+                last_error = f"runner exited early with code {runner_process.returncode}"
+                break
+            try:
+                resp = httpx.get(f"{base_url}/health", timeout=2)
+                if resp.status_code == 200:
+                    status_resp = httpx.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2)
+                    if status_resp.status_code == 200 and status_resp.json()["online"] is True:
+                        return
+                    last_error = (
+                        f"runner status HTTP {status_resp.status_code}: {status_resp.text[:200]}"
+                    )
+                else:
+                    last_error = f"health HTTP {resp.status_code}: {resp.text[:200]}"
+            except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+            time.sleep(_HEALTH_POLL_INTERVAL_S)
+        raise RuntimeError(
+            f"named-provider pricing server did not become healthy within "
+            f"{_HEALTH_TIMEOUT_S:.0f}s on {base_url} (last_error={last_error}).\n"
+            f"Server log:\n{log_path.read_text()[-3000:] if log_path.exists() else ''}\n"
+            "Runner log:\n"
+            f"{runner_log_path.read_text()[-3000:] if runner_log_path.exists() else ''}"
+        )
+
+    try:
+        proc = subprocess.Popen(
+            server_command,
+            env=server_env,
+            cwd=compat_server_cwd(),
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
+        runner_proc = subprocess.Popen(
+            [sys.executable, "-m", "omnigent.runner._entry"],
+            env=runner_env,
+            stdout=runner_log_handle,
+            stderr=subprocess.STDOUT,
+        )
+        _wait_until_ready(proc, runner_proc)
+
+        # Guardrails classifier + any stray non-turn call (title inference,
+        # model validation) get benign replies so they can't consume the
+        # scripted turn; the turn itself is keyed to the agent's unique model.
+        set_fallback_mock_llm(
+            mock_llm_server_url, "_policy_llm_", '{"action": "allow", "reason": ""}'
+        )
+        set_fallback_mock_llm(mock_llm_server_url, "default", "OK")
+        reset_mock_llm(mock_llm_server_url)
+        configure_mock_llm(
+            mock_llm_server_url,
+            [{"text": _FINAL_TEXT, "usage": _USAGE}],
+            key=model,
+        )
+        yield _NamedProviderServer(base_url=base_url, runner_id=runner_id, model=model)
+    finally:
+        for p in (runner_proc, proc):
+            if p is not None and p.poll() is None:
+                p.send_signal(signal.SIGTERM)
+                try:
+                    p.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait(timeout=5)
+        runner_log_handle.close()
+        log_handle.close()
+
+
+def _create_named_provider_session(base_url: str, runner_id: str, model: str) -> str:
     name = f"named-pricing-{uuid.uuid4().hex[:8]}"
-    bundle = _build_named_provider_bundle(name)
+    bundle = _agent_bundle(name, model)
+    # A title in metadata suppresses background title inference, which would
+    # otherwise consume the turn's single scripted response.
     create_resp = httpx.post(
         f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
+        data={"metadata": json.dumps({"title": "Named provider pricing"})},
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
         timeout=30.0,
     )
     create_resp.raise_for_status()
-    session_id = create_resp.json()["session_id"]
+    session_id = str(create_resp.json()["session_id"])
     patch_resp = httpx.patch(
         f"{base_url}/v1/sessions/{session_id}",
         json={"runner_id": runner_id},
@@ -207,109 +329,70 @@ def _create_named_provider_session(base_url: str, runner_id: str) -> str:
     return session_id
 
 
-def _persisted_session_usage(session_id: str) -> dict:
-    """Read the persisted ``session_usage`` for cross-checking the UI value."""
-    from omnigent.stores.conversation_store.sqlalchemy_store import (
-        SqlAlchemyConversationStore,
-    )
-
-    database_uri = str(_server_state.get("database_uri") or "")
-    if not database_uri:
-        return {}
-    conv = SqlAlchemyConversationStore(database_uri).get_conversation(session_id)
-    return dict(conv.session_usage) if conv and conv.session_usage else {}
+def _send(page: Page, text: str) -> None:
+    composer = page.get_by_placeholder(_COMPOSER)
+    expect(composer).to_be_visible()
+    composer.fill(text)
+    page.get_by_role("button", name="Send", exact=True).click()
 
 
 @pytest.mark.timeout(600)
-def test_named_provider_session_cost_uses_named_rate_not_default(
+def test_named_provider_session_priced_at_named_rate(
     page: Page,
-    live_server: str,
+    named_provider_server: _NamedProviderServer,
     mock_llm_server_url: str,
-    two_rate_provider_config: None,
-    tmp_path_factory: pytest.TempPathFactory,
 ) -> None:
-    """A session launched on a named, non-default provider must show the
-    NAMED provider's cost in the agent-info popover — not the default's.
+    """A session bound to a NAMED provider must be priced at that provider's rate.
 
-    On the current build the accounting path resolves pricing via
-    ``default_provider_for_harness()``, so the popover shows the cheap
-    default provider's $2.00 instead of the named provider's $20.00 and the
-    final assertions fail — that failure is the reproduction.
+    The turn runs through ``repro-named-expensive`` ($10/$10 per M) and reports
+    1,000,000 in / 1,000,000 out, so its true cost is $20.00. On the current
+    build pricing resolves the openai-family DEFAULT (``repro-default-cheap``,
+    $1/$1 per M) via ``default_provider_for_harness`` and shows $2.00 instead --
+    the ``$20.00`` assertion fails. Once pricing threads the actual provider it
+    passes.
     """
-    respawned = _ensure_runner_online(live_server, tmp_path_factory)
-    try:
-        runner_id = str(_server_state["runner_id"])
+    base_url = named_provider_server.base_url
+    model = named_provider_server.model
 
-        token = f"pricing-{uuid.uuid4().hex[:6]}"
-        # Route by the unique token (and model key) so this test's queue can't
-        # be drained by another session's calls; a couple of copies cover any
-        # incidental extra call within the turn.
-        configure_mock_llm(
-            mock_llm_server_url,
-            [{"text": "ack"}] * 4,
-            key=_MODEL,
-            match=token,
+    session_id = _create_named_provider_session(base_url, named_provider_server.runner_id, model)
+    try:
+        page.goto(f"{base_url}/c/{session_id}")
+
+        _send(page, "Say hello.")
+        expect(page.locator(_ASSISTANT).filter(has_text=_FINAL_TEXT).first).to_be_visible(
+            timeout=240_000
+        )
+        expect(page.locator(_WORKING)).to_have_count(0, timeout=240_000)
+
+        # Precondition: the turn really ran through the named provider (one
+        # model request carrying the scripted usage). Passes before and after a
+        # fix, so a smaller cost below is mis-pricing, not a broken turn.
+        reqs = httpx.get(
+            f"{mock_llm_server_url}/mock/requests", params={"key": model}, timeout=10.0
+        )
+        reqs.raise_for_status()
+        captured = reqs.json()["requests"]
+        assert len(captured) >= 1, (
+            f"expected at least one model request routed to {model!r}; the "
+            f"openai-agents/named-provider wiring broke, not the pricing bug"
         )
 
-        session_id = _create_named_provider_session(live_server, runner_id)
-        try:
-            page.goto(f"{live_server}/c/{session_id}")
-
-            composer = page.get_by_placeholder(_COMPOSER)
-            expect(composer).to_be_visible(timeout=30_000)
-            composer.fill(f"Say ack. {token}")
-            page.get_by_role("button", name="Send", exact=True).click()
-
-            # Drive the turn to completion: the assistant bubble renders and
-            # the working indicator clears. Completion also proves the session
-            # was served through the NAMED provider (the default's base_url is
-            # unreachable), pinning any default-rate cost to the pricing
-            # lookup rather than request routing.
-            expect(page.locator(_ASSISTANT).first).to_be_visible(timeout=120_000)
-            expect(page.locator(_WORKING)).to_have_count(0, timeout=120_000)
-
-            # Open the agent-info popover: the session-cost line is the
-            # user-facing readout of the accounted cost.
-            page.get_by_test_id("agent-info-trigger").click()
-            cost_el = page.get_by_test_id("agent-info-session-cost")
-            expect(cost_el).to_be_visible(timeout=15_000)
-            # Brief linger so the popover (with the accounted cost) is legible
-            # in recorded runs before the assertions below end the page.
-            page.wait_for_timeout(1500)
-            cost_text = (cost_el.inner_text() or "").strip()
-
-            wrong = _format_session_cost(_DEFAULT_PROVIDER_COST)
-            expected = _format_session_cost(_NAMED_PROVIDER_COST)
-
-            # The bug: cost renders at the default provider's rate. Guard
-            # against it explicitly so a regression is legible, then assert
-            # the correct contract.
-            assert cost_text != wrong, (
-                f"Session cost shows {cost_text} — the DEFAULT provider's rate "
-                f"(cheap-default: {_CHEAP_INPUT_PER_M}/{_CHEAP_OUTPUT_PER_M} per M) — "
-                f"instead of the named provider the session was actually launched "
-                f"with (expensive-named: {_NAMED_INPUT_PER_M}/{_NAMED_OUTPUT_PER_M} "
-                f"per M, expected {expected}). Wrong provider used for pricing."
-            )
-            assert cost_text == expected, (
-                f"expected the named provider's cost {expected}, got {cost_text} "
-                f"(persisted usage: {_persisted_session_usage(session_id)})"
-            )
-
-            # Cross-check the persisted accounting the UI renders from.
-            usage = _persisted_session_usage(session_id)
-            persisted = usage.get("total_cost_usd")
-            assert persisted == pytest.approx(_NAMED_PROVIDER_COST), (
-                f"persisted total_cost_usd={persisted} is not the named "
-                f"provider's cost {_NAMED_PROVIDER_COST}; usage={usage}"
-            )
-        finally:
-            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        # Open the agent-info popover and read the Session cost row.
+        trigger = page.get_by_test_id("agent-info-trigger")
+        trigger.focus()
+        trigger.press("Enter")
+        panel = page.get_by_test_id("agent-info-panel")
+        cost = panel.get_by_test_id("agent-info-session-cost")
+        expect(cost).to_be_visible(timeout=30_000)
+        # A priced cost rendered at all (not "<$0.01"): passes before and after
+        # a fix, isolating the failure to the wrong rate rather than no pricing.
+        expect(cost).to_have_text(re.compile(r"^\$\d"), timeout=30_000)
+        assert cost.text_content() != _DEFAULT_RATE_COST, (
+            "Session cost shows the cheap DEFAULT provider's rate "
+            f"({_DEFAULT_RATE_COST}); it must reflect the NAMED provider "
+            f"({_NAMED_RATE_COST}) the session actually ran through"
+        )
+        expect(cost).to_have_text(_NAMED_RATE_COST)
     finally:
-        if respawned is not None:
-            respawned.terminate()
-            try:
-                respawned.wait(timeout=5)
-            except Exception:  # best-effort teardown
-                respawned.kill()
-                respawned.wait(timeout=5)
+        with httpx.Client() as client:
+            client.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)

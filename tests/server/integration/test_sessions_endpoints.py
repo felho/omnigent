@@ -5076,17 +5076,31 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
     ]
 
 
+@pytest.mark.parametrize(
+    ("detail", "expected_message"),
+    [
+        (
+            "There's an issue with the selected model (claude-3-5-sonnet-20241022). "
+            "It may not exist or you may not have access to it.",
+            "The turn failed without a reported reason; the last assistant message was: "
+            "There's an issue with the selected model (claude-3-5-sonnet-20241022). "
+            "It may not exist or you may not have access to it.",
+        ),
+        (
+            "API Error: 502 The upstream server returned an invalid response.",
+            "API Error: 502 The upstream server returned an invalid response.",
+        ),
+    ],
+)
 async def test_post_external_session_status_failed_forwards_persisted_assistant_output(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    detail: str,
+    expected_message: str,
 ) -> None:
     """Attach persisted assistant text to the parent event while labeling it in the typed error."""
     from omnigent.server.routes import sessions as sessions_module
 
-    detail = (
-        "There's an issue with the selected model (claude-3-5-sonnet-20241022). "
-        "It may not exist or you may not have access to it."
-    )
     forwarded: list[dict[str, Any]] = []
     published: list[tuple[str, dict[str, Any]]] = []
 
@@ -5162,10 +5176,7 @@ async def test_post_external_session_status_failed_forwards_persisted_assistant_
     error = failed_events[0]["error"]
     assert error is not None
     assert error["code"] == "native_turn_error"
-    assert "selected model" in error["message"]
-    # Persisted assistant prose is labeled instead of reused verbatim.
-    assert error["message"] != detail
-    assert error["message"].startswith("The turn failed without a reported reason;")
+    assert error["message"] == expected_message
 
 
 @pytest.mark.parametrize(

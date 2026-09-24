@@ -1563,8 +1563,8 @@ def register_events_routes(
                 wire_detail = wire_output.strip() if isinstance(wire_output, str) else ""
                 if not detail:
                     message = _NATIVE_FAILURE_WITHOUT_DETAIL
-                elif wire_detail:
-                    # The forwarder reported this reason itself: verbatim.
+                elif wire_detail or detail.casefold().startswith("api error:"):
+                    # A forwarder reason or an explicit API error is already diagnostic.
                     message = detail
                 else:
                     # Label persisted assistant text so it is not mistaken for the reason.

@@ -7,9 +7,8 @@ the parent session: the gate reads the parent's effective model
 child's ``model_override``. Inheritance is best-effort and skips quietly
 when the sub-agent spec pins its own model, the child harness has no
 override plumbing, the parent model's family cannot run on the child
-harness, an opencode child cannot resolve a bare id (no ``provider/``
-prefix, no synthesizing Databricks profile), or the parent snapshot is
-unavailable.
+harness, an OpenCode child lacks a route for a bare id, or the parent
+snapshot is unavailable.
 """
 
 from __future__ import annotations
@@ -327,14 +326,7 @@ async def test_unreachable_parent_snapshot_skips_inheritance(
 async def test_opencode_worker_skips_bare_id_inheritance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    A bare vendor id is not inherited onto an opencode worker: opencode
-    resolves a model's provider from its ``provider/`` prefix, so the bare id
-    would land verbatim in ``opencode.json`` and fail the first turn with
-    ``ProviderModelNotFoundError``. The child keeps its own default.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    """
+    """A bare id leaves the OpenCode child without a model override."""
     _stub_worker_launchable(monkeypatch)
     bodies = await _dispatch_without_model(
         monkeypatch,
@@ -354,12 +346,7 @@ async def test_opencode_worker_skips_bare_id_inheritance(
 async def test_opencode_worker_inherits_provider_prefixed_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    A ``provider/model`` id is inherited onto an opencode worker verbatim —
-    opencode resolves the provider from the prefix against its own auth.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    """
+    """A ``provider/model`` id is inherited by OpenCode verbatim."""
     _stub_worker_launchable(monkeypatch)
     bodies = await _dispatch_without_model(
         monkeypatch,
@@ -379,12 +366,7 @@ async def test_opencode_worker_inherits_provider_prefixed_id(
 async def test_opencode_worker_with_profile_inherits_gateway_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    A worker spec naming a Databricks profile keeps inheriting: the launch
-    synthesizes a gateway provider that pins the id's serving endpoint.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    """
+    """A named Databricks profile permits gateway-model inheritance."""
     _stub_worker_launchable(monkeypatch)
     bodies = await _dispatch_without_model(
         monkeypatch,

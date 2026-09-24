@@ -200,10 +200,7 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
     return None
 
 
-# opencode resolves a model's provider from the id's own ``provider/`` prefix,
-# so a bare id has nowhere to route; best-effort parent-model inheritance
-# checks that before pushing one through (an explicit ``args.model`` keeps its
-# fail-loud contract at the harness instead).
+# OpenCode needs a provider prefix unless launch synthesizes a gateway.
 _OPENCODE_HARNESSES: frozenset[str] = frozenset({"opencode-native", "native-opencode", "opencode"})
 
 
@@ -213,38 +210,16 @@ def inherited_model_unservable_reason(
     *,
     databricks_profile: str | None,
 ) -> str | None:
-    """
-    Return why inheriting *model* onto *harness* cannot be served, or ``None``.
+    """Return a known reason to skip best-effort model inheritance.
 
-    Complements :func:`model_family_mismatch` for opencode, which it waves
-    through as multi-model: family compatibility alone does not make a bare id
-    servable there. opencode resolves a model's provider from the id's
-    ``provider/`` prefix against its own auth, so a bare id is only usable when
-    a Databricks profile lets the launch synthesize a gateway provider (which
-    re-pins the id to a serving endpoint).
-
-    Other multi-model harnesses (pi, openai-agents) are intentionally not
-    gated here: they route a validated id to the provider their launch
-    configured, so servability is a provider-resolution concern that belongs
-    in the harness, not a second-guess at the dispatch gate.
-
-    :param harness: The child's harness id, alias or canonical, e.g.
-        ``"opencode-native"``.
-    :param model: A model id that already passed
-        :func:`validate_model_override`.
-    :param databricks_profile: The Databricks profile the child's launch
-        would use (spec ``executor.config.profile``, else the ambient
-        ``DATABRICKS_CONFIG_PROFILE``); ``None`` when absent.
-    :returns: Human-readable reason to skip inheritance, or ``None`` when
-        the id is servable (or servability is not this function's concern).
+    Bare OpenCode ids need a Databricks profile to synthesize a provider.
+    Other harnesses are not filtered by this check.
     """
     canon = canonicalize_harness(harness)
     if canon in _OPENCODE_HARNESSES:
         if "/" in model:
             return None
         if databricks_profile:
-            # The launch-time Databricks gateway synthesis owns the id: it
-            # pins the matching serving endpoint (or the catalog default).
             return None
         return (
             f"opencode resolves a model's provider from its 'provider/' prefix; "

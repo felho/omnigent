@@ -1856,8 +1856,7 @@ async def _inherited_parent_model(
     if child_harness is not None:
         sub_config = getattr(getattr(sub_spec, "executor", None), "config", None)
         spec_profile = sub_config.get("profile") if isinstance(sub_config, dict) else None
-        # Profile precedence mirrors the opencode launch path
-        # (_opencode_native_profile_from_spec): spec config, else ambient env.
+        # Match OpenCode launch's spec-over-ambient profile precedence.
         unservable = inherited_model_unservable_reason(
             child_harness,
             parent_model,

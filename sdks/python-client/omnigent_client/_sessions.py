@@ -497,11 +497,15 @@ class SessionsNamespace:
         not resolvable this way and raises ``LookupError``.
 
         Follows the listing cursor, so an agent past the first page
-        still resolves.
+        still resolves. The only quiet end of the walk is the server
+        reporting ``has_more`` false; a stalled listing raises instead
+        of masquerading as a clean miss.
 
         :param agent_name: Agent display name, e.g. ``"hello_world"``.
         :returns: The matching agent's id and advertised harness.
-        :raises OmnigentError: If the listing returns a non-2xx status.
+        :raises OmnigentError: If the listing returns a non-2xx status,
+            or reports ``has_more`` with a missing or non-advancing
+            ``last_id`` cursor (a stalled walk, not an absent agent).
         :raises LookupError: If no registered agent has that name.
         """
         # Cap the miss-path name list: a large deployment should not
@@ -543,7 +547,15 @@ class SessionsNamespace:
                     f"agent listing stalled: server returned has_more=True but"
                     f" no last_id cursor (searched so far: {', '.join(names) or '<none>'})"
                 )
-            after = str(last_id)
+            next_after = str(last_id)
+            if next_after == after:
+                # A cursor that does not advance would page forever; raise
+                # instead of looping on the same page.
+                raise OmnigentError(
+                    f"agent listing stalled: server repeated cursor {next_after!r}"
+                    f" with has_more=True (searched so far: {', '.join(names) or '<none>'})"
+                )
+            after = next_after
         available = ", ".join(names) + (", …" if truncated else "")
         raise LookupError(
             f"No agent named {agent_name!r} is registered on this server. Available: {available}"

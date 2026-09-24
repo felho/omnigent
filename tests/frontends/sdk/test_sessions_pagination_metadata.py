@@ -227,3 +227,47 @@ async def test_resolve_agent_raises_on_has_more_without_cursor() -> None:
     # Either the stall is detected immediately (1 request + non-LookupError)
     # or the client retried and then raised — both are acceptable; the only
     # forbidden outcome is silently returning LookupError.
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_raises_on_repeated_cursor() -> None:
+    """A cursor that never advances must raise instead of paging forever."""
+    request_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        if request_count > 5:
+            # Escape hatch so a regressed client fails fast instead of
+            # spinning: end the listing and let it fall through to the
+            # clean-miss LookupError the assertion below rejects.
+            return httpx.Response(
+                200,
+                json={"data": [], "has_more": False, "first_id": None, "last_id": None},
+            )
+        # Every page reports more and hands back the same cursor.
+        return httpx.Response(
+            200,
+            json={
+                "data": [{"id": "ag_1", "name": "other_agent", "harness": "claude-sdk"}],
+                "has_more": True,
+                "first_id": "ag_1",
+                "last_id": "ag_1",
+            },
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        with pytest.raises(Exception) as exc_info:
+            await ns.resolve_agent("target_agent")
+    finally:
+        await client.aclose()
+
+    assert not isinstance(exc_info.value, LookupError), (
+        "resolve_agent looped on a non-advancing cursor and reported the "
+        "stalled walk as a clean 'no such agent' miss"
+    )
+    assert request_count <= 2, (
+        f"resolve_agent kept re-fetching the same page {request_count} times "
+        "instead of raising on the repeated cursor"
+    )

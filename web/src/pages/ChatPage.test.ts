@@ -1445,13 +1445,8 @@ describe("dispatchInitialPrompt", () => {
 });
 
 describe("isInitialPromptDelivered", () => {
-  // The reconcile behind hard-navigation recovery: a first message whose
-  // send was severed mid-flight (computer sleep) may have LANDED server-side
-  // without the client ever seeing the response. After the forced-re-login
-  // reload, the recovered prompt is re-dispatched ONLY when the hydrated
-  // transcript doesn't already carry it — these cases pin both directions,
-  // since a false negative double-delivers and a false positive re-loses the
-  // message.
+  // Reconciliation must avoid both replaying a delivered prompt and losing
+  // an undelivered one after reload.
   const ctx = (itemId: string) => ({
     agent: null,
     depth: 0,
@@ -1486,9 +1481,6 @@ describe("isInitialPromptDelivered", () => {
   });
 
   it("does not let a plain prompt match a skill receipt's echo text", () => {
-    // A plain-text prompt that happens to look like "/name args" must only
-    // match a user_message — the skill receipt branch is gated on
-    // prompt.skill, exercised below.
     expect(
       isInitialPromptDelivered([userMessage("unrelated")], {
         text: "/review-pr 123",
@@ -1512,7 +1504,6 @@ describe("isInitialPromptDelivered", () => {
         skill: { name: "review-pr", args: "123" },
       }),
     ).toBe(true);
-    // A different invocation of the same skill is NOT this prompt.
     expect(
       isInitialPromptDelivered([receipt], {
         text: "/review-pr 456",
@@ -1522,8 +1513,7 @@ describe("isInitialPromptDelivered", () => {
   });
 
   it("finds a delivered skill invocation by its synthesized user echo", () => {
-    // Some funnels render the receipt as a user bubble carrying the typed
-    // text (`slashCommandEchoText`); recovery must treat that as delivered.
+    // Some funnels render a user echo instead of the receipt.
     expect(
       isInitialPromptDelivered([userMessage("/review-pr 123")], {
         text: "/review-pr 123",

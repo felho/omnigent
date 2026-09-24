@@ -9967,13 +9967,8 @@ describe("chatStore — startStreamPump reconnect loop", () => {
   });
 });
 
-// The first-message handoff from the landing composer to ChatPage. Within
-// one page load the transport is strictly read-once, but a sessionStorage
-// copy survives until the send settles server-side: it is what recovers a
-// first message across the hard navigation of a forced re-login
-// (sleep/wake), instead of silently losing it. Replay of a delivered prompt
-// is prevented by the settle-clear (exercised below via `send`), the
-// per-heap dispatch guard, and ChatPage's transcript reconcile.
+// The in-memory handoff is read-once; storage survives until server settlement.
+// A per-heap guard and transcript reconciliation prevent duplicate dispatch.
 describe("pending initial prompt transport", () => {
   beforeEach(() => {
     window.sessionStorage.clear();
@@ -9986,18 +9981,12 @@ describe("pending initial prompt transport", () => {
       text: "read the README",
       skill: null,
     });
-    // Within the SAME heap the transport stays strictly read-once — the
-    // persisted copy is recovery insurance for a hard navigation, never a
-    // second prompt for the page that already dispatched it (that would
-    // double-send alongside the original in-flight POST).
+    // The storage copy must not dispatch again within this heap.
     expect(consumePendingInitialPrompt("conv_abc")).toBeNull();
   });
 
   it("persists text + skill only, so a hard navigation can recover them", () => {
-    // The map is module state, so a real hard navigation can't be simulated
-    // here — pin the storage side: the entry exists under the persistence
-    // key after set, and carries text + skill only (`File` attachments
-    // cannot survive serialization — recovery degrades to text-only).
+    // A unit test cannot reset the module map; inspect the stored payload.
     setPendingInitialPrompt("conv_hard", {
       text: "survive the reload",
       skill: null,
@@ -10011,10 +10000,7 @@ describe("pending initial prompt transport", () => {
   });
 
   it("recovers a persisted prompt from a previous page load, once", () => {
-    // A prior page load stashed the prompt and was hard-navigated away
-    // (forced re-login) before the send settled: this heap has no map entry
-    // and never dispatched for the conversation — exactly the state a
-    // direct storage seed models.
+    // A direct storage seed models a fresh page with no in-memory entry.
     window.sessionStorage.setItem(
       "omnigent.pendingInitialPrompts",
       JSON.stringify({ conv_recovered: { text: "came back after wake", skill: null } }),
@@ -10023,16 +10009,13 @@ describe("pending initial prompt transport", () => {
       text: "came back after wake",
       skill: null,
     });
-    // Recovery hands the prompt to a dispatcher once per page load — a
-    // repeat consume in this heap must not double-dispatch it.
     expect(consumePendingInitialPrompt("conv_recovered")).toBeNull();
   });
 
   it("clearPersistedInitialPrompt drops the recovery copy", () => {
     setPendingInitialPrompt("conv_clear", { text: "already delivered", skill: null });
     consumePendingInitialPrompt("conv_clear");
-    // ChatPage's reconcile calls this when the hydrated transcript already
-    // carries the prompt — afterwards a reload has nothing to re-dispatch.
+    // Reconciliation drops the copy when the transcript already has the prompt.
     clearPersistedInitialPrompt("conv_clear");
     expect(window.sessionStorage.getItem("omnigent.pendingInitialPrompts")).toBeNull();
   });
@@ -10040,7 +10023,6 @@ describe("pending initial prompt transport", () => {
   it("tolerates a corrupt persisted payload", () => {
     window.sessionStorage.setItem("omnigent.pendingInitialPrompts", "{not json");
     expect(consumePendingInitialPrompt("conv_corrupt")).toBeNull();
-    // A fresh stash still round-trips after the corrupt state.
     setPendingInitialPrompt("conv_corrupt", { text: "after corruption", skill: null });
     expect(consumePendingInitialPrompt("conv_corrupt")).toEqual({
       text: "after corruption",
@@ -10049,10 +10031,7 @@ describe("pending initial prompt transport", () => {
   });
 
   it("a settled send clears the persisted copy so a reload can't replay it", async () => {
-    // The landing handoff: stash + consume, send dispatched… and this time
-    // the POST settles (the default handler acks /events). The persisted
-    // copy must be gone — otherwise every later reload of the session would
-    // re-post the first message.
+    // An acknowledged POST must remove its recovery copy.
     setPendingInitialPrompt("conv_settle", { text: "hello there", skill: null });
     expect(consumePendingInitialPrompt("conv_settle")).toEqual({
       text: "hello there",
@@ -10068,9 +10047,7 @@ describe("pending initial prompt transport", () => {
   });
 
   it("a send severed mid-flight keeps the persisted copy for recovery", async () => {
-    // The sleep/wake journey: the auto-send POST dies as a network error.
-    // The failure path must NOT clear the recovery copy — it is exactly what
-    // the post-wake reload re-dispatches.
+    // A network failure leaves the copy available for a later reload.
     setPendingInitialPrompt("conv_severed", { text: "must survive sleep", skill: null });
     expect(consumePendingInitialPrompt("conv_severed")).toEqual({
       text: "must survive sleep",
@@ -10092,8 +10069,7 @@ describe("pending initial prompt transport", () => {
   });
 
   it("an unrelated settled send does not clear a pending recovery copy", async () => {
-    // Content-matched clearing: a different message settling in the same
-    // session must not discard a first message still awaiting recovery.
+    // A different settled message must not erase the first prompt.
     setPendingInitialPrompt("conv_unrelated", { text: "still pending", skill: null });
     consumePendingInitialPrompt("conv_unrelated");
     useChatStore.setState({

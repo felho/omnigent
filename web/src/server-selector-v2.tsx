@@ -26,6 +26,7 @@ interface OmnigentSetup {
   setServerSelectorV2?: (enabled: boolean) => Promise<unknown>;
   getSetupCapabilities?: () => Promise<{ v2Forced?: boolean }>;
   setColorScheme?: (scheme: "light" | "dark" | "system") => void;
+  getColorScheme?: () => Promise<{ source: string; effective: "light" | "dark" } | null>;
   onColorScheme?: (cb: (theme: "light" | "dark") => void) => () => void;
   getCliStatus: () => Promise<{ installed?: boolean; installSupported?: boolean }>;
   startLocalServer: () => Promise<{ ok?: boolean; url?: string; error?: string }>;
@@ -73,6 +74,10 @@ function BridgeSetupApp() {
   // Whether the env var pins the selector on → "Switch to legacy" can't take
   // effect, so the menu item is disabled.
   const [v2Forced, setV2Forced] = useState(false);
+  // The shell's current color-scheme source. themeSource is process-global and
+  // survives navigation, so a returning-to-setup wizard must seed the radio
+  // from it (not assume "system"). Undefined → shell didn't report → "system".
+  const [colorScheme, setColorScheme] = useState<"system" | "light" | "dark">("system");
   // Hold the initial paint until the CLI probe resolves, so the wizard opens on
   // the correct step (welcome vs server list) instead of flashing the wrong one.
   const [ready, setReady] = useState(false);
@@ -104,7 +109,16 @@ function BridgeSetupApp() {
     const caps = bridge.getSetupCapabilities
       ? bridge.getSetupCapabilities().then((c) => setV2Forced(c?.v2Forced === true))
       : Promise.resolve();
-    Promise.allSettled([savedUrl, recents, managed, cli, caps]).then(() => {
+    // Seed the radio + `.dark` class from the shell's live theme so returning to
+    // setup after the app set Dark shows Dark, not the "system" default.
+    const theme = bridge.getColorScheme
+      ? bridge.getColorScheme().then((s) => {
+          if (!s) return;
+          setColorScheme(s.source === "light" || s.source === "dark" ? s.source : "system");
+          document.documentElement.classList.toggle("dark", s.effective === "dark");
+        })
+      : Promise.resolve();
+    Promise.allSettled([savedUrl, recents, managed, cli, caps, theme]).then(() => {
       // A failed CLI probe means "not installed" rather than unknown.
       setInstalled((prev) => prev ?? false);
       setReady(true);
@@ -238,6 +252,7 @@ function BridgeSetupApp() {
     onSetColorScheme: setupBridge()?.setColorScheme
       ? (scheme) => setupBridge()?.setColorScheme?.(scheme)
       : undefined,
+    initialColorScheme: colorScheme,
   };
 
   return (

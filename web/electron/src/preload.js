@@ -454,6 +454,10 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
    *  persisted — resets to the OS default on relaunch.
    *  @param {"light"|"dark"|"system"} scheme */
   setColorScheme: (scheme) => ipcRenderer.send("omnigent:setup-set-color-scheme", scheme),
+  /** Current color scheme: `{source, effective}` — the persisted-for-the-session
+   *  source (system/light/dark) and the resolved appearance. Seeds the wizard's
+   *  radio + `.dark` class on load (themeSource may hold a value set earlier). */
+  getColorScheme: () => ipcRenderer.invoke("omnigent:setup-get-color-scheme"),
   /** Subscribe to the wizard's effective theme ("dark"/"light") so the renderer
    *  can sync its `.dark` class; fires on set and on OS changes. */
   onColorScheme: (callback) => {

@@ -86,6 +86,9 @@ export interface ServerSelectorV2Setup {
   /** Set the wizard's live color scheme (System/Light/Dark), if the shell
    *  supports it. Absent → the theme submenu is hidden. */
   onSetColorScheme?: (scheme: "light" | "dark" | "system") => void;
+  /** The shell's current color-scheme source, to seed the radio (themeSource
+   *  survives navigation, so it may be non-system on return to setup). */
+  initialColorScheme?: "system" | "light" | "dark";
 }
 
 /** Result of the advisory reachability probe. */
@@ -115,9 +118,11 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   const [step, setStep] = useState<Step>(
     setup.error || setup.initialStep === "server" || setup.installed ? "server" : "landing",
   );
-  // Wizard color scheme (live only; the shell resets to the OS default on
-  // relaunch, so we default to "system" and don't try to read it back).
-  const [colorScheme, setColorScheme] = useState<"system" | "light" | "dark">("system");
+  // Wizard color scheme radio. Seeded from the shell's current source (which
+  // survives navigation), defaulting to "system" when the shell doesn't report.
+  const [colorScheme, setColorScheme] = useState<"system" | "light" | "dark">(
+    setup.initialColorScheme ?? "system",
+  );
   // The preset server picked from the landing split button (drives the detail step).
   const [detailUrl, setDetailUrl] = useState<string | null>(null);
   // What the terminal step should run after any install: start the local server,

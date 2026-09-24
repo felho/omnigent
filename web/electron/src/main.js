@@ -3403,32 +3403,45 @@ function registerIpc() {
     }
   });
 
-  // Setup page → live color-scheme override (System/Light/Dark) for the wizard.
+  // Setup page ↔ live color-scheme override (System/Light/Dark) for the wizard.
   // Separate sender gate from the SPA handler above: the setup page isn't a
-  // pinned origin. Not persisted — resets to the OS default on relaunch.
-  // Tracks setup senders wired to nativeTheme "updated" so we register once.
-  const setupThemeSenders = new Set();
+  // pinned origin. themeSource is process-global and NOT persisted, so it may
+  // still hold a value the connected SPA set earlier this run — the wizard must
+  // read it on load rather than assume "system".
+
+  // Read the current source + effective appearance so the wizard can seed its
+  // radio and `.dark` class on mount (the wizard's dark styles key off the
+  // class, not the OS media query). Mirrors update_overlay's initial send.
+  ipcMain.handle("omnigent:setup-get-color-scheme", (event) => {
+    if (!isSetupPageSender(event)) return null;
+    return {
+      source: nativeTheme.themeSource,
+      effective: nativeTheme.shouldUseDarkColors ? "dark" : "light",
+    };
+  });
+
   ipcMain.on("omnigent:setup-set-color-scheme", (event, scheme) => {
     if (!isSetupPageSender(event)) return;
     if (scheme !== "light" && scheme !== "dark" && scheme !== "system") return;
     nativeTheme.themeSource = scheme;
-    // The wizard's dark styles key off a `.dark` class (index.css), not the OS
-    // media query, so push the effective theme back for the renderer to apply.
-    // Track later OS changes too, so "System" restyles live (like the update
-    // overlay). Sender-scoped, and cleaned up when the page goes away.
-    const sender = event.sender;
-    const pushTheme = () =>
-      sender.send("omnigent:setup-theme", nativeTheme.shouldUseDarkColors ? "dark" : "light");
-    if (!setupThemeSenders.has(sender)) {
-      setupThemeSenders.add(sender);
-      const onUpdated = () => pushTheme();
-      nativeTheme.on("updated", onUpdated);
-      sender.once("destroyed", () => {
-        nativeTheme.removeListener("updated", onUpdated);
-        setupThemeSenders.delete(sender);
-      });
+    event.sender.send(
+      "omnigent:setup-theme",
+      nativeTheme.shouldUseDarkColors ? "dark" : "light",
+    );
+  });
+
+  // Track OS appearance changes once, and push to every WebContents CURRENTLY
+  // on the setup page — re-checked per send, since setup and the connected SPA
+  // share one reused WebContents (a destroyed-only cleanup would leak the push
+  // into the SPA after navigation). "System" thus restyles live.
+  nativeTheme.on("updated", () => {
+    const theme = nativeTheme.shouldUseDarkColors ? "dark" : "light";
+    for (const win of BrowserWindow.getAllWindows()) {
+      const wc = win.webContents;
+      if (wc && !wc.isDestroyed() && isSetupPageUrl(wc.getURL())) {
+        wc.send("omnigent:setup-theme", theme);
+      }
     }
-    pushTheme();
   });
 
   // SPA → start / stop / restart this machine's host daemon for the window's

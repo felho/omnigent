@@ -139,4 +139,19 @@ describe("ServerSelectorV2", () => {
     fireEvent.click(screen.getByRole("menuitemradio", { name: "Dark" }));
     expect(onSetColorScheme).toHaveBeenCalledWith("dark");
   });
+
+  it("seeds the Appearance radio from the shell's current scheme", () => {
+    // Returning to setup after the app set Dark: the radio reflects Dark, not
+    // the "system" default.
+    render(
+      <ServerSelectorV2 setup={makeSetup({ onSetColorScheme: vi.fn(), initialColorScheme: "dark" })} />,
+    );
+    fireEvent.pointerDown(screen.getByRole("button", { name: /server selector settings/i }), {
+      button: 0,
+    });
+    expect(screen.getByRole("menuitemradio", { name: "Dark" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+  });
 });

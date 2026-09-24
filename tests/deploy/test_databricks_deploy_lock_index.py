@@ -161,7 +161,10 @@ def test_registry_check_rejects_direct_url_sources(deploy_mod: ModuleType, tmp_p
 def test_registry_check_redacts_index_credentials(deploy_mod: ModuleType, tmp_path: Path) -> None:
     """Index URLs with embedded credentials must not reach the error message."""
     lock = tmp_path / "uv.lock"
-    lock.write_text('source = { registry = "https://user:secret@mirror.corp.example/simple" }\n')
+    lock.write_text(
+        'source = { registry = "https://user:secret@mirror.corp.example/simple" }\n'
+        'source = { url = "https://downloads.example/pkg.whl?token=qu3ry-tok3n#frag" }\n'
+    )
 
     with pytest.raises(SystemExit) as excinfo:
         deploy_mod._check_lock_registries(lock, "https://tok3n@proxy.example/simple")
@@ -170,6 +173,7 @@ def test_registry_check_redacts_index_credentials(deploy_mod: ModuleType, tmp_pa
     assert "secret" not in message
     assert "tok3n" not in message
     assert "***@mirror.corp.example" in message
+    assert "https://downloads.example/pkg.whl" in message
 
 
 def test_registry_check_tolerates_trailing_slash(deploy_mod: ModuleType, tmp_path: Path) -> None:
@@ -201,3 +205,10 @@ def test_redact_url_handles_literal_at_in_password(deploy_mod: ModuleType) -> No
 
     assert redacted == "https://***@mirror.corp.example/simple"
     assert "ssw0rd" not in redacted
+
+
+def test_redact_url_drops_query_and_fragment(deploy_mod: ModuleType) -> None:
+    """Query strings and fragments can carry tokens; diagnostics must drop them."""
+    redacted = deploy_mod._redact_url("https://downloads.example/pkg.whl?token=qu3ry-tok3n#frag")
+
+    assert redacted == "https://downloads.example/pkg.whl"

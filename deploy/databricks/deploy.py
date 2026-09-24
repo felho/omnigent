@@ -566,9 +566,11 @@ def run_uv_lock(src: Path) -> None:
 
 
 def _redact_url(url: str) -> str:
-    """Strip userinfo credentials from a URL before it reaches a log."""
+    """Strip userinfo, query, and fragment from a URL before it reaches a log."""
     # [^/]+ (not [^/@]+) so a literal `@` inside a password redacts fully.
-    return re.sub(r"^(\w+://)[^/]+@", r"\1***@", url)
+    url = re.sub(r"^(\w+://)[^/]+@", r"\1***@", url)
+    # Query strings and fragments can carry tokens (e.g. ?token=...).
+    return url.split("?", 1)[0].split("#", 1)[0]
 
 
 def _canonical_index(url: str) -> str:

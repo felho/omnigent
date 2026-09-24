@@ -12585,3 +12585,65 @@ async def test_stable_id_naming_a_different_item_is_rejected(
         if "text" in block
     ]
     assert "run this instead" not in texts
+
+
+def test_same_web_submission_requires_exact_author_match() -> None:
+    """
+    An unattributed stored item is nobody's to re-send; authors must match exactly.
+
+    Same text under an existing id is a re-send only when it is the same user
+    message by the same author. ``None == None`` still covers single-user mode.
+    """
+    from omnigent.entities import ConversationItem, MessageData, NewConversationItem
+    from omnigent.server.routes._sessions.orchestration import _same_web_submission
+
+    content = [{"type": "input_text", "text": "hi"}]
+
+    def stored(created_by: str | None) -> ConversationItem:
+        return ConversationItem(
+            id="a" * 32,
+            type="message",
+            status="completed",
+            response_id="resp_x",
+            created_at=0,
+            data=MessageData(role="user", content=content),
+            created_by=created_by,
+        )
+
+    item = NewConversationItem(
+        type="message", response_id="resp_y", data=MessageData(role="user", content=content)
+    )
+    assert _same_web_submission(stored(None), item, None) is True
+    assert _same_web_submission(stored("alice@example.com"), item, "alice@example.com") is True
+    assert _same_web_submission(stored(None), item, "alice@example.com") is False
+    assert _same_web_submission(stored("alice@example.com"), item, None) is False
+    assert _same_web_submission(stored("alice@example.com"), item, "bob@example.com") is False
+
+
+def test_consumed_event_carries_the_web_stable_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A receipt names the submission it acknowledges, not only the persisted item id."""
+    from omnigent.entities import ConversationItem, MessageData
+    from omnigent.server.routes._sessions import helpers
+
+    published: list[dict[str, Any]] = []
+
+    class _Stream:
+        def publish(self, _session_id: str, event: dict[str, Any]) -> None:
+            published.append(event)
+
+    monkeypatch.setattr(helpers, "session_stream", _Stream())
+    item = ConversationItem(
+        id="f" * 32,
+        type="message",
+        status="completed",
+        response_id="resp_x",
+        created_at=0,
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+    )
+    helpers._publish_input_consumed(
+        "conv_a", item, cleared_pending_id="pending_1", stable_id="a" * 32
+    )
+    assert published[0]["data"]["stable_id"] == "a" * 32
+    assert published[0]["data"]["cleared_pending_id"] == "pending_1"
+    helpers._publish_input_consumed("conv_a", item)
+    assert published[1]["data"]["stable_id"] is None

@@ -178,10 +178,12 @@ class _Entry:
 _pending: WorkspaceScopedCache[str, dict[str, _Entry]] = WorkspaceScopedCache()
 _lock = threading.Lock()
 
-# How long a drained web submission's committed item id stays resolvable for
-# a client retry of the same ``stable_id``. Retries happen while the tab that
-# sent the message is still open, so an hour covers them with margin.
-_COMMITTED_TTL_S: float = 3600.0
+# How long a web submission stays resolvable for a client retry of the same
+# ``stable_id``: its committed item id, and (SDK path) the fact that the runner
+# accepted it. This is the retry window the client honours too — a failed send
+# older than this is not revived after a reload — so delivery evidence is kept
+# for as long as a submission can still be retried.
+_COMMITTED_TTL_S: float = 24 * 3600.0
 # Per-conversation cap on remembered submissions; the oldest is dropped first.
 _COMMITTED_MAX_PER_CONVERSATION = 256
 

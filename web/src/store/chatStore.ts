@@ -1313,6 +1313,13 @@ let pendingSeq = 0;
  */
 const SEND_CHECK_DELAY_MS = 1_000;
 
+/**
+ * How long a failed send stays re-sendable, matching the server's memory of
+ * delivered submissions: re-sending the same stable id is only safe while the
+ * server can still recognise it.
+ */
+const SEND_RETRY_WINDOW_S = 24 * 3600;
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
@@ -1458,8 +1465,15 @@ export function rehydratePersistedSends(conversationId: string): void {
   if (records.length === 0) return;
   const state = setterForState(conversationId);
   if (state === null) return;
+  const nowS = Date.now() / 1000;
   const revived: PendingUserMessage[] = [];
   for (const record of records) {
+    // Past the retry window the server no longer remembers the delivery, so a
+    // re-send could run the message twice. The record is dropped instead.
+    if (record.createdAtS !== undefined && nowS - record.createdAtS > SEND_RETRY_WINDOW_S) {
+      forgetPendingSend(conversationId, record.stableId);
+      continue;
+    }
     // Identity only: a snapshot pending entry or a committed item carrying
     // this stable id means the server has it. Matching wording is not
     // evidence — two identical messages are two messages.
@@ -2706,6 +2720,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           false;
         if (!stillPending()) throw firstErr;
         setSendFailed(checkTarget, tempId, { attempts: 1 });
+        // Remembered now, not after the check: a reload during the wait must
+        // bring the message back with its stable id. Confirmation forgets it.
+        persistFailedBubble(checkTarget, tempId);
         await sleep(SEND_CHECK_DELAY_MS);
         if (!stillPending()) throw firstErr;
         setSendFailed(checkTarget, tempId, undefined);
@@ -6445,16 +6462,20 @@ function committedContentFor(
  * Which optimistic bubble a consumed event acknowledges. In-flight and posted
  * bubbles are matched by queue position: per-session ordering makes the oldest
  * the right one. A failed bubble has left the queue, so it is matched only by
- * identity — the committed item id equal to its stable id, which is how the
- * SDK path persists it — and only when the queue head does not match that
- * receipt itself. Wording is never evidence: a native receipt carries the
- * forwarder's id, so a failed native bubble is cleared by its own re-send
- * instead. Returns -1 when nothing should be acknowledged (an unsent draft at
+ * identity — the receipt's `stable_id` (the submission it acknowledges), or the
+ * committed item id when that is the stable id, as on the SDK path — and only
+ * when the queue head does not match that receipt itself. Wording is never
+ * evidence. Returns -1 when nothing should be acknowledged (an unsent draft at
  * the head, or nothing waits).
  */
-function pickPendingForConsumed(pending: PendingUserMessage[], itemId: string): number {
+function pickPendingForConsumed(
+  pending: PendingUserMessage[],
+  itemId: string,
+  stableId: string | undefined,
+): number {
+  const submissionId = stableId ?? itemId;
   const matches = (p: PendingUserMessage): boolean =>
-    p.stableId !== undefined && p.stableId === itemId;
+    p.stableId !== undefined && p.stableId === submissionId;
   const firstLive = pending.findIndex((p) => p.failed === undefined);
   const head = firstLive >= 0 && !pending[firstLive]!.initialDraft ? firstLive : -1;
   const failedIdx = pending.findIndex((p) => p.failed !== undefined && matches(p));
@@ -7240,7 +7261,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // steal a real queued message's bubble. Hold the head back for a marker.
           const eventContent = userContentFromEvent(event);
           if (eventContent !== null && isSystemUserContent(eventContent)) return {};
-          const ack = pickPendingForConsumed(s.pendingUserMessages, event.itemId);
+          const ack = pickPendingForConsumed(s.pendingUserMessages, event.itemId, event.stableId);
           if (ack < 0) return {};
           return { pendingUserMessages: noteAcknowledged(s.pendingUserMessages, ack) };
         }
@@ -7288,7 +7309,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         const headIdx =
           eventContent !== null && isSystemUserContent(eventContent)
             ? -1
-            : pickPendingForConsumed(s.pendingUserMessages, event.itemId);
+            : pickPendingForConsumed(s.pendingUserMessages, event.itemId, event.stableId);
         const head = headIdx >= 0 ? s.pendingUserMessages[headIdx] : undefined;
         if (head) {
           const content = committedContentFor(event, head.content);

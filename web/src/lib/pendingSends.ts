@@ -14,6 +14,12 @@ export interface PersistedPendingSend {
 }
 
 const STORAGE_KEY = "omnigent.pendingSends";
+/**
+ * Failed sends kept per conversation. Older ones fall off the reload record
+ * (their text is still in the transcript until the tab closes); a user with
+ * more than this many undelivered messages in one chat has a bigger problem
+ * than the record.
+ */
 const MAX_PER_CONVERSATION = 20;
 
 type Stored = Record<string, PersistedPendingSend[]>;

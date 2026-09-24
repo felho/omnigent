@@ -3123,7 +3123,9 @@ def create_runner_app(
     # buffered) a turn, per conversation. The server dedupes web re-sends,
     # but its memory is process-local: after a server restart a re-send of a
     # message this runner already ran arrives as a fresh forward. The runner
-    # outlives the server, so this is the durable half of that guarantee.
+    # outlives the server, so this is the durable half of that guarantee. The
+    # cap comfortably exceeds the messages a conversation sees within the
+    # client's one-day retry window.
     _started_item_ids: dict[str, deque[str]] = {}
     _session_event_queues = _session_event_queues_ref
     app.state.session_event_queues = _session_event_queues
@@ -9923,7 +9925,7 @@ def create_runner_app(
                 persisted_item_id = message_body.get("persisted_item_id")
                 if not isinstance(persisted_item_id, str) or not persisted_item_id:
                     persisted_item_id = None
-                started_ids = _started_item_ids.setdefault(conversation_id, deque(maxlen=64))
+                started_ids = _started_item_ids.setdefault(conversation_id, deque(maxlen=512))
                 if persisted_item_id is not None and persisted_item_id in started_ids:
                     _logger.info(
                         "post_session_events: message %s already started a turn for conv=%s; "

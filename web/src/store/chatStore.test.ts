@@ -5661,6 +5661,67 @@ describe("chatStore — send (failed send)", () => {
     expect(bodies).toEqual([]);
   });
 
+  it("acknowledges a failed native bubble by the receipt's stable id, not the queue head", () => {
+    // A reached the runner but both POST responses were lost, so A is failed
+    // with no pending id; B was sent after it and is live. A's receipt is a
+    // native mirror (forwarder-derived item id) that carries A's stable id:
+    // it must clear A and leave B untouched.
+    useChatStore.setState({
+      pendingUserMessages: [
+        {
+          tempId: "pend_a",
+          stableId: "a".repeat(32),
+          content: [{ type: "input_text", text: "first" }],
+          failed: { attempts: 2 },
+        },
+        { tempId: "pend_b", content: [{ type: "input_text", text: "second" }], posted: true },
+      ],
+    });
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "fwd_7c1d",
+      itemType: "message",
+      stableId: "a".repeat(32),
+      clearedPendingId: "pending_srv_a",
+      data: { role: "user", content: [{ type: "input_text", text: "first" }] },
+    });
+    const state = useChatStore.getState();
+    expect(state.pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_b"]);
+    expect(
+      state.blocks
+        .filter((b): b is UserMessageBlock => b.type === "user_message")
+        .map((b) => b.ctx.itemId),
+    ).toEqual(["fwd_7c1d"]);
+  });
+
+  it("remembers a send for reload as soon as its first attempt fails", async () => {
+    const bodies = installFlakyPost(1, () => mockResponse({ queued: true, item_id: "msg_ok" }));
+    const sending = useChatStore.getState().send("reload mid-check", "agent_xyz");
+    await vi.advanceTimersByTimeAsync(0);
+    // Before the check has run: the record already exists.
+    expect(bodies).toHaveLength(1);
+    expect(readPendingSends("conv_existing")).toEqual([
+      expect.objectContaining({ content: [{ type: "input_text", text: "reload mid-check" }] }),
+    ]);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await sending;
+    // Confirmed by the check: the record is gone again.
+    expect(useChatStore.getState().pendingUserMessages[0]).toMatchObject({ posted: true });
+    expect(readPendingSends("conv_existing")).toEqual([]);
+  });
+
+  it("does not revive a remembered send older than the retry window", () => {
+    const content = [{ type: "input_text" as const, text: "from yesterday" }];
+    persistPendingSend("conv_existing", {
+      stableId: "9".repeat(32),
+      content,
+      createdAtS: Math.floor(Date.now() / 1000) - 25 * 3600,
+    });
+    rehydratePersistedSends("conv_existing");
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(readPendingSends("conv_existing")).toEqual([]);
+  });
+
   it("does not revive a remembered send the server already shows, matching by identity only", () => {
     const content = [{ type: "input_text" as const, text: "already there" }];
     // The first attempt landed after all: the snapshot replays it as a pending

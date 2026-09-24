@@ -2684,7 +2684,10 @@ async def _persist_external_conversation_item(
             pending_inputs.remember_committed(session_id, skipped.stable_id, persisted_user.id)
         if not persisted_user.deduplicated:
             _publish_input_consumed(
-                session_id, persisted_user, cleared_pending_id=skipped.pending_id
+                session_id,
+                persisted_user,
+                cleared_pending_id=skipped.pending_id,
+                stable_id=skipped.stable_id,
             )
             _publish_external_conversation_item(session_id, persisted_error)
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
@@ -2696,6 +2699,7 @@ async def _persist_external_conversation_item(
         persisted,
         cleared_pending_id=cleared_pending_id,
         message_id=message_id if isinstance(message_id, str) else None,
+        stable_id=drained.stable_id if drained is not None else None,
     )
     _drive_terminal_resolved_elicitation(session_id, persisted)
     return persisted.id
@@ -6013,7 +6017,7 @@ async def _forward_event_to_runner(
         # the runner has the message and will start the turn.
         if web_stable_id is not None:
             pending_inputs.mark_dispatched(session_id, web_stable_id)
-        _publish_input_consumed(session_id, persisted_items[0])
+        _publish_input_consumed(session_id, persisted_items[0], stable_id=web_stable_id)
         _logger.info(
             "turn dispatched to runner for session=%s",
             session_id,
@@ -6280,7 +6284,9 @@ def _same_web_submission(
         return False
     if stored.data.content != item.data.content:
         return False
-    return stored.created_by is None or created_by is None or stored.created_by == created_by
+    # Exact author equality: an unattributed stored item is not anyone's to
+    # re-send, and an authenticated re-send must come from the original author.
+    return stored.created_by == created_by
 
 
 def _web_stable_id(body: SessionEventInput) -> str | None:

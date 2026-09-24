@@ -1,48 +1,9 @@
-"""End-to-end test: a stopped sub-agent must not read as still running.
+"""Check the supervisor's child status after a runner restart within grace.
 
-A Polly-style supervisor dispatches a sub-agent and goes idle while the
-child works. If the runner process is interrupted mid-child-turn (laptop
-close, wifi drop, host daemon restart) and a replacement runner reconnects
-promptly — inside the server's disconnect grace — the server skips
-offline-marking for the runner's sessions. The child's in-flight turn died
-with the old runner process, but the server never records that: no
-``failed``/interrupted status is persisted for the child, no completion or
-wake ever reaches the supervisor, and the supervisor's state-inspection
-tool gives it nothing to reconcile with — ``sys_session_list`` sub-agent
-rows carry no status field at all, and the global sessions list omits
-sub-agent sessions entirely.
-
-So after the interruption the supervisor's status check reports nothing
-about the stopped child. Left with only its own "dispatched, waiting"
-context, the supervisor insists the stopped sub-agent is still working —
-the user has to manually chat with the sub-agent to re-kick it.
-
-This test reproduces that journey deterministically:
-
-1. The supervisor dispatches a gated researcher sub-agent (its mock-LLM
-   response blocks until the test releases a gate), then ends its turn —
-   the child is now mid-turn, status ``running``.
-2. The test SIGKILLs the runner process (the interruption) and immediately
-   spawns a replacement with the same binding token, so it reconnects as
-   the same runner id within the disconnect grace. The child's turn is
-   gone; the child will never complete.
-3. After the grace has elapsed and the state has settled, the user bumps
-   the supervisor to check on the sub-agent; the supervisor inspects via
-   ``sys_session_list``. The test asserts the supervisor IS told the dead
-   child's status, and that the status is not ``running``/``waiting``.
-
-On a buggy build the first assertion fails: the captured tool output
-mentions the child only as ``{agent, title, conversation_id}`` — no
-status — so the supervisor cannot learn the child stopped; the failure
-message includes the ground truth (the child never produced a completion).
-A fix that surfaces the child's true state to the supervisor makes both
-assertions pass; a fix that surfaces a stale ``running`` is caught by the
-second.
-
-Excluded from default ``pytest`` runs via ``--ignore=tests/e2e``. Invoke
-with::
-
-    pytest tests/e2e/test_stale_subagent_status_after_runner_restart_e2e.py -v --timeout=600
+A mock LLM holds the child mid-turn while the test kills its runner. A
+replacement reconnects under the same ID before offline marking. After the
+grace period, the supervisor's real session-list result must not report the
+incomplete child as running or waiting.
 """
 
 from __future__ import annotations
@@ -87,15 +48,7 @@ pytestmark = [pytest.mark.timeout(600, method="signal")]
 
 
 def _ambient_free_environ() -> dict[str, str]:
-    """Return ``os.environ`` minus ambient runner/host identity variables.
-
-    When the test itself runs inside an omnigent runner (an agent session),
-    the parent process leaks ``OMNIGENT_RUNNER_*`` / ``OMNIGENT_HOST_*`` vars
-    that make the dedicated stack's subprocesses bind to the *outer* server
-    instead of this test's own. Strip them so the stack is hermetic.
-
-    :returns: A copy of the environment safe to base subprocess envs on.
-    """
+    """Strip inherited runner identity so subprocesses bind to this stack."""
     return {
         k: v
         for k, v in os.environ.items()
@@ -105,11 +58,7 @@ def _ambient_free_environ() -> dict[str, str]:
 
 
 def _merged_no_proxy(env: dict[str, str]) -> str:
-    """Return the env's NO_PROXY extended with loopback hosts.
-
-    :param env: Environment mapping about to be passed to a subprocess.
-    :returns: Comma-joined NO_PROXY value including loopback entries.
-    """
+    """Include loopback hosts in the subprocess's NO_PROXY."""
     existing = env.get("NO_PROXY") or env.get("no_proxy") or ""
     parts = [p for p in existing.split(",") if p]
     for host in _LOOPBACK_NO_PROXY.split(","):
@@ -119,15 +68,7 @@ def _merged_no_proxy(env: dict[str, str]) -> str:
 
 
 class _RunnerRestartStack:
-    """A dedicated server plus a killable, replaceable runner.
-
-    The shared session-scoped ``live_server`` fixture's runner cannot be
-    killed mid-test without poisoning every other test, so this stack owns
-    its own subprocesses. The server stays up throughout; the runner can be
-    SIGKILLed and respawned with the same tunnel binding token, so the
-    replacement reconnects as the *same* runner id — the mid-turn
-    interruption this bug needs.
-    """
+    """Own a server and a replaceable runner with a stable binding token."""
 
     def __init__(self, mock_llm_server_url: str, tmp_path: Path) -> None:
         self._mock_base = f"{mock_llm_server_url}/v1"
@@ -180,8 +121,7 @@ class _RunnerRestartStack:
         )
 
     def _spawn_runner(self) -> None:
-        # Base on the server env so the runner imports the worktree source
-        # (PYTHONPATH), mirroring the live_server fixture's runner spawn.
+        # Keep the runner on this worktree's PYTHONPATH.
         env = apply_runner_env(
             {
                 **self._server_env(),
@@ -202,11 +142,7 @@ class _RunnerRestartStack:
         )
 
     def runner_online(self) -> bool:
-        """Return whether the server currently sees the runner online.
-
-        :returns: The ``online`` flag from ``GET /v1/runners/{id}/status``,
-            or ``False`` on a transient error.
-        """
+        """Check the server's runner-online flag."""
         try:
             resp = httpx.get(
                 f"{self.base_url}/v1/runners/{self.runner_id}/status",
@@ -218,10 +154,7 @@ class _RunnerRestartStack:
         return resp.status_code == 200 and resp.json().get("online") is True
 
     def wait_healthy(self, timeout: float = _HEALTH_TIMEOUT_S) -> None:
-        """Wait for the server health check AND the runner to be online.
-
-        :param timeout: Max seconds to wait before failing the test.
-        """
+        """Wait until both the server and runner are ready."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
@@ -229,8 +162,7 @@ class _RunnerRestartStack:
                 if health.status_code == 200 and self.runner_online():
                     return
             except httpx.HTTPError:
-                # Expected while the stack is still booting; keep polling
-                # until the deadline.
+                # The stack may still be booting.
                 pass
             time.sleep(0.25)
         server_tail = self.server_log.read_text()[-3000:] if self.server_log.exists() else ""
@@ -257,14 +189,7 @@ class _RunnerRestartStack:
             self._runner_log_handle = None
 
     def spawn_replacement_runner(self, timeout: float = _HEALTH_TIMEOUT_S) -> None:
-        """Spawn a fresh runner process with the same binding token.
-
-        The replacement registers under the same runner id, modeling the
-        interrupted runner coming back after a connectivity blip / host
-        daemon restart. Waits until the server reports it online.
-
-        :param timeout: Max seconds to wait for the reconnect.
-        """
+        """Restart the runner under the same ID and wait for reconnect."""
         self._spawn_runner()
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -293,12 +218,7 @@ def runner_restart_stack(
     mock_llm_server_url: str,
     tmp_path: Path,
 ) -> Iterator[_RunnerRestartStack]:
-    """Yield a server + killable-runner stack wired to the mock LLM.
-
-    :param mock_llm_server_url: Session-scoped mock LLM server URL.
-    :param tmp_path: Per-test temp dir for DB, artifacts, and logs.
-    :returns: The started :class:`_RunnerRestartStack`.
-    """
+    """Provide an isolated server and runner wired to the mock LLM."""
     stack = _RunnerRestartStack(mock_llm_server_url, tmp_path)
     stack.start()
     try:
@@ -308,13 +228,7 @@ def runner_restart_stack(
 
 
 def _create_session(client: httpx.Client, agent_name: str, runner_id: str) -> str:
-    """Create a session for *agent_name* bound to *runner_id*.
-
-    :param client: HTTP client pointed at the stack's server.
-    :param agent_name: Registered agent display name.
-    :param runner_id: The stack's runner id.
-    :returns: The session/conversation id.
-    """
+    """Create a session for the agent on this runner."""
     agent_id = lookup_agent_id(client, agent_name)
     resp = client.post(
         "/v1/sessions",
@@ -329,12 +243,7 @@ def _create_session(client: httpx.Client, agent_name: str, runner_id: str) -> st
 
 
 def _post_user_message(client: httpx.Client, session_id: str, text: str) -> None:
-    """POST a plain user message to *session_id*.
-
-    :param client: HTTP client pointed at the stack's server.
-    :param session_id: Target session id.
-    :param text: Message text.
-    """
+    """Post a user message to the session."""
     resp = client.post(
         f"/v1/sessions/{session_id}/events",
         json={
@@ -346,12 +255,7 @@ def _post_user_message(client: httpx.Client, session_id: str, text: str) -> None
 
 
 def _session_blob(client: httpx.Client, session_id: str) -> str:
-    """Return the session snapshot's items as one JSON string.
-
-    :param client: HTTP client pointed at the stack's server.
-    :param session_id: Target session id.
-    :returns: JSON-dumped items list, or ``""`` on a transient error.
-    """
+    """Return the session's items as JSON, or empty on a transient error."""
     try:
         resp = client.get(f"/v1/sessions/{session_id}")
         resp.raise_for_status()
@@ -361,16 +265,7 @@ def _session_blob(client: httpx.Client, session_id: str) -> str:
 
 
 def _session_status(client: httpx.Client, session_id: str) -> str:
-    """Return the status field the supervisor's info tool projects.
-
-    This mirrors the runner's ``sys_session_get_info`` read exactly:
-    ``GET /v1/sessions/{id}`` with items and liveness skipped, projecting
-    ``status`` from the snapshot.
-
-    :param client: HTTP client pointed at the stack's server.
-    :param session_id: Target session id.
-    :returns: The snapshot's ``status`` string, or ``""`` on error.
-    """
+    """Read status via the lightweight snapshot used by session-get-info."""
     try:
         resp = client.get(
             f"/v1/sessions/{session_id}",
@@ -384,12 +279,7 @@ def _session_status(client: httpx.Client, session_id: str) -> str:
 
 
 def _find_child_session_id(client: httpx.Client, parent_session_id: str) -> str | None:
-    """Return the sub-agent child session id of *parent_session_id*, if any.
-
-    :param client: HTTP client pointed at the stack's server.
-    :param parent_session_id: The supervisor session id.
-    :returns: The child session id, or ``None`` when not yet created.
-    """
+    """Find the supervisor's child session, if created."""
     resp = client.get(
         "/v1/sessions", params={"visibility": "all", "kind": "sub_agent", "limit": 50}
     )
@@ -412,12 +302,7 @@ def _find_child_session_id(client: httpx.Client, parent_session_id: str) -> str 
 
 
 def _poll_until(condition: Callable[[], bool], timeout: float, what: str) -> None:
-    """Poll *condition* until true or fail the test after *timeout* seconds.
-
-    :param condition: Zero-arg callable returning the current truth.
-    :param timeout: Max seconds to wait.
-    :param what: Failure description for the assertion message.
-    """
+    """Wait for a condition or fail with its description."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if condition():
@@ -427,37 +312,20 @@ def _poll_until(condition: Callable[[], bool], timeout: float, what: str) -> Non
 
 
 def _gate_pending(mock_url: str) -> bool:
-    """Return whether a mock-LLM request is currently blocked on a gate.
-
-    :param mock_url: Mock LLM server base URL.
-    :returns: True when a gated request is waiting.
-    """
+    """Check whether a mock-LLM call is blocked on its gate."""
     resp = httpx.get(f"{mock_url}/gate/pending", timeout=5, trust_env=False)
     resp.raise_for_status()
     return bool(resp.json().get("pending"))
 
 
 def _release_gate(mock_url: str) -> None:
-    """Release the oldest pending mock-LLM gate.
-
-    :param mock_url: Mock LLM server base URL.
-    """
+    """Release the pending mock-LLM call."""
     resp = httpx.post(f"{mock_url}/gate/release", timeout=5, trust_env=False)
     resp.raise_for_status()
 
 
 def _statuses_in_payload(payload: object, session_id: str) -> list[str]:
-    """Collect ``status`` values from dicts that reference *session_id*.
-
-    Walks an arbitrary JSON payload (a tool result of any shape) and
-    returns the ``status`` of every dict that carries *session_id* as one
-    of its string values — i.e. the rows a supervisor's session-listing /
-    info tool reported for that session.
-
-    :param payload: Decoded JSON payload to walk.
-    :param session_id: The session id to look for.
-    :returns: Every status string found alongside the id.
-    """
+    """Collect statuses from nested tool-result rows referencing a session."""
     found: list[str] = []
 
     def _walk(node: object) -> None:
@@ -477,18 +345,7 @@ def _statuses_in_payload(payload: object, session_id: str) -> list[str]:
 
 
 def _status_tool_outputs(mock_url: str, parent_key: str, call_id: str) -> list[str]:
-    """Return the raw status-check tool outputs the supervisor's LLM saw.
-
-    Scans the mock server's captured requests for the parent model and
-    collects every ``function_call_output`` string for the scripted
-    status-check tool call. This is the supervisor's ground truth: whatever
-    appears here is what the model reasons from.
-
-    :param mock_url: Mock LLM server base URL.
-    :param parent_key: The parent model key on the mock server.
-    :param call_id: The scripted status-check tool call id.
-    :returns: Every raw output string captured for the call.
-    """
+    """Read status-check outputs captured in the supervisor's LLM requests."""
     resp = httpx.get(
         f"{mock_url}/mock/requests", params={"key": parent_key}, timeout=5, trust_env=False
     )
@@ -514,15 +371,7 @@ def _status_tool_outputs(mock_url: str, parent_key: str, call_id: str) -> list[s
 
 
 def _decode_tool_output(output: str) -> object | None:
-    """Decode a captured tool-output string into a payload to walk.
-
-    The runner emits tool results as JSON, but a harness may re-serialize
-    the parsed dict when building the ``function_call_output`` it sends the
-    LLM (Python ``str(dict)`` — single quotes), so accept both encodings.
-
-    :param output: Raw ``function_call_output`` string.
-    :returns: The decoded payload, or ``None`` when neither decode works.
-    """
+    """Accept JSON or a harness-repr'd Python dict in tool output."""
     try:
         return json.loads(output)
     except ValueError:
@@ -534,12 +383,7 @@ def _decode_tool_output(output: str) -> object | None:
 
 
 def _supervisor_reported_statuses(outputs: list[str], child_id: str) -> list[str]:
-    """Extract the statuses reported for *child_id* from raw tool outputs.
-
-    :param outputs: Raw ``function_call_output`` strings.
-    :param child_id: The child session id to look for.
-    :returns: Every status string found alongside the id.
-    """
+    """Extract child statuses from captured tool outputs."""
     statuses: list[str] = []
     for output in outputs:
         payload = _decode_tool_output(output)
@@ -553,16 +397,7 @@ def test_stopped_subagent_not_reported_running_after_runner_restart(
     runner_restart_stack: _RunnerRestartStack,
     mock_llm_server_url: str,
 ) -> None:
-    """A dead sub-agent turn must not read as still running post-reconnect.
-
-    Journey: the supervisor dispatches a researcher sub-agent and goes
-    idle; the runner process is killed mid-child-turn and a replacement
-    reconnects under the same runner id (a connectivity interruption); the
-    user then asks the supervisor to check on the sub-agent. The status
-    the supervisor's inspection tool reports for the child — whose turn
-    died with the old runner and can never complete — must not be
-    ``running``/``waiting``.
-    """
+    """An interrupted child turn must not read as running after reconnect."""
     stack = runner_restart_stack
     client = stack.client
     reset_mock_llm(mock_llm_server_url)
@@ -605,10 +440,7 @@ def test_stopped_subagent_not_reported_running_after_runner_restart(
         },
     )
 
-    # Supervisor queue: dispatch → ack text → (on the status bump)
-    # sys_session_list → text. The tool output captured between the last
-    # two responses is exactly what the supervisor model is told about its
-    # sub-agents.
+    # The parent dispatches, then calls sys_session_list on the status bump.
     configure_mock_llm(
         mock_llm_server_url,
         [
@@ -641,9 +473,7 @@ def test_stopped_subagent_not_reported_running_after_runner_restart(
         ],
         key=parent_model,
     )
-    # Child queue: ONE gated response — the child stays mid-LLM-call
-    # (status ``running``) until the test releases the gate, which it does
-    # only after the runner holding the turn has been killed.
+    # Keep the child mid-turn until its runner has been killed.
     configure_mock_llm(
         mock_llm_server_url,
         [{"text": f"Research complete. {_CHILD_COMPLETION}", "block": True}],
@@ -653,8 +483,7 @@ def test_stopped_subagent_not_reported_running_after_runner_restart(
     session_id = _create_session(client, parent_name, stack.runner_id)
     _post_user_message(client, session_id, "Dispatch the researcher sub-agent.")
 
-    # Supervisor dispatch turn ends (ack text visible); the child is
-    # mid-LLM-call, parked on the mock gate.
+    # Wait for the parent's turn to end and the child's call to block.
     _poll_until(
         lambda: _DISPATCH_ACK in _session_blob(client, session_id),
         timeout=120,
@@ -680,10 +509,7 @@ def test_stopped_subagent_not_reported_running_after_runner_restart(
         "interruption."
     )
 
-    # The interruption: the runner process dies mid-child-turn and a
-    # replacement reconnects under the same runner id, inside the server's
-    # disconnect grace. The child's in-flight turn is gone for good — its
-    # sole scripted completion is released into the dead process below.
+    # Reconnect within grace; the old runner's child turn cannot resume.
     interrupted_at = time.monotonic()
     stack.kill_runner()
     _poll_until(
@@ -699,17 +525,14 @@ def test_stopped_subagent_not_reported_running_after_runner_restart(
     )
     _release_gate(mock_llm_server_url)
 
-    # Let the disconnect grace elapse and any reconnect-time reconciliation
-    # settle before the user asks for a status update.
+    # Inspect only after the disconnect grace has elapsed.
     time.sleep(_SETTLE_AFTER_RECONNECT_S)
 
-    # Ground truth: the child never completed (no completion marker in its
-    # transcript) and never will — its turn died with the old runner.
+    # The child did not produce its gated completion.
     child_completed = _CHILD_COMPLETION in _session_blob(client, child_id)
     assert not child_completed, "Precondition: the killed runner's child turn must not complete"
 
-    # The user asks the supervisor to check on the sub-agent; the
-    # supervisor inspects via sys_session_list.
+    # Ask the parent to inspect its child with sys_session_list.
     _post_user_message(
         client, session_id, "Status update: is the researcher sub-agent still running?"
     )

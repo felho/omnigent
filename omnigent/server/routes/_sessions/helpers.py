@@ -10285,12 +10285,9 @@ def _child_session_summary_from_conversation(
     uniqueness keys built from opaque runtime ids, so Codex and Claude
     rows take ``tool`` from their labels instead of the title.
 
-    ``busy`` / ``status`` are derived from the relay-fed
-    ``_session_status_cache`` (the tasks table has been removed), falling
-    back to the row's durable ``live_status`` on a cache miss so a replica
-    that does not hold the runner tunnel — or a restarted server — still
-    reports the child's real state instead of a blank one. ``agent_id``
-    and ``agent_name`` are read from the conversation row directly.
+    ``status`` prefers the relay cache, falls back to durable
+    ``live_status``, and treats a durable task error as failed. ``busy``
+    follows the resolved status.
 
     :param conv: A child :class:`Conversation` row
         (``kind="sub_agent"``) from

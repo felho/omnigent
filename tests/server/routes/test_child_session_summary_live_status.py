@@ -1,13 +1,4 @@
-"""Unit tests for the child-session summary's live ``status`` projection.
-
-``_child_session_summary_from_conversation`` derives ``busy`` /
-``current_task_status`` / ``status`` from the relay-fed status cache. A
-cache miss — a replica that doesn't hold the runner tunnel, or a server
-that restarted after the status was published — must fall back to the
-row's durable ``live_status`` instead of presenting the child as unknown:
-that blank is what left an orchestrating parent unable to tell a child
-whose turn died with an interrupted runner from one still working.
-"""
+"""Child-session status projection and cache precedence tests."""
 
 from __future__ import annotations
 
@@ -31,12 +22,7 @@ def _child(
     live_status: str | None = None,
     labels: dict[str, str] | None = None,
 ) -> Conversation:
-    """A minimal sub-agent conversation row.
-
-    :param live_status: The durable relay-persisted turn status on the row.
-    :param labels: Guardrails labels (e.g. a durable ``last_task_error``).
-    :returns: The conversation entity.
-    """
+    """Build a minimal sub-agent conversation row."""
     return Conversation(
         id="conv_child",
         created_at=100,

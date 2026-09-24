@@ -509,10 +509,8 @@ class SysSessionListTool(Tool):
     Returns two views:
 
     - ``sub_agents`` — the named ``(agent, title)`` children (and, for
-      a child caller, its parent/siblings) under this conversation, each
-      with its live ``status`` (``idle`` / ``running`` / ``waiting`` /
-      ``failed``, ``None`` when unknown) so the caller can tell a
-      finished or interrupted child from one still working. The
+      a child caller, its parent/siblings) under this conversation, with
+      live ``status`` (or ``None`` when unknown). The
       LLM uses these to decide which pairs already exist (so a follow-up
       ``sys_session_send`` continues rather than spawns) and to grab each
       child's ``conversation_id`` for ``sys_session_get_history`` /

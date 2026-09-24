@@ -5849,9 +5849,7 @@ async def _collect_sub_agents(
     # If the caller is itself a child, surface main + siblings too.
     parent_id = await _session_parent_id(conversation_id, server_client)
     if parent_id is not None:
-        # ``status`` is None here: the parent-id probe reads the caller's own
-        # snapshot, so the parent's live status isn't known without another
-        # round trip. Keep the key so every row has a uniform shape.
+        # The caller snapshot does not provide the parent's live status.
         result.append(
             {"agent": "main", "title": None, "conversation_id": parent_id, "status": None}
         )
@@ -5983,12 +5981,8 @@ def _child_rows_to_entries(
 
     Skips closed and titleless/colonless rows. The server already
     parses ``tool``/``session_name`` from the title (including the
-    ``"ui:<agent>:<label>"`` form), so those are reused. ``status``
-    carries the child's live state (``idle`` / ``running`` / ``waiting``
-    / ``failed``, or ``None`` when unknown) so an orchestrating caller
-    can tell a finished or interrupted sub-agent from one still working
-    — without it, a child whose turn died with a restarted runner reads
-    as forever in-flight.
+    ``"ui:<agent>:<label>"`` form), so those are reused. The API's
+    ``status`` passes through, or is ``None`` when absent.
 
     :param rows: ``data`` rows from ``GET .../child_sessions``.
     :returns: ``[{"agent", "title", "conversation_id", "status"}, ...]``.

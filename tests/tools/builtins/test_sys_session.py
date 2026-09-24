@@ -1126,14 +1126,7 @@ def test_session_list_skips_label_closed_child_with_original_title(
 def test_session_list_reports_child_live_status(
     session_fixture: _Fixture,
 ) -> None:
-    """
-    ``sys_session_list`` rows carry the child's durable live status.
-
-    Without it, a parent inspecting its sub-agents cannot tell a child
-    whose turn ended (or died with an interrupted runner) from one still
-    working — the row read as an eternal opaque handle. A child that
-    never reported a status surfaces ``status: None`` rather than a guess.
-    """
+    """Report the child's status, or None before any status was recorded."""
     raw = SysSessionListTool().invoke("{}", session_fixture.ctx)
     payload = json.loads(raw)
     assert payload["sub_agents"] == [

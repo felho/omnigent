@@ -228,7 +228,7 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
       // Teammate nodes have no conversation page to open.
       if (node.id.startsWith(TEAMMATE_NODE_PREFIX)) return;
       const params = new URLSearchParams(location.search);
-      for (const key of ["file", "diff", "comment", "view"]) params.delete(key);
+      for (const key of ["file", "diff", "comment", "view", "message"]) params.delete(key);
       const search = params.toString();
       navigate({
         pathname: `/c/${node.data.sessionId}`,

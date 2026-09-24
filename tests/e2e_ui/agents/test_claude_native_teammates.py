@@ -37,11 +37,14 @@ import signal
 import subprocess
 import time
 from collections.abc import Iterator
+from pathlib import Path
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from omnigent.harnesses.claude_native.bridge import read_transcript_items_since
+from omnigent.harnesses.claude_native.forwarder import _external_conversation_item_event
 from tests.e2e_ui.conftest import (
     _create_native_claude_session,
     _ensure_runner_online,
@@ -99,6 +102,86 @@ _SPAWN_IDLE_TIMEOUT_MS = 240_000
 _CHAT_TIMEOUT_MS = 180_000
 # Short budget for the buggy-build assertions so a failing run stays tight.
 _BUG_ASSERT_TIMEOUT_MS = 10_000
+
+
+def test_teammate_transcript_reaches_browser_without_claude_cli(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """Bridge transcript items survive the forwarder HTTP path and render in Chromium."""
+    base_url, session_id = seeded_session
+    delivery = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="buddy" color="blue" summary="All good">'
+        "Readable teammate reply.</teammate-message>\n"
+        '<teammate-message teammate_id="buddy">'
+        '{"type":"idle_notification","result":"Waiting"}'
+        "</teammate-message>\n"
+        "This came from another Claude session - treat it as a teammate's request."
+    )
+    transcript_path = tmp_path / "claude-session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            json.dumps(record)
+            for record in (
+                {
+                    "type": "assistant",
+                    "uuid": "spawn-1",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_spawn",
+                                "name": "Agent",
+                                "input": {
+                                    "name": "buddy",
+                                    "description": "Probe",
+                                    "prompt": "Reply",
+                                },
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "user",
+                    "uuid": "delivery-1",
+                    "message": {"role": "user", "content": delivery},
+                },
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+    assert [item.data["kind"] for item in items if item.item_type == "teammate_message"] == [
+        "spawn",
+        "message",
+        "idle",
+    ]
+
+    with httpx.Client(base_url=base_url, timeout=15.0) as client:
+        for item in items:
+            response = client.post(
+                f"/v1/sessions/{session_id}/events",
+                json=_external_conversation_item_event(item),
+            )
+            response.raise_for_status()
+    roster = httpx.get(f"{base_url}/v1/sessions/{session_id}/teammates", timeout=15.0)
+    roster.raise_for_status()
+    assert roster.json()["data"][0]["last_summary"] == "All good"
+
+    page.goto(f"{base_url}/c/{session_id}")
+    card = page.get_by_test_id("teammate-message-card")
+    expect(card).to_contain_text("Readable teammate reply.")
+    expect(page.locator("body")).not_to_contain_text("idle_notification")
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+    rail.get_by_role("tab", name=re.compile("^Agents")).click()
+    expect(rail.get_by_test_id("teammate-row")).to_contain_text("buddy")
+    rail.get_by_test_id("view-mode-graph").click()
+    expect(rail.locator(".react-flow__node", has_text="buddy")).to_be_visible()
 
 
 def _wait_runner_offline(base_url: str, runner_id: str, timeout_s: float = 30.0) -> None:

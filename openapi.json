@@ -1263,6 +1263,9 @@
               },
               {
                 "$ref": "#/components/schemas/TerminalCommandData"
+              },
+              {
+                "$ref": "#/components/schemas/TeammateMessageData"
               }
             ],
             "description": "The typed data payload (MessageData, etc.).",
@@ -3807,7 +3810,7 @@
         "type": "object"
       },
       "ProjectOrderRequest": {
-        "description": "Rank owned project IDs; unranked projects append in discovery order.\n\nNull selects alphabetical mode without erasing the remembered manual IDs.",
+        "description": "Rank owned project IDs; unranked projects append in discovery order.\n\nNull selects alphabetical mode without erasing the remembered manual IDs.\nThe serialized preference must fit in 65,535 bytes after compression and\nframing; lists below the 10,000-ID limit can still exceed this byte limit.",
         "properties": {
           "ordered_project_ids": {
             "anyOf": [
@@ -4527,6 +4530,18 @@
             ],
             "title": "Scope",
             "type": "string"
+          },
+          "task_description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Human label of the task/spawn this decision governed, e.g. `\"Research auth flows\"` \u2014 what ties a fan-out's decision to its sub-agent when every spawn shares one `agent` type. `None` when the spawn carried none, and on rows written before the field existed.",
+            "title": "Task Description"
           }
         },
         "required": [
@@ -5380,6 +5395,11 @@
             ],
             "description": "Which configured sandbox provider to provision on `host_type: \"managed\"` (one of the server's `sandbox_providers`); `None` takes the server's first. Only valid with `host_type: \"managed\"`.",
             "title": "Sandbox Provider"
+          },
+          "side_chat": {
+            "default": false,
+            "title": "Side Chat",
+            "type": "boolean"
           },
           "terminal_launch_args": {
             "anyOf": [
@@ -6679,6 +6699,22 @@
             "title": "Id",
             "type": "string"
           },
+          "inference_configured": {
+            "default": false,
+            "title": "Inference Configured",
+            "type": "boolean"
+          },
+          "inference_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inference Error"
+          },
           "items": {
             "description": "Committed conversation items in chronological order. Empty for a freshly created session.",
             "items": {
@@ -6980,7 +7016,7 @@
                 "type": "null"
               }
             ],
-            "description": "Cumulative LLM spend for this session in USD, e.g. `0.42`. `None` when the session is **unpriced** \u2014 no turn has been priced yet (the model is absent from the pricing catalog, or no usage has been recorded) \u2014 so clients render \"\u2014\" rather than a misleading `$0.00`. Server-computed (cache-aware for relay/codex, exact billing for claude-native), the same total the cost-budget policy gates on. Lets clients seed their cost indicator on resume without waiting for the next `session.usage` SSE event.",
+            "description": "Cumulative LLM spend for this session in USD, e.g. `0.42`. `None` when the session is **unpriced** \u2014 no turn has been priced yet (the model is absent from the pricing catalog, or no usage has been recorded) \u2014 so clients render \"\u2014\" rather than a misleading `$0.00`. Server-computed (cache-aware for relay/codex, exact billing for claude-native), the same total the cost-budget policy gates on. Lets clients seed their cost indicator on resume without waiting for the next `session.usage` SSE event. Also `None` when `usage_included` is `False`.",
             "title": "Total Cost Usd"
           },
           "updated_at": {
@@ -7008,8 +7044,14 @@
                 "type": "null"
               }
             ],
-            "description": "Per-model breakdown of the same subtree usage, keyed by the raw harness model id, e.g. `{\"claude-sonnet-4-6\": ModelUsage(input_tokens=12000, ...)}`. `None` when no per-model usage has been recorded (older sessions recorded before this field existed, or before the first turn). Lets the UI show which models a session spent its tokens / budget on.",
+            "description": "Per-model breakdown of the same subtree usage, keyed by the raw harness model id, e.g. `{\"claude-sonnet-4-6\": ModelUsage(input_tokens=12000, ...)}`. `None` when no per-model usage has been recorded (older sessions recorded before this field existed, or before the first turn). Lets the UI show which models a session spent its tokens / budget on. Also `None` when `usage_included` is `False`.",
             "title": "Usage By Model"
+          },
+          "usage_included": {
+            "default": true,
+            "description": "`False` when the caller skipped usage aggregation with `include_usage=false`. Both usage fields are then unknown, not zero or this session's own-only spend. Display clients can load them with a separate `GET /v1/sessions/{id}` using `include_usage=true`, `include_items=false`, `include_liveness=false`, and `refresh_state=false`.",
+            "title": "Usage Included",
+            "type": "boolean"
           },
           "workspace": {
             "anyOf": [
@@ -7894,6 +7936,162 @@
           "kind"
         ],
         "title": "StoreHarnessCredentialRequest",
+        "type": "object"
+      },
+      "TeammateList": {
+        "description": "List of teammates; `data` covers every teammate seen in the session.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/TeammateSummary"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "TeammateList",
+        "type": "object"
+      },
+      "TeammateMessageData": {
+        "description": "Data payload for a harness-internal teammate delivery observed in a\nharness transcript (today: Claude Code's in-process agent teams).\n\nA teammate is spawned inside the harness process (Claude Code's\n`Agent` tool with a `name`) and is not an Omnigent session, so\nits deliveries reach the parent transcript as `<teammate-message>`\nmarkup on the user channel. The bridge parses that markup into this\nstructured item so the web can render the prose readably, suppress\nthe machine-side idle ping, and list the teammate in the Agents\nrail. Listed in `NON_CONTENT_ITEM_TYPES` so the agent loop's\nhistory filter skips it (native harnesses keep the original markup\nin their own context).",
+        "properties": {
+          "color": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Teammate accent color from the markup (e.g. `\"blue\"`), else `None`.",
+            "title": "Color"
+          },
+          "kind": {
+            "default": "message",
+            "description": "`\"message\"` for a prose delivery, `\"idle\"` for the machine-side idle notification twin (rendered as no chat bubble), `\"spawn\"` for the parent's spawn call (no delivery text yet \u2014 makes a still-working teammate visible in the rail).",
+            "enum": [
+              "message",
+              "idle",
+              "spawn"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "One-line `summary` attribute when the delivery carried one, else `None`.",
+            "title": "Summary"
+          },
+          "teammate_id": {
+            "description": "The teammate's name, e.g. `\"buddy\"`.",
+            "title": "Teammate Id",
+            "type": "string"
+          },
+          "text": {
+            "default": "",
+            "description": "Prose body of the delivery; empty for `idle` / `spawn` items without one.",
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "teammate_id"
+        ],
+        "title": "TeammateMessageData",
+        "type": "object"
+      },
+      "TeammateSummary": {
+        "description": "Summary of a harness-internal teammate under a session.\n\nPowers `GET /v1/sessions/{id}/teammates`. A teammate is an agent\nspawned *inside* a native harness process (today: Claude Code agent\nteams) \u2014 it has no Omnigent session, runner, or conversation, so it\ncannot appear in `child_sessions`. This summary is folded from the\nsession's `teammate_message` items (display-only), letting the\nAgents rail show the teammate distinctly from real child sessions.",
+        "properties": {
+          "color": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Teammate accent color from the newest delivery carrying one, e.g. `\"blue\"`. `None` when never provided.",
+            "title": "Color"
+          },
+          "last_activity_at": {
+            "description": "Unix epoch timestamp of the teammate's newest `teammate_message` item.",
+            "format": "int64",
+            "title": "Last Activity At",
+            "type": "integer"
+          },
+          "last_message_preview": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Single-line preview of the newest prose delivery's text, truncated like the child-session preview. `None` before the first prose delivery.",
+            "title": "Last Message Preview"
+          },
+          "last_summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`summary` attribute of the newest prose delivery, e.g. `\"All good over here\"`. `None` when the teammate has not delivered prose yet.",
+            "title": "Last Summary"
+          },
+          "object": {
+            "default": "teammate",
+            "description": "Fixed resource type, always `\"teammate\"`.",
+            "title": "Object",
+            "type": "string"
+          },
+          "parent_session_id": {
+            "description": "Session whose transcript the teammate's deliveries appear in (echo of the route's `session_id`).",
+            "title": "Parent Session Id",
+            "type": "string"
+          },
+          "status": {
+            "default": "active",
+            "description": "`\"idle\"` when the newest delivery is the teammate's idle notification, else `\"active\"` (spawned or mid-delivery). Coarse by construction \u2014 deliveries arrive at turn boundaries, not live.",
+            "enum": [
+              "active",
+              "idle"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "teammate_id": {
+            "description": "The teammate's name, e.g. `\"buddy\"`.",
+            "title": "Teammate Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "teammate_id",
+          "parent_session_id",
+          "last_activity_at"
+        ],
+        "title": "TeammateSummary",
         "type": "object"
       },
       "TerminalCommandData": {
@@ -9952,7 +10150,7 @@
     },
     "/v1/hosts/{host_id}/worktrees": {
       "get": {
-        "description": "List the git worktrees of a repository on a host.\n\nUsed by the Web UI's new-session worktree picker to show the\nworktrees a session can start in directly. Owner-scoped exactly\nlike the filesystem browse endpoints; NOT scoped to a session.\nA path that is not a git repository is reported as 400 so the\npicker can quietly fall back to \"no worktrees\".\n\n**Returns:** `{\"object\": \"list\", \"data\": [{path, branch, is_main, detached}, ...]}` (main first).\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 403 if not owned by caller, 409 if host is offline/unresponsive, 400 on path validation or a non-git path.",
+        "description": "List the git worktrees of a repository on a host.\n\nUsed by the Web UI's new-session worktree picker to show the\nworktrees a session can start in directly. Owner-scoped exactly\nlike the filesystem browse endpoints; NOT scoped to a session.\nA path that is not a git repository is reported as 400 so the\npicker can quietly fall back to \"no worktrees\".\n\n**Returns:** `{\"object\": \"list\", \"data\": [{path, branch, is_main, detached, updated_at?}, ...]}` (main first).\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 403 if not owned by caller, 409 if host is offline/unresponsive, 400 on path validation or a non-git path.",
         "operationId": "list_host_worktrees_v1_hosts__host_id__worktrees_get",
         "parameters": [
           {
@@ -10819,6 +11017,75 @@
         ]
       }
     },
+    "/v1/sandbox-providers/{provider}/harnesses/{harness}/model-options": {
+      "get": {
+        "operationId": "model_options_v1_sandbox_providers__provider__harnesses__harness__model_options_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "provider",
+            "required": true,
+            "schema": {
+              "title": "Provider",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Model Options V1 Sandbox Providers  Provider  Harnesses  Harness  Model Options Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Model Options",
+        "tags": [
+          "sandbox inference"
+        ]
+      }
+    },
     "/v1/sessions": {
       "get": {
         "description": "List sessions with cursor-based pagination.\n\nSessions are conversations with a non-`None` `agent_id`\n\u2014 i.e. those created via `POST /v1/sessions`.\nConversations without an agent binding are excluded.\n\n**Returns:** A `PaginatedList` of `SessionListItem`.",
@@ -11191,6 +11458,17 @@
               "title": "Refresh State",
               "type": "boolean"
             }
+          },
+          {
+            "description": "When `False`, skip the subtree usage read and return null usage fields with `usage_included=False`. Display clients can independently request this route with `include_usage=true`, `include_items=false`, `include_liveness=false`, and `refresh_state=false`.",
+            "in": "query",
+            "name": "include_usage",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Include Usage",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -11232,6 +11510,17 @@
             "schema": {
               "title": "Session Id",
               "type": "string"
+            }
+          },
+          {
+            "description": "When `False`, skip usage aggregation in the response. Metadata writes during native launch do not need it.",
+            "in": "query",
+            "name": "include_usage",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Include Usage",
+              "type": "boolean"
             }
           }
         ],
@@ -14959,6 +15248,50 @@
           }
         },
         "summary": "Switch Session Agent",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/teammates": {
+      "get": {
+        "description": "List harness-internal teammates observed in a session.\n\nTeammates (today: Claude Code agent teams) run inside the\nharness process and are not Omnigent sessions, so they never\nappear in `child_sessions`. This endpoint folds the session's\n`teammate_message` items \u2014 mirrored from the native transcript\nby the bridge \u2014 into one display-only summary per teammate, so\nthe Agents rail can show them alongside real child sessions.\n\n**Returns:** A `TeammateList`; empty when the session has no teammate activity.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 if the caller lacks READ on `session_id`; 404 if no session exists there.",
+        "operationId": "list_teammates_v1_sessions__session_id__teammates_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TeammateList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Teammates",
         "tags": [
           "sessions"
         ]

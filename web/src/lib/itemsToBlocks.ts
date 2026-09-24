@@ -94,6 +94,7 @@ const ANSWER_SEPARATOR = '"="';
 export function itemsToBlocks(items: ConversationItem[]): AnyBlock[] {
   const blocks: AnyBlock[] = [];
   const outputs = toolOutputsByCallId(items);
+  const agents = agentNamesByResponseId(items);
   for (const item of items) {
     if (!item.response_id) continue;
     if (isSlashCommandItem(item)) {
@@ -104,10 +105,33 @@ export function itemsToBlocks(items: ConversationItem[]): AnyBlock[] {
       const card = answeredElicitationBlock(item, outputs.get(item.call_id));
       if (card !== null) blocks.push(card);
     }
-    const block = itemToBlock(item);
+    const block = itemToBlock(item, agents.get(item.response_id));
     if (block !== null) blocks.push(block);
   }
   return blocks;
+}
+
+function agentNamesByResponseId(items: ConversationItem[]): Map<string, string | null> {
+  const agents = new Map<string, string | null>();
+  for (const item of items) {
+    if (
+      !item.response_id ||
+      !(
+        (isMessageItem(item) && item.role === "assistant") ||
+        isFunctionCallItem(item) ||
+        isReasoningItem(item)
+      )
+    ) {
+      continue;
+    }
+    const name = item.model?.trim();
+    if (!name) continue;
+    const previous = agents.get(item.response_id);
+    // A model id on routing/compaction items is not an agent identity. Multiple
+    // speakers in one response are also insufficient to attribute its error.
+    agents.set(item.response_id, previous === undefined || previous === name ? name : null);
+  }
+  return agents;
 }
 
 function toolOutputsByCallId(items: ConversationItem[]): Map<string, string> {
@@ -217,7 +241,7 @@ function answersFromToolResult(
   return answers;
 }
 
-function itemToBlock(item: ConversationItem): AnyBlock | null {
+function itemToBlock(item: ConversationItem, agentName?: string | null): AnyBlock | null {
   if (isMessageItem(item) && item.role === "user") {
     // Claude Code's background-task wake: the CLI injects a
     // `<task-notification>` user entry (mirrored with `is_meta`) and
@@ -252,7 +276,7 @@ function itemToBlock(item: ConversationItem): AnyBlock | null {
     return functionCallOutputToBlock(item);
   }
   if (isErrorItem(item)) {
-    return errorToBlock(item);
+    return errorToBlock(item, agentName);
   }
   if (isReasoningItem(item)) {
     return reasoningToBlock(item);
@@ -366,7 +390,7 @@ function functionCallOutputToBlock(item: FunctionCallOutputItem): ToolResultBloc
   };
 }
 
-function errorToBlock(item: ErrorItem): ErrorBlock {
+function errorToBlock(item: ErrorItem, agentName?: string | null): ErrorBlock {
   return {
     type: "error",
     ctx: ctxFor(item),
@@ -374,7 +398,7 @@ function errorToBlock(item: ErrorItem): ErrorBlock {
     code: item.code,
     message: item.message,
     ...(item.level ? { level: item.level } : {}),
-    ...structuredErrorFields(item),
+    ...structuredErrorFields(item, agentName),
   };
 }
 

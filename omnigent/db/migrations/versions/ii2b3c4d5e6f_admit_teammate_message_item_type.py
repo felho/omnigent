@@ -1,7 +1,7 @@
 """Admit the teammate_message conversation-item type.
 
 Revision ID: ii2b3c4d5e6f
-Revises: hh1b2c3d4e5f
+Revises: ll1a2b3c4d5e
 Create Date: 2026-09-17 00:00:00.000000
 
 Widens ``ck_conversation_items_type`` to admit code 12
@@ -14,10 +14,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import sqlalchemy as sa
 from alembic import op
 
 revision: str = "ii2b3c4d5e6f"
-down_revision: str | None = "hh1b2c3d4e5f"
+down_revision: str | None = "ll1a2b3c4d5e"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -25,21 +26,30 @@ _CONSTRAINT = "ck_conversation_items_type"
 _TABLE = "conversation_items"
 
 
-def upgrade() -> None:
-    """Recreate the item-type CHECK with code 12 admitted."""
+def _replace_check_constraint(codes: str) -> None:
+    bind = op.get_bind()
+    condition = f"type IN ({codes})"
+    if bind.dialect.name == "cockroachdb":
+        # CRDB must publish the drop before reusing the constraint name.
+        existing = {row["name"] for row in sa.inspect(bind).get_check_constraints(_TABLE)}
+        if _CONSTRAINT in existing:
+            op.drop_constraint(_CONSTRAINT, _TABLE, type_="check")
+            bind.commit()
+            bind.execute(sa.text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+        op.create_check_constraint(_CONSTRAINT, _TABLE, condition)
+        bind.commit()
+        bind.execute(sa.text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+        return
     with op.batch_alter_table(_TABLE) as batch_op:
         batch_op.drop_constraint(_CONSTRAINT, type_="check")
-        batch_op.create_check_constraint(
-            _CONSTRAINT,
-            "type IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)",
-        )
+        batch_op.create_check_constraint(_CONSTRAINT, condition)
+
+
+def upgrade() -> None:
+    """Recreate the item-type CHECK with code 12 admitted."""
+    _replace_check_constraint("1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12")
 
 
 def downgrade() -> None:
     """Restore the pre-teammate_message CHECK (codes 1-11)."""
-    with op.batch_alter_table(_TABLE) as batch_op:
-        batch_op.drop_constraint(_CONSTRAINT, type_="check")
-        batch_op.create_check_constraint(
-            _CONSTRAINT,
-            "type IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)",
-        )
+    _replace_check_constraint("1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11")

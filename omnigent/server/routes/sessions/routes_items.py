@@ -82,31 +82,28 @@ def _teammate_summaries(
     :param session_id: The parent session id echoed on each summary.
     :returns: Summaries ordered by most recent activity, newest first.
     """
-    summaries: dict[str, dict[str, object]] = {}
+    summaries: dict[str, TeammateSummary] = {}
     for item in items:
         data = item.data
         if not isinstance(data, TeammateMessageData):
             continue
         entry = summaries.get(data.teammate_id)
         if entry is None:
-            entry = {
-                "teammate_id": data.teammate_id,
-                "parent_session_id": session_id,
-                "status": "idle" if data.kind == "idle" else "active",
-                "color": None,
-                "last_summary": None,
-                "last_message_preview": None,
-                "last_activity_at": item.created_at,
-            }
+            entry = TeammateSummary(
+                teammate_id=data.teammate_id,
+                parent_session_id=session_id,
+                status="idle" if data.kind == "idle" else "active",
+                last_activity_at=item.created_at,
+            )
             summaries[data.teammate_id] = entry
-        if entry["color"] is None and data.color:
-            entry["color"] = data.color
+        if entry.color is None and data.color:
+            entry.color = data.color
         if data.kind == "message":
-            if entry["last_message_preview"] is None:
-                entry["last_message_preview"] = _teammate_preview(data.text)
-            if entry["last_summary"] is None and data.summary:
-                entry["last_summary"] = data.summary
-    return [TeammateSummary(**entry) for entry in summaries.values()]
+            if entry.last_message_preview is None:
+                entry.last_message_preview = _teammate_preview(data.text)
+            if entry.last_summary is None and data.summary:
+                entry.last_summary = data.summary
+    return list(summaries.values())
 
 
 def register_items_routes(

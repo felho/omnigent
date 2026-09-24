@@ -92,6 +92,25 @@ export function useHosts(options: UseHostsOptions = {}) {
   });
 }
 
+/** Optional CLI versions for the selected host; older hosts return an empty map. */
+export function useHostHarnessVersions(hostId: string | null, enabled: boolean) {
+  return useQuery({
+    queryKey: ["host-harness-versions", hostId],
+    queryFn: async (): Promise<Record<string, string>> => {
+      const res = await authenticatedFetch(
+        `/v1/hosts/${encodeURIComponent(hostId as string)}/harness-versions`,
+      );
+      if (!res.ok) throw new Error("Could not fetch host CLI versions");
+      const body = (await res.json()) as { versions: Record<string, string> };
+      return body.versions;
+    },
+    enabled: enabled && hostId !== null,
+    staleTime: 0,
+    refetchInterval: enabled ? 30_000 : false,
+    retry: false,
+  });
+}
+
 async function fetchHostModelOptions(
   hostId: string,
   harness: string,

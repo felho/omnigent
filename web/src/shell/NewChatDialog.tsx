@@ -240,7 +240,13 @@ import {
   DEVIN_NATIVE_DEFAULT_PERMISSION_MODE,
   DEVIN_NATIVE_PERMISSION_MODES,
 } from "@/lib/nativeHarnessModes";
-import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
+import {
+  fetchHosts,
+  useHostHarnessVersions,
+  useHostModelOptions,
+  useHosts,
+  type Host,
+} from "@/hooks/useHosts";
 import { sandboxModelOptionsKey, useSandboxModelOptions } from "@/hooks/useSandboxModelOptions";
 import { useSkills } from "@/hooks/useSkills";
 import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
@@ -1474,6 +1480,12 @@ export function AgentHarnessPicker({
 }) {
   // Controlled so picking a row can close the menu.
   const [open, setOpen] = useState(false);
+  const versionHostId = !sandboxSelected && host?.status === "online" ? host.host_id : null;
+  const { data: harnessVersions, isError: versionsFailed } = useHostHarnessVersions(
+    versionHostId,
+    open,
+  );
+
   // Tracks the last-applied openNonce so the imperative-open effect (below,
   // after the drill-in state it drives) skips the initial value.
   const appliedOpenNonce = useRef(0);
@@ -1645,6 +1657,9 @@ export function AgentHarnessPicker({
         testId={`new-chat-landing-agent-${agent.id}`}
         icon={<ComposerAgentIcon agent={agent} />}
         label={agent.display_name}
+        version={
+          versionHostId && !versionsFailed ? harnessVersions?.[agent.harness ?? ""] : undefined
+        }
         summary={summary}
         description={blurb}
         active={active}

@@ -186,6 +186,7 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
 }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
+  useHostHarnessVersions: vi.fn(() => ({ data: {} })),
   useHostModelOptions: vi.fn(),
   fetchHosts: vi.fn(async () => []),
   // The setup dialog mounts these; default to inert so tests that don't

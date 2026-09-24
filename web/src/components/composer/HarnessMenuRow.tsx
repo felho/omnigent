@@ -18,6 +18,7 @@ export function PickerSectionHeader({ children }: { children: ReactNode }) {
 export function HarnessMenuRowContent({
   icon,
   label,
+  version,
   summary,
   description,
   active,
@@ -32,6 +33,7 @@ export function HarnessMenuRowContent({
 }: {
   icon: ReactNode;
   label: string;
+  version?: string;
   summary: string;
   description?: string;
   active: boolean;
@@ -59,6 +61,14 @@ export function HarnessMenuRowContent({
         {icon}
         <span className={cn("flex min-w-0 items-center gap-1 text-left", active && "font-medium")}>
           <span className="truncate">{label}</span>
+          {version && (
+            <span
+              className="shrink-0 text-[10px] font-normal text-muted-foreground"
+              title={`Installed CLI version: ${version}`}
+            >
+              v{version}
+            </span>
+          )}
           {warning}
         </span>
         {description ? (

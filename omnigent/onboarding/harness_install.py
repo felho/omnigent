@@ -43,6 +43,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import NamedTuple
 
@@ -922,7 +923,9 @@ def harness_cli_installed(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     return _harness_cli_version_satisfies(spec, binary, timeout)
 
 
-def harness_cli_version(key: str) -> tuple[str | None, str | None]:
+def harness_cli_version(
+    key: str, *, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_S
+) -> tuple[str | None, str | None]:
     """Return the installed CLI's version string plus the declared range.
 
     Useful for human-readable status messages when the CLI is present but
@@ -942,10 +945,33 @@ def harness_cli_version(key: str) -> tuple[str | None, str | None]:
     binary = resolve_cli_binary(spec.binary)
     if binary is None:
         return None, None
-    version = _harness_cli_version_string(spec, binary)
+    version = _harness_cli_version_string(spec, binary, timeout=timeout)
     if version is None:
         return None, _version_range_str(spec)
     return version, _version_range_str(spec)
+
+
+def harness_cli_versions() -> dict[str, str]:
+    """Probe installed CLI versions by harness id, omitting SDKs and unknown versions."""
+    from omnigent.harness_aliases import HARNESS_ALIASES, NATIVE_HARNESSES
+
+    keys = _all_harness_name_to_key()
+    aliases = {
+        h: h.removeprefix("native-") + "-native"
+        for h in NATIVE_HARNESSES
+        if h.startswith("native-")
+    }
+    aliases.update(HARNESS_ALIASES)
+    for alias, canonical in aliases.items():
+        if canonical in keys:
+            keys[alias] = keys[canonical]
+
+    def probe(key: str) -> tuple[str, str | None]:
+        return key, harness_cli_version(key, timeout=3.0)[0]
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        versions = dict(pool.map(probe, set(keys.values())))
+    return {harness: version for harness, key in keys.items() if (version := versions[key])}
 
 
 def _version_range_str(spec: HarnessInstallSpec) -> str | None:

@@ -336,6 +336,9 @@ class HostConnection:
     pending_fs_requests: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    pending_harness_versions: dict[str, asyncio.Future[dict[str, str]]] = field(
+        default_factory=dict,
+    )
     pending_model_options: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )

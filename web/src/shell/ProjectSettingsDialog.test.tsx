@@ -17,6 +17,7 @@ vi.mock("@/lib/projectsApi", () => ({
 const { hostModelOptionsMock } = vi.hoisted(() => ({ hostModelOptionsMock: vi.fn() }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({ data: [{ host_id: "h1", name: "Laptop", owner: "me", status: "online" }] }),
+  useHostHarnessVersions: vi.fn(() => ({ data: {} })),
   useHostModelOptions: hostModelOptionsMock,
 }));
 // Hoisted so the vi.mock factory below can reference it; per-test overrides

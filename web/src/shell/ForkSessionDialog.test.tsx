@@ -40,7 +40,11 @@ vi.mock("@/hooks/useAvailableAgents", () => ({
 }));
 vi.mock("@/hooks/useAgents", () => ({ useSessionAgent: vi.fn() }));
 vi.mock("@/hooks/useSession", () => ({ useSession: vi.fn() }));
-vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn(), useHostModelOptions: vi.fn() }));
+vi.mock("@/hooks/useHosts", () => ({
+  useHosts: vi.fn(),
+  useHostHarnessVersions: vi.fn(() => ({ data: {} })),
+  useHostModelOptions: vi.fn(),
+}));
 vi.mock("@/hooks/useDirectorySessions", () => ({ useDirectorySessions: vi.fn() }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({ useRunnerHealthRegistration: vi.fn() }));
 vi.mock("@/hooks/useHostFilesystem", () => ({

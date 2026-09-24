@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   useDetectedCredentials,
+  useHostHarnessVersions,
   useHostModelOptions,
   useHosts,
   useInstallHarness,
@@ -834,5 +835,41 @@ describe("useDetectedCredentials", () => {
     expect(fetchMock).not.toHaveBeenCalled();
     disabled.unmount();
     noHost.unmount();
+  });
+});
+
+describe("useHostHarnessVersions", () => {
+  it("waits for an open picker, isolates hosts, and refreshes on reopening", async () => {
+    fetchMock.mockImplementation(async (url: string) =>
+      mockResponse({ versions: { "claude-native": url.includes("host_b") ? "2.2.0" : "2.1.0" } }),
+    );
+    const { result, rerender } = renderHook(
+      ({ hostId, open }) => useHostHarnessVersions(hostId, open),
+      { wrapper, initialProps: { hostId: "host_a", open: false } },
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+    rerender({ hostId: "host_a", open: true });
+    await waitFor(() => expect(result.current.data).toEqual({ "claude-native": "2.1.0" }));
+    rerender({ hostId: "host_b", open: true });
+    expect(result.current.data).toBeUndefined();
+    await waitFor(() => expect(result.current.data).toEqual({ "claude-native": "2.2.0" }));
+    rerender({ hostId: "host_b", open: false });
+    fetchMock.mockResolvedValue(mockResponse({ versions: { "claude-native": "2.3.0" } }));
+    rerender({ hostId: "host_b", open: true });
+    await waitFor(() => expect(result.current.data).toEqual({ "claude-native": "2.3.0" }));
+  });
+
+  it("accepts older hosts and keeps lookup failures optional", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ versions: {} }));
+    const { result, rerender } = renderHook(({ hostId }) => useHostHarnessVersions(hostId, true), {
+      wrapper,
+      initialProps: { hostId: "old_host" },
+    });
+    await waitFor(() => expect(result.current.data).toEqual({}));
+    fetchMock.mockResolvedValueOnce(mockResponse({}, 504));
+    rerender({ hostId: "unreachable_host" });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.data).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });

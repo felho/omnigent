@@ -88,6 +88,7 @@ vi.mock("@/components/ui/toast", async (importOriginal) => ({
 }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
+  useHostHarnessVersions: vi.fn(() => ({ data: {} })),
   useHostModelOptions: vi.fn(() => ({ data: [] })),
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
   useInstallingHarnesses: vi.fn(() => new Set<string>()),

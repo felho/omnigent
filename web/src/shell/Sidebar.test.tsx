@@ -78,6 +78,7 @@ vi.mock("@/hooks/useHosts", () => ({
   // The project-settings dialog (mounted by Sidebar rows) resolves model
   // options through this hook; no test here opens it, so an empty catalog is
   // enough to keep the module contract satisfied.
+  useHostHarnessVersions: vi.fn(() => ({ data: {} })),
   useHostModelOptions: () => ({ data: [] }),
 }));
 

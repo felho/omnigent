@@ -1890,3 +1890,27 @@ def test_workspace_missing_message_is_the_host_spelling() -> None:
     assert classify_launch_refusal(None, workspace_missing_message("/w"), "/w") == (
         WORKSPACE_MISSING_ERROR_CODE
     )
+
+
+@pytest.mark.parametrize("versions", [{"claude-native": "2.1.0"}, {}])
+def test_harness_versions_round_trip(versions: dict[str, str]) -> None:
+    from omnigent.host.frames import HostHarnessVersionsFrame, HostHarnessVersionsResultFrame
+
+    for frame in [
+        HostHarnessVersionsFrame("version-request"),
+        HostHarnessVersionsResultFrame("version-request", versions),
+    ]:
+        assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+@pytest.mark.parametrize("versions", [None, [], {"good": "1.2.3", "empty": "", "bad": True}])
+def test_harness_versions_ignores_malformed_entries(versions: object) -> None:
+    from omnigent.host.frames import HostHarnessVersionsResultFrame
+
+    frame = decode_host_frame(
+        json.dumps(
+            {"kind": "host.harness_versions_result", "request_id": "v", "versions": versions}
+        )
+    )
+    assert isinstance(frame, HostHarnessVersionsResultFrame)
+    assert frame.versions == ({"good": "1.2.3"} if isinstance(versions, dict) else {})

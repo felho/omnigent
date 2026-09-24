@@ -67,6 +67,8 @@ from omnigent.host.frames import (
     HostFsResultFrame,
     HostFsWriteFrame,
     HostHarnessReadinessFrame,
+    HostHarnessVersionsFrame,
+    HostHarnessVersionsResultFrame,
     HostHelloFrame,
     HostImportedLocalSession,
     HostImportLocalByIdFrame,
@@ -3134,6 +3136,18 @@ class HostProcess:
         routable = list(config.routable_models) if config is not None else []
         return ModelOptionsResult(models=rows, routable_models=routable)
 
+    async def _handle_harness_versions(
+        self, frame: HostHarnessVersionsFrame
+    ) -> HostHarnessVersionsResultFrame:
+        from omnigent.onboarding.harness_install import harness_cli_versions
+
+        try:
+            versions = await self._run_host_subprocess_in_thread(harness_cli_versions)
+        except Exception:
+            _logger.exception("Harness version probe failed")
+            versions = {}
+        return HostHarnessVersionsResultFrame(request_id=frame.request_id, versions=versions)
+
     async def _handle_model_options(
         self,
         frame: HostModelOptionsFrame,
@@ -4557,6 +4571,8 @@ class HostProcess:
         elif isinstance(frame, HostSkillsFrame):
             skills_result = await asyncio.to_thread(self._handle_skills, frame)
             await ws.send(encode_host_frame(skills_result))
+        elif isinstance(frame, HostHarnessVersionsFrame):
+            await ws.send(encode_host_frame(await self._handle_harness_versions(frame)))
         elif isinstance(frame, HostModelOptionsFrame):
             # Every dispatched frame already runs on its own task (see
             # _start_frame_task), so a cold harness probe here cannot stall

@@ -47,9 +47,14 @@ WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 # feature simply omits the token (older hosts send no ``capabilities`` at all).
 # The runner intercepts codex ``/side`` and forks an ephemeral side-chat thread:
 CAP_CODEX_SIDE_CHAT = "codex_side_chat"
+CAP_HARNESS_VERSIONS = "harness_versions"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
-HOST_CAPABILITIES: list[str] = [CAP_CODEX_SIDE_CHAT, CAP_FILESYSTEM_ATTACHMENTS]
+HOST_CAPABILITIES: list[str] = [
+    CAP_CODEX_SIDE_CHAT,
+    CAP_FILESYSTEM_ATTACHMENTS,
+    CAP_HARNESS_VERSIONS,
+]
 
 
 def workspace_missing_message(workspace: str | PathLike[str] | None) -> str:
@@ -130,6 +135,8 @@ class HostFrameKind(str, Enum):
     FS_REQUEST = "host.fs_request"
     FS_RESULT = "host.fs_result"
     FS_WRITE_REQUEST = "host.fs_write_request"
+    HARNESS_VERSIONS = "host.harness_versions"
+    HARNESS_VERSIONS_RESULT = "host.harness_versions_result"
     MODEL_OPTIONS = "host.model_options"
     MODEL_OPTIONS_RESULT = "host.model_options_result"
     SKILLS = "host.skills"
@@ -946,6 +953,21 @@ class HostFsResultFrame:
 
 
 @dataclass
+class HostHarnessVersionsFrame:
+    """Server → host: probe installed CLI versions for the picker."""
+
+    request_id: str
+
+
+@dataclass
+class HostHarnessVersionsResultFrame:
+    """Host → server: known CLI versions, keyed by harness identifier."""
+
+    request_id: str
+    versions: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class HostModelOptionsFrame:
     """Server → host: resolve pre-launch model choices for a harness."""
 
@@ -1124,6 +1146,8 @@ HostFrame = (
     | HostFsRequestFrame
     | HostFsResultFrame
     | HostFsWriteFrame
+    | HostHarnessVersionsFrame
+    | HostHarnessVersionsResultFrame
     | HostModelOptionsFrame
     | HostModelOptionsResultFrame
     | HostSkillsFrame
@@ -1489,6 +1513,18 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
             }
         )
+    if isinstance(frame, HostHarnessVersionsFrame):
+        return _encode_payload(
+            {"kind": HostFrameKind.HARNESS_VERSIONS.value, "request_id": frame.request_id}
+        )
+    if isinstance(frame, HostHarnessVersionsResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.HARNESS_VERSIONS_RESULT.value,
+                "request_id": frame.request_id,
+                "versions": frame.versions,
+            }
+        )
     if isinstance(frame, HostModelOptionsFrame):
         return _encode_payload(
             {
@@ -1706,6 +1742,16 @@ def _decode_known_host_frame(
             return _decode_fs_result(msg)
         case HostFrameKind.FS_WRITE_REQUEST:
             return _decode_fs_write_request(msg)
+        case HostFrameKind.HARNESS_VERSIONS:
+            return HostHarnessVersionsFrame(request_id=_required_str(msg, "request_id"))
+        case HostFrameKind.HARNESS_VERSIONS_RESULT:
+            versions = msg.get("versions")
+            return HostHarnessVersionsResultFrame(
+                request_id=_required_str(msg, "request_id"),
+                versions={k: v for k, v in versions.items() if isinstance(v, str) and v}
+                if isinstance(versions, dict)
+                else {},
+            )
         case HostFrameKind.MODEL_OPTIONS:
             return _decode_model_options(msg)
         case HostFrameKind.MODEL_OPTIONS_RESULT:

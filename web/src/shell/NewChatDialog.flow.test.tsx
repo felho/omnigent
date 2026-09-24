@@ -125,6 +125,7 @@ vi.mock("@/lib/identity", () => ({
 }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
+  useHostHarnessVersions: vi.fn(() => ({ data: {} })),
   useHostModelOptions: vi.fn(() => ({
     data: [
       { id: "opus", displayName: "Opus" },

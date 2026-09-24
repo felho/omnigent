@@ -35,6 +35,7 @@ from omnigent.host.frames import (
     HostDetectCredentialsResultFrame,
     HostFsResultFrame,
     HostHarnessReadinessFrame,
+    HostHarnessVersionsResultFrame,
     HostHelloFrame,
     HostImportLocalDoneFrame,
     HostImportLocalSessionFrame,
@@ -769,6 +770,12 @@ async def _receive_loop(
                         "error": frame.error,
                     }
                 )
+            continue
+
+        if isinstance(frame, HostHarnessVersionsResultFrame):
+            versions_future = conn.pending_harness_versions.pop(frame.request_id, None)
+            if versions_future is not None and not versions_future.done():
+                versions_future.set_result(frame.versions)
             continue
 
         if isinstance(frame, HostModelOptionsResultFrame):

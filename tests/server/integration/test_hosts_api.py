@@ -1509,3 +1509,112 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
 
     # The callback got the exact runner id and error string off the frame.
     assert received == [("runner_x", "exited with code 1")]
+
+
+async def test_harness_versions_probe_through_tunnel(host_api_app, tmp_path, monkeypatch):
+    """Actual CLI subprocess → host dispatch → wire → server API, including upgrades."""
+    from omnigent.host.connect import HostProcess
+    from omnigent.host.frames import CAP_HARNESS_VERSIONS, decode_host_frame
+    from omnigent.host.identity import HostIdentity
+    from omnigent.onboarding import harness_install
+
+    app, registry, _store, _conversations = host_api_app
+    comm = await _connect_host(app, registry)
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    host = HostProcess(
+        identity=HostIdentity(host_id=_HOST_ID, name="test"), server_url="http://test"
+    )
+    binary = tmp_path / "claude"
+    binary.write_text("#!/bin/sh\necho '2.1.0 (Claude Code)'\n")
+    binary.chmod(0o755)
+    monkeypatch.setattr(
+        harness_install,
+        "resolve_cli_binary",
+        lambda name: str(binary) if name == "claude" else None,
+    )
+
+    class TunnelReply:
+        async def send(self, raw):
+            await comm.send_input({"type": "websocket.receive", "text": raw})
+
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            # Old hosts must not receive a frame they cannot decode.
+            response = await client.get(f"/v1/hosts/{_HOST_ID}/harness-versions")
+            assert response.json() == {"versions": {}}
+            conn.hello.capabilities.append(CAP_HARNESS_VERSIONS)
+            for version in ["2.1.0", "2.123.0"]:
+                binary.write_text(f"#!/bin/sh\necho '{version} (Claude Code)'\n")
+                task = asyncio.create_task(client.get(f"/v1/hosts/{_HOST_ID}/harness-versions"))
+                outbound = await comm.receive_output(timeout=5)
+                frame = decode_host_frame(outbound["text"])
+                await host._dispatch_host_frame(TunnelReply(), frame)
+                response = await task
+                assert response.status_code == 200
+                versions = response.json()["versions"]
+                assert versions["claude-native"] == version
+                assert versions["native-claude"] == version
+                assert "claude-sdk" not in versions
+                assert not conn.pending_harness_versions
+    finally:
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=5)
+
+
+@pytest.mark.parametrize("user,status", [(None, 401), ("bob@test.com", 403)])
+async def test_harness_versions_requires_owner(multi_user_app, user, status):
+    app, registry, host_store, _cs = multi_user_app
+
+    @app.exception_handler(OmnigentError)
+    async def handle_error(request: Request, exc: OmnigentError) -> JSONResponse:
+        return JSONResponse(status_code=exc.http_status, content={"detail": exc.message})
+
+    host_id = "294391bc835cde1130ef2a02dcd2b7b3"
+    host_store.upsert_on_connect(host_id, "alice-laptop", "alice@test.com")
+    _register_fake_host(registry, host_id, "alice@test.com")
+    conn = registry.get(host_id)
+    assert conn is not None
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            f"/v1/hosts/{host_id}/harness-versions",
+            headers={"x-test-user": user} if user else {},
+        )
+    assert response.status_code == status
+    assert conn.outbound_queue.empty()
+
+
+@pytest.mark.parametrize("outcome", ["timeout", "cancel", "wrong-replica", "offline"])
+async def test_harness_versions_unreachable_cleanup(host_api_app, monkeypatch, outcome):
+    from omnigent.host.frames import CAP_HARNESS_VERSIONS
+
+    app, registry, _store, _cs = host_api_app
+    comm = await _connect_host(app, registry)
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    conn.hello.capabilities.append(CAP_HARNESS_VERSIONS)
+    monkeypatch.setattr("omnigent.server.routes.hosts._HARNESS_VERSIONS_TIMEOUT_S", 0.01)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            if outcome in ("wrong-replica", "offline"):
+                registry.deregister(_HOST_ID)
+                monkeypatch.setattr(
+                    "omnigent.server.routes._host_launch._deployment_is_sharded",
+                    lambda: outcome == "wrong-replica",
+                )
+            task = asyncio.create_task(client.get(f"/v1/hosts/{_HOST_ID}/harness-versions"))
+            if outcome == "cancel":
+                await comm.receive_output(timeout=1)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                response = await task
+                assert (
+                    response.status_code
+                    == {"timeout": 504, "wrong-replica": 400, "offline": 409}[outcome]
+                )
+            assert not conn.pending_harness_versions
+    finally:
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=5)

@@ -21,11 +21,14 @@ import pytest
 from playwright.async_api import Route, async_playwright, expect
 
 import omnigent
+from omnigent.host.connect import HostProcess
 from omnigent.host.frames import (
+    CAP_HARNESS_VERSIONS,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
+    HostHarnessVersionsFrame,
     HostHelloFrame,
     HostListDirFrame,
     HostListDirResultFrame,
@@ -130,7 +133,7 @@ def _daemon_readiness_map(*, simulate_windows: bool, credentialed: bool) -> dict
         return json.loads(result.stdout.strip().splitlines()[-1])
 
 
-async def _serve_host_frames(ws: Any) -> None:
+async def _serve_host_frames(ws: Any, host: HostProcess | None = None) -> None:
     """Answer host frames on the tunnel like an idle host daemon."""
     async for raw in ws:
         if not isinstance(raw, str):
@@ -145,6 +148,9 @@ async def _serve_host_frames(ws: Any) -> None:
                 continue
             if isinstance(runner_frame, PingFrame):
                 await ws.send(encode_frame(PongFrame(ts=runner_frame.ts)))
+            continue
+        if isinstance(frame, HostHarnessVersionsFrame) and host is not None:
+            await host._dispatch_host_frame(ws, frame)
             continue
         reply: Any = None
         if isinstance(frame, HostListDirFrame):
@@ -177,7 +183,11 @@ async def _serve_host_frames(ws: Any) -> None:
 
 @contextlib.asynccontextmanager
 async def _fake_host(
-    base_url: str, name: str, configured_harnesses: dict[str, Any]
+    base_url: str,
+    name: str,
+    configured_harnesses: dict[str, Any],
+    *,
+    host: HostProcess | None = None,
 ) -> AsyncIterator[str]:
     """Connect a host with the computed readiness map to the real tunnel."""
     import websockets
@@ -192,10 +202,11 @@ async def _fake_host(
                     frame_protocol_version=1,
                     name=name,
                     configured_harnesses=configured_harnesses,
+                    capabilities=[CAP_HARNESS_VERSIONS] if host is not None else [],
                 )
             )
         )
-        serve_task = asyncio.create_task(_serve_host_frames(ws))
+        serve_task = asyncio.create_task(_serve_host_frames(ws, host))
         try:
             rest_host_id: str | None = None
             async with httpx.AsyncClient() as client:

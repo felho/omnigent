@@ -29,6 +29,7 @@ vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 // alias list, which is what a no-host-pinned scheduled task uses anyway.
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
+  useHostHarnessVersions: vi.fn(() => ({ data: {} })),
   useHostModelOptions: vi.fn(() => ({ data: undefined })),
 }));
 vi.mock("@/hooks/useScheduledTasks", () => ({

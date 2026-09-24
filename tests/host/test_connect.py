@@ -7459,3 +7459,20 @@ def test_fs_reader_picks_up_a_repo_created_after_first_request(
 
     assert second.status == "ok", second
     assert [e["path"] for e in second.payload["data"]] == ["zzz/target.jsonnet"], second.payload
+
+
+async def test_harness_version_failure_replies_without_breaking_tunnel(monkeypatch):
+    from omnigent.host.frames import HostHarnessVersionsFrame, HostHarnessVersionsResultFrame
+
+    def failed_probe():
+        raise OSError("CLI probe unavailable")
+
+    monkeypatch.setattr("omnigent.onboarding.harness_install.harness_cli_versions", failed_probe)
+    host = _make_host_process()
+    ws = AsyncMock()
+    await host._dispatch_host_frame(ws, HostHarnessVersionsFrame(request_id="v"))
+    assert decode_host_frame(ws.send.call_args.args[0]) == HostHarnessVersionsResultFrame(
+        request_id="v", versions={}
+    )
+    assert host._owned_subprocess_ops == 0
+    _cleanup_host(host)

@@ -110,6 +110,7 @@ _LIST_DIR_MAX_LIMIT = 1000
 # for transient network slowness without making the picker feel hung.
 _CREATE_DIR_TIMEOUT_S = 5.0
 _MODEL_OPTIONS_TIMEOUT_S = 15.0
+_HARNESS_VERSIONS_TIMEOUT_S = 20.0
 # Per-call timeout for host.install_harness round-trips. The host runs
 # `npm install -g <pkg>` — install_harness_cli caps that subprocess at 300s —
 # then recomputes readiness and sends the result back over the tunnel. The
@@ -712,6 +713,41 @@ def create_hosts_router(
             "interactive_shells": host_registry.interactive_shells(host.host_id),
             "runners": [],
         }
+
+    @router.get("/hosts/{host_id}/harness-versions")
+    async def get_host_harness_versions(
+        request: Request, host_id: str
+    ) -> dict[str, dict[str, str]]:
+        """Read CLI versions from the selected host without delaying host startup."""
+        from omnigent.host.frames import CAP_HARNESS_VERSIONS, HostHarnessVersionsFrame
+
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise _host_absent_error(host)
+        if CAP_HARNESS_VERSIONS not in conn.hello.capabilities:
+            return {"versions": {}}
+        request_id = secrets.token_hex(8)
+        future: asyncio.Future[dict[str, str]] = asyncio.get_running_loop().create_future()
+        conn.pending_harness_versions[request_id] = future
+        try:
+            host_registry.send_text(
+                conn, encode_host_frame(HostHarnessVersionsFrame(request_id=request_id))
+            )
+            return {
+                "versions": await asyncio.wait_for(future, timeout=_HARNESS_VERSIONS_TIMEOUT_S)
+            }
+        except ConnectionError as exc:
+            raise HTTPException(status_code=502, detail="host disconnected") from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail="host version lookup timed out") from exc
+        finally:
+            conn.pending_harness_versions.pop(request_id, None)
 
     @router.get("/hosts/{host_id}/harnesses/{harness}/model-options")
     async def get_host_model_options(

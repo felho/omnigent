@@ -3403,7 +3403,9 @@ async def _execute_session_create(
     ``conversation_id``) — unlike named-mode send, it does NOT block on
     the child turn.
 
-    Maps a 404 to ``agent_not_found`` and 401/403 to ``access_denied``.
+    Maps a 404 to ``agent_not_found`` and 401/403 to ``access_denied``, and
+    refuses an ACP CLI built-in whose CLI this host lacks with
+    ``harness_not_installed`` before any child is created.
 
     :param args: Parsed arguments; exactly one of ``agent_id`` /
         ``config_path`` required, ``title`` / ``message`` optional.
@@ -3460,6 +3462,22 @@ async def _execute_session_create(
             publish_event=publish_event,
             agent_spec=agent_spec,
             runner_workspace=runner_workspace,
+        )
+    missing_harness = await asyncio.to_thread(_uninstalled_acp_cli_builtin, str(agent_id))
+    if missing_harness is not None:
+        from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+
+        row = ACP_CLI_HARNESSES[missing_harness]
+        return json.dumps(
+            {
+                "error": "harness_not_installed",
+                "agent_id": agent_id,
+                "harness": missing_harness,
+                "detail": (
+                    f"{row.label} (`{row.binary}`) is not installed on this host, so a "
+                    "child on it cannot start. Pick another agent from sys_agent_list."
+                ),
+            }
         )
     body = _build_session_create_body(
         str(agent_id),
@@ -5516,6 +5534,55 @@ def _in_spawn_family(builtins: list[_JsonObject], family: str | None) -> list[_J
     return kept
 
 
+def _uninstalled_acp_cli_harness(harness: object) -> str | None:
+    """Return *harness* when it is a builtin ACP CLI whose binary this host lacks.
+
+    A child session inherits the caller's runner, so it skips the host's
+    launch-time readiness gate; spawning such an agent yields a child whose
+    every turn fails at subprocess start.
+
+    :param harness: An agent's harness id, e.g. ``"jcode"``; any other value
+        (native, SDK, unknown, ``None``) is never reported.
+    :returns: The canonical row key, e.g. ``"jcode"``, or ``None``.
+    """
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+    from omnigent.runtime.workflow import resolve_acp_cli_executable
+
+    if not isinstance(harness, str):
+        return None
+    canonical = canonicalize_harness(harness) or harness
+    if canonical not in ACP_CLI_HARNESSES:
+        return None
+    return canonical if resolve_acp_cli_executable(canonical) is None else None
+
+
+def _launchable_builtins(builtins: list[_JsonObject]) -> list[_JsonObject]:
+    """Drop built-in agents whose ACP CLI is not installed on this host.
+
+    :param builtins: Projected ``builtins`` rows, each carrying ``harness``.
+    :returns: The rows a child spawned from this runner could run.
+    """
+    return [row for row in builtins if _uninstalled_acp_cli_harness(row.get("harness")) is None]
+
+
+def _uninstalled_acp_cli_builtin(agent_id: str) -> str | None:
+    """Return the row key when *agent_id* is an ACP CLI built-in this host can't run.
+
+    Built-in ids are derived from the agent name, and each ACP CLI row seeds one
+    agent named after its key, so the runner can recognize them without a lookup.
+
+    :param agent_id: The id passed to ``sys_session_create``.
+    :returns: The row key, e.g. ``"grok"``, or ``None`` for any other agent.
+    """
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+    from omnigent.db.utils import builtin_agent_id
+
+    for key in ACP_CLI_HARNESSES:
+        if builtin_agent_id(key) == agent_id:
+            return _uninstalled_acp_cli_harness(key)
+    return None
+
+
 async def _agent_list_via_rest(
     server_client: httpx.AsyncClient,
     *,
@@ -5547,7 +5614,8 @@ async def _agent_list_via_rest(
     to the caller's own model family (:func:`_spawn_family`) — an agent it
     could never route a spawn onto is not a launchable agent for it. The
     other two sections carry no harness to filter on; the child-create gate
-    refuses those.
+    refuses those. ``builtins`` also omits ACP CLI agents whose vendor CLI is
+    not installed on this host (:func:`_launchable_builtins`).
 
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_spec: The running agent's spec, for os_env cwd
@@ -5600,7 +5668,8 @@ async def _agent_list_via_rest(
         remaining_configs[:source_limit],
     )
     listing["builtins"] = _in_spawn_family(
-        listing["builtins"], await _spawn_family(server_client, conversation_id)
+        await asyncio.to_thread(_launchable_builtins, listing["builtins"]),
+        await _spawn_family(server_client, conversation_id),
     )
     return _bounded_discovery_result(
         listing,

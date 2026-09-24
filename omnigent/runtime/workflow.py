@@ -1595,6 +1595,30 @@ def _build_goose_spawn_env(
     return env
 
 
+def resolve_acp_cli_executable(harness: str) -> str | None:
+    """Resolve the vendor CLI a builtin ACP CLI harness launches on this host.
+
+    The ``OMNIGENT_<NAME>_PATH`` env override wins, then the config
+    ``harness.<name>.command`` path, then PATH plus the common global install
+    dirs.
+
+    :param harness: The catalog row key, e.g. ``"grok"``.
+    :returns: The executable to launch, or ``None`` when the CLI is not installed.
+    """
+    from omnigent._platform import resolve_cli_binary
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+    from omnigent.harness_startup_config import (
+        config_harness_path_override,
+        resolve_harness_path,
+    )
+
+    return (
+        resolve_harness_path(harness)
+        or config_harness_path_override(harness, load_config())
+        or resolve_cli_binary(ACP_CLI_HARNESSES[harness].binary)
+    )
+
+
 def _build_acp_cli_spawn_env(
     spec: AgentSpec,
     *,
@@ -1609,9 +1633,7 @@ def _build_acp_cli_spawn_env(
     shared ``omnigent/inner/acp_harness.py`` wrap; this maps a row + spec to
     the ``HARNESS_ACP_*`` vars it reads. Like goose/acp, a vendor ACP CLI owns
     its own auth and model, so no provider/gateway credential and no model var
-    is wired. The binary resolves via the ``OMNIGENT_<NAME>_PATH`` env
-    override, then the config ``harness.<name>.command`` path, then PATH plus
-    the common global install dirs.
+    is wired. The binary resolves via :func:`resolve_acp_cli_executable`.
 
     :param spec: The agent spec.
     :param harness: The catalog row key, e.g. ``"grok"``.
@@ -1619,20 +1641,10 @@ def _build_acp_cli_spawn_env(
         ACP wrap consumes no bundle dir.
     :returns: A dict of ``HARNESS_ACP_*`` env-var overrides for the spawn.
     """
-    from omnigent._platform import resolve_cli_binary
     from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-    from omnigent.harness_startup_config import (
-        config_harness_path_override,
-        resolve_harness_path,
-    )
 
     row = ACP_CLI_HARNESSES[harness]
-    executable = (
-        resolve_harness_path(harness)
-        or config_harness_path_override(harness, load_config())
-        or resolve_cli_binary(row.binary)
-        or row.binary
-    )
+    executable = resolve_acp_cli_executable(harness) or row.binary
     env = {
         "HARNESS_ACP_COMMAND": shlex.join([executable, *row.args]),
         "HARNESS_ACP_NAME": row.label,

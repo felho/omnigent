@@ -23,12 +23,16 @@ import datetime
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 import httpx
+import pytest
+
+from tests.e2e.test_host_e2e import _spawn_host_daemon, _wait_for_host_online
 
 # Two source sessions with distinct historical activity windows. Each entry is
 # ``(session_id, [(record_type, iso_timestamp, text), ...])``; the file mtime
@@ -112,6 +116,7 @@ def test_cli_import_preserves_source_timestamps(live_server: str, tmp_path: Path
     env.update(
         {
             "HOME": str(tmp_path),
+            "CLAUDE_CONFIG_DIR": str(tmp_path / ".claude"),
             "OMNIGENT_CONFIG_HOME": str(tmp_path / "config"),
             "OMNIGENT_DATA_DIR": str(tmp_path / "omnigent-data"),
         }
@@ -212,3 +217,52 @@ def test_cli_import_preserves_source_timestamps(live_server: str, tmp_path: Path
         f"imported sessions share one updated_at {session_updated_ats}; "
         "recency sorting of imported history is meaningless"
     )
+
+
+def test_host_import_preserves_source_timestamps(
+    live_server: str,
+    http_client: httpx.Client,
+    mock_llm_server_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real host forwards source times through the tunnel to the server."""
+    source_id = "a1b2c3d4-0801-4000-8000-000000000003"
+    records = (
+        ("user", "2026-08-01T10:00:00.000Z", "inspect TODO.md"),
+        ("assistant", "2026-08-01T10:05:00.000Z", "Done."),
+    )
+    _write_claude_transcript(tmp_path, source_id, records)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / ".claude"))
+    daemon = _spawn_host_daemon(
+        tmp_path=tmp_path,
+        live_server=live_server,
+        mock_llm_server_url=mock_llm_server_url,
+    )
+    try:
+        _wait_for_host_online(http_client, daemon.host_id)
+        imported = http_client.post(
+            "/v1/imports/local",
+            json={"host_id": daemon.host_id, "source": "claude", "session_id": source_id},
+            timeout=60,
+        )
+        imported.raise_for_status()
+        assert imported.json()["imported"] == 1
+        session_id = imported.json()["sessions"][0]["session_id"]
+
+        session = http_client.get(f"/v1/sessions/{session_id}")
+        session.raise_for_status()
+        assert int(session.json()["created_at"]) == _epoch(records[0][1])
+        assert int(session.json()["updated_at"]) == _epoch(records[-1][1])
+        items = http_client.get(f"/v1/sessions/{session_id}/items")
+        items.raise_for_status()
+        assert [int(item["created_at"]) for item in items.json()["data"]] == [
+            _epoch(record[1]) for record in records
+        ]
+    finally:
+        daemon.proc.send_signal(signal.SIGTERM)
+        try:
+            daemon.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            daemon.proc.kill()
+            daemon.proc.wait()

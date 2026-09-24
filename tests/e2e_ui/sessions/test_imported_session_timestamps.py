@@ -92,6 +92,7 @@ def test_imported_message_timestamps_reflect_source_not_import(
     env.update(
         {
             "HOME": str(tmp_path),
+            "CLAUDE_CONFIG_DIR": str(tmp_path / ".claude"),
             "OMNIGENT_CONFIG_HOME": str(tmp_path / "config"),
             "OMNIGENT_DATA_DIR": str(tmp_path / "omnigent-data"),
         }

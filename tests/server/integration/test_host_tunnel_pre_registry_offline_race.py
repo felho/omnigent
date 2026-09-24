@@ -25,16 +25,19 @@ import asyncio
 from typing import Any
 
 import pytest
+from asgiref.testing import ApplicationCommunicator
 from fastapi import FastAPI, WebSocket
 
 import omnigent.server.routes.host_tunnel as tunnel_mod
+from omnigent.db.utils import now_epoch
 from omnigent.host.frames import HostConnectionErrorFrame, decode_host_frame
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.stores.host_store import HostStore, host_is_live
 from tests.server.integration.test_host_tunnel_route import (
-    _connect_route,
     _make_hello,
+    _managed_scope,
     _wait_registered,
+    _websocket_scope,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -43,9 +46,13 @@ _HOST_ID = "1444b179a19322377dcc75cf7fcd1bd2"
 _TUNNEL_PATH = f"/v1/hosts/{_HOST_ID}/tunnel"
 
 
+@pytest.mark.parametrize("managed", [False, True], ids=["external", "managed"])
+@pytest.mark.parametrize("separate_replica", [False, True], ids=["same-replica", "cross-replica"])
 async def test_stale_pre_registry_cleanup_cannot_offline_newer_connection(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    managed: bool,
+    separate_replica: bool,
 ) -> None:
     """A superseded connection's pre-registry cleanup must not clobber a reconnect.
 
@@ -66,6 +73,36 @@ async def test_stale_pre_registry_cleanup_cannot_offline_newer_connection(
     store = HostStore(db_uri)
     app = FastAPI()
     app.include_router(tunnel_mod.create_host_tunnel_router(registry, store), prefix="/v1")
+    if managed:
+        store.register_managed_host(
+            host_id=_HOST_ID,
+            name="managed-laptop",
+            user_id="alice@example.com",
+            token="managed-race-token",
+            provider="modal",
+            sandbox_id="race-sandbox",
+            token_expires_at=now_epoch() + 3600,
+        )
+    successor_registry = HostRegistry() if separate_replica else registry
+    successor_store = HostStore(db_uri) if separate_replica else store
+    successor_app = FastAPI() if separate_replica else app
+    if separate_replica:
+        successor_app.include_router(
+            tunnel_mod.create_host_tunnel_router(successor_registry, successor_store),
+            prefix="/v1",
+        )
+
+    async def connect(target: FastAPI) -> ApplicationCommunicator:
+        scope = (
+            _managed_scope(_TUNNEL_PATH, "managed-race-token")
+            if managed
+            else _websocket_scope(_TUNNEL_PATH)
+        )
+        communicator = ApplicationCommunicator(target, scope)
+        await communicator.send_input({"type": "websocket.connect"})
+        accepted = await communicator.receive_output(timeout=2.0)
+        assert accepted["type"] == "websocket.accept"
+        return communicator
 
     # First register call (connection A) fails after the upsert persisted the
     # row; later calls (connection B's reconnect) register normally.
@@ -98,7 +135,7 @@ async def test_stale_pre_registry_cleanup_cannot_offline_newer_connection(
 
     monkeypatch.setattr(tunnel_mod, "_send_connection_error", _send_error_then_hold)
 
-    comm_a = await _connect_route(app, _TUNNEL_PATH)
+    comm_a = await connect(app)
     try:
         await comm_a.send_input({"type": "websocket.receive", "text": _make_hello()})
 
@@ -120,10 +157,10 @@ async def test_stale_pre_registry_cleanup_cannot_offline_newer_connection(
 
         # Connection B reconnects inside A's window and becomes the current
         # registered online host.
-        comm_b = await _connect_route(app, _TUNNEL_PATH)
+        comm_b = await connect(successor_app)
         try:
             await comm_b.send_input({"type": "websocket.receive", "text": _make_hello()})
-            await asyncio.wait_for(_wait_registered(registry, _HOST_ID), timeout=2.0)
+            await asyncio.wait_for(_wait_registered(successor_registry, _HOST_ID), timeout=2.0)
             host = store.get_host(_HOST_ID)
             assert host is not None and host.status == "online", (
                 "connection B's upsert should have the host online"
@@ -137,7 +174,7 @@ async def test_stale_pre_registry_cleanup_cannot_offline_newer_connection(
             await comm_a.wait(timeout=2.0)
 
             # B is still the live, registered connection...
-            assert registry.get(_HOST_ID) is not None, (
+            assert successor_registry.get(_HOST_ID) is not None, (
                 "the reconnected host must still be registered"
             )
 
@@ -154,6 +191,7 @@ async def test_stale_pre_registry_cleanup_cannot_offline_newer_connection(
             assert host_is_live(host), "the reconnected host must still be live"
         finally:
             await comm_b.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm_b.wait(timeout=2.0)
     finally:
         # Unblock A's parked coroutine even when an assertion fails early.
         reconnect_done.set()

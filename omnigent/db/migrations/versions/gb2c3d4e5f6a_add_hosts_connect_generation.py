@@ -1,7 +1,7 @@
 """add connect_generation to hosts
 
 Revision ID: gb2c3d4e5f6a
-Revises: gh1b2c3d4e5f
+Revises: ll1a2b3c4d5e
 Create Date: 2026-09-02 00:00:00.000000
 
 Adds ``hosts.connect_generation`` — an epoch-microseconds token stamped by
@@ -25,7 +25,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "gb2c3d4e5f6a"
-down_revision: str | None = "gh1b2c3d4e5f"
+down_revision: str | None = "ll1a2b3c4d5e"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

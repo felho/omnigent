@@ -80,7 +80,7 @@ def test_downgrade_drops_connect_generation(tmp_path: Path) -> None:
     config = _build_alembic_config(uri)
     with engine.begin() as conn:
         config.attributes["connection"] = conn
-        command.downgrade(config, "gh1b2c3d4e5f")
+        command.downgrade(config, "ll1a2b3c4d5e")
 
     remaining = {c["name"] for c in sa.inspect(engine).get_columns("hosts")}
     assert "connect_generation" not in remaining

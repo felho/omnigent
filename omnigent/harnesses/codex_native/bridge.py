@@ -694,6 +694,21 @@ def write_codex_config_model(bridge_dir: Path, model: str) -> bool:
     :param model: Model id to record, e.g. ``"gpt-5.6-luna"``.
     :returns: ``True`` when the file was updated.
     """
+    return write_codex_home_config_model(codex_home_for_bridge_dir(bridge_dir), model)
+
+
+def write_codex_home_config_model(codex_home: Path, model: str) -> bool:
+    """
+    Upsert the top-level ``model`` key in ``<codex_home>/config.toml``.
+
+    Home-addressed form of :func:`write_codex_config_model`, shared with the
+    app-server's launch pin, which knows the private home rather than a bridge
+    dir. A stale top-level effort is clamped to one *model* accepts.
+
+    :param codex_home: Private per-session ``CODEX_HOME`` directory.
+    :param model: Model id to record, e.g. ``"gpt-5.6-luna"``.
+    :returns: ``True`` when the file was updated.
+    """
     from omnigent.util.reasoning_effort import clamp_effort_for_model
 
     def _clamp_stale_effort(document: MutableMapping[str, object]) -> None:
@@ -708,7 +723,7 @@ def write_codex_config_model(bridge_dir: Path, model: str) -> bool:
                 document["model_reasoning_effort"] = clamped
 
     return _upsert_top_level_config_key(
-        codex_home_for_bridge_dir(bridge_dir) / "config.toml",
+        codex_home / "config.toml",
         "model",
         model,
         mutate_document=_clamp_stale_effort,
@@ -740,8 +755,22 @@ def write_codex_config_effort(bridge_dir: Path, effort: str) -> bool:
     :param effort: Reasoning effort to record, e.g. ``"high"``.
     :returns: ``True`` when the file was updated.
     """
+    return write_codex_home_config_effort(codex_home_for_bridge_dir(bridge_dir), effort)
+
+
+def write_codex_home_config_effort(codex_home: Path, effort: str) -> bool:
+    """
+    Upsert the top-level ``model_reasoning_effort`` key in ``<codex_home>/config.toml``.
+
+    Home-addressed form of :func:`write_codex_config_effort`, shared with the
+    app-server's launch pin.
+
+    :param codex_home: Private per-session ``CODEX_HOME`` directory.
+    :param effort: Reasoning effort to record, e.g. ``"high"``.
+    :returns: ``True`` when the file was updated.
+    """
     return _upsert_top_level_config_key(
-        codex_home_for_bridge_dir(bridge_dir) / "config.toml",
+        codex_home / "config.toml",
         "model_reasoning_effort",
         effort,
     )

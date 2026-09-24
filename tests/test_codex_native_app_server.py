@@ -3377,6 +3377,139 @@ class TestPinCodexConfigEffort:
         )
 
 
+# A ``[``-leading line inside a multi-line string sits in the top-level section
+# but is not a table header; a line scan stops there and misses later keys.
+_MULTILINE_BEFORE_PINNED_KEYS = (
+    'developer_instructions = """\n'
+    "Follow these rules:\n"
+    "[Important] never push to main\n"
+    '"""\n'
+    'model = "gpt-5.5"\n'
+    'model_reasoning_effort = "medium"\n'
+    "\n"
+    "[model_providers.Databricks]\n"
+    'name = "Databricks"\n'
+)
+
+
+class TestPinsKeepConfigValid:
+    """The launch pins never write a duplicate top-level key."""
+
+    @pytest.mark.parametrize(
+        ("pin", "key", "expected"),
+        [
+            (
+                lambda home: app_server._pin_codex_config_model(home, "gpt-5.6-sol"),
+                "model",
+                "gpt-5.6-sol",
+            ),
+            (
+                lambda home: app_server._pin_codex_config_effort(home, "high", "gpt-5.5"),
+                "model_reasoning_effort",
+                "high",
+            ),
+        ],
+        ids=["model", "effort"],
+    )
+    def test_key_after_multiline_string(
+        self, tmp_path: Path, pin: Any, key: str, expected: str
+    ) -> None:
+        """The existing key is replaced in place and the string body is untouched."""
+        config = tmp_path / "config.toml"
+        config.write_text(_MULTILINE_BEFORE_PINNED_KEYS, encoding="utf-8")
+
+        pin(tmp_path)
+
+        text = config.read_text(encoding="utf-8")
+        parsed = tomllib.loads(text)
+        assert parsed[key] == expected
+        assert sum(line.startswith(f"{key} =") for line in text.splitlines()) == 1
+        assert "[Important] never push to main" in parsed["developer_instructions"]
+
+    def test_indented_model_key(self, tmp_path: Path) -> None:
+        """An indented top-level ``model`` is updated rather than shadowed."""
+        config = tmp_path / "config.toml"
+        config.write_text('  model = "gpt-5.5"\n[profiles.default]\nx = 1\n', encoding="utf-8")
+
+        app_server._pin_codex_config_model(tmp_path, "gpt-5.6-sol")
+
+        assert tomllib.loads(config.read_text(encoding="utf-8"))["model"] == "gpt-5.6-sol"
+
+    def test_malformed_config_is_left_unchanged(self, tmp_path: Path) -> None:
+        """A config that is already invalid TOML is never made worse."""
+        config = tmp_path / "config.toml"
+        broken = 'model = "a"\nmodel = "b"\n'
+        config.write_text(broken, encoding="utf-8")
+
+        app_server._pin_codex_config_model(tmp_path, "gpt-5.6-sol")
+
+        assert config.read_text(encoding="utf-8") == broken
+
+
+class TestRepairPrependedPinDuplicates:
+    """Configs broken by the old line-scan pins recover on the next launch."""
+
+    def test_drops_prepended_model_and_effort_pins(self, tmp_path: Path) -> None:
+        """Both leading pins go; the file parses and keeps its own values."""
+        config = tmp_path / "config.toml"
+        config.write_text(
+            'model_reasoning_effort = "low"\nmodel = "gpt-5.6-sol"\n'
+            + _MULTILINE_BEFORE_PINNED_KEYS,
+            encoding="utf-8",
+        )
+
+        app_server._repair_prepended_pin_duplicates(tmp_path)
+
+        text = config.read_text(encoding="utf-8")
+        assert text == _MULTILINE_BEFORE_PINNED_KEYS
+        parsed = tomllib.loads(text)
+        assert parsed["model"] == "gpt-5.5"
+        assert parsed["model_reasoning_effort"] == "medium"
+
+    def test_repaired_config_accepts_the_pin(self, tmp_path: Path) -> None:
+        """Repair then pin yields one top-level ``model`` holding the launch model."""
+        config = tmp_path / "config.toml"
+        config.write_text(
+            'model = "gpt-5.6-sol"\n' + _MULTILINE_BEFORE_PINNED_KEYS, encoding="utf-8"
+        )
+
+        app_server._repair_prepended_pin_duplicates(tmp_path)
+        app_server._pin_codex_config_model(tmp_path, "gpt-5.6-sol")
+
+        assert tomllib.loads(config.read_text(encoding="utf-8"))["model"] == "gpt-5.6-sol"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            'model = "gpt-5.5"\n[profiles.default]\nx = 1\n',
+            'model = "gpt-5.5"\nname = "a"\nname = "b"\n',
+            'model = "gpt-5.5"\nbroken = \n',
+        ],
+        ids=["valid", "unrelated-duplicate", "unrelated-syntax-error"],
+    )
+    def test_leaves_other_configs_alone(self, tmp_path: Path, text: str) -> None:
+        """Only a duplicate of the pinned keys themselves is repaired."""
+        config = tmp_path / "config.toml"
+        config.write_text(text, encoding="utf-8")
+
+        app_server._repair_prepended_pin_duplicates(tmp_path)
+
+        assert config.read_text(encoding="utf-8") == text
+
+    def test_symlinked_config_is_never_edited(self, tmp_path: Path) -> None:
+        """The user's shared config behind a symlink is not rewritten."""
+        shared = tmp_path / "shared.toml"
+        broken = 'model = "a"\nmodel = "b"\n'
+        shared.write_text(broken, encoding="utf-8")
+        home = tmp_path / "codex-home"
+        home.mkdir()
+        (home / "config.toml").symlink_to(shared)
+
+        app_server._repair_prepended_pin_duplicates(home)
+
+        assert shared.read_text(encoding="utf-8") == broken
+
+
 # --- Subagent-routing hook trust ---------------------------------------
 #
 # Empirically (codex-cli 0.145.0) ``--dangerously-bypass-hook-trust`` does

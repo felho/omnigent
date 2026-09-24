@@ -34,7 +34,11 @@ if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.harnesses.codex_native.bridge import write_policy_hook_config
+from omnigent.harnesses.codex_native.bridge import (
+    write_codex_home_config_effort,
+    write_codex_home_config_model,
+    write_policy_hook_config,
+)
 from omnigent.harnesses.codex_native.launch_args import (
     _write_private_config,
     absolute_codex_path,
@@ -318,9 +322,9 @@ def _codex_mcp_server_config_section(
     )
 
 
-# Top-level ``model_reasoning_effort = "<value>"`` line, capturing the value so
-# it can be clamped to one the pinned model accepts. Tolerates a trailing comment.
-_EFFORT_KEY_RE = re.compile(r'^(\s*model_reasoning_effort\s*=\s*")([^"]*)("\s*(?:#.*)?)$')
+# Keys the launch pins used to prepend whenever a line scan missed the existing
+# top-level key (a ``[``-leading line inside a multi-line value, an indented key).
+_PREPENDED_PIN_KEY_RE = re.compile(r"^(model|model_reasoning_effort)\s*=")
 
 
 def _pin_codex_config_model(codex_home: Path, model: str) -> None:
@@ -336,35 +340,19 @@ def _pin_codex_config_model(codex_home: Path, model: str) -> None:
     shared file's stale ``gpt-5.5``). An in-TUI ``/model`` later overwrites
     the same line, so user switches still win.
 
+    The file is edited through a TOML parser: a missed existing key would add
+    a duplicate, which codex rejects on every later launch of the session.
+
     :param codex_home: Private per-session ``CODEX_HOME`` directory.
     :param model: Validated model id to pin.
     """
-    from omnigent.util.reasoning_effort import clamp_effort_for_model
-
     config_path = codex_home / "config.toml"
     _materialize_config_symlink(config_path)
-    existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-    pin_line = f"model = {json.dumps(model)}"
-    lines = existing.splitlines()
-    replaced = False
-    for i, line in enumerate(lines):
-        if line.startswith("["):
-            break
-        if re.match(r"^model\s*=", line):
-            lines[i] = pin_line
-            replaced = True
-            continue
-        # The config copies the user's default effort (e.g. xhigh), which the
-        # pinned model may reject (GLM has no xhigh). Clamp it to a value the
-        # model accepts rather than 400 the turn.
-        effort_match = _EFFORT_KEY_RE.match(line)
-        if effort_match:
-            clamped = clamp_effort_for_model(effort_match.group(2), model)
-            if clamped and clamped != effort_match.group(2):
-                lines[i] = f"{effort_match.group(1)}{clamped}{effort_match.group(3)}"
-    if not replaced:
-        lines.insert(0, pin_line)
-    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if not write_codex_home_config_model(codex_home, model):
+        _logger.warning(
+            "Could not pin the launch model in the session Codex config.toml; "
+            "it is unreadable or not valid TOML"
+        )
 
 
 def _pin_codex_config_effort(codex_home: Path, effort: str, model: str | None) -> None:
@@ -388,29 +376,58 @@ def _pin_codex_config_effort(codex_home: Path, effort: str, model: str | None) -
 
     config_path = codex_home / "config.toml"
     _materialize_config_symlink(config_path)
-    existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     clamped = clamp_effort_for_model(effort, model) or effort
-    pin_line = f"model_reasoning_effort = {json.dumps(clamped)}"
-    lines = existing.splitlines()
-    replaced = False
-    for i, line in enumerate(lines):
-        if line.startswith("["):
-            break
-        # Rewrite the value in place so the line's indentation and trailing
-        # comment survive, as the model pin's clamp does; a value the regex
-        # cannot parse (e.g. single-quoted) is replaced wholesale.
-        effort_match = _EFFORT_KEY_RE.match(line)
-        if effort_match:
-            lines[i] = f"{effort_match.group(1)}{clamped}{effort_match.group(3)}"
-            replaced = True
-            break
-        if re.match(r"^\s*model_reasoning_effort\s*=", line):
-            lines[i] = pin_line
-            replaced = True
-            break
-    if not replaced:
-        lines.insert(0, pin_line)
-    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if not write_codex_home_config_effort(codex_home, clamped):
+        _logger.warning(
+            "Could not pin the launch reasoning effort in the session Codex "
+            "config.toml; it is unreadable or not valid TOML"
+        )
+
+
+def _repair_prepended_pin_duplicates(codex_home: Path) -> None:
+    """
+    Drop a duplicate ``model`` / effort line that an older launch pin prepended.
+
+    Older builds pinned these keys with a line scan; when it missed the
+    existing key it prepended a second one, and the private config then failed
+    every later launch of the session. A leading pin line is dropped only when
+    the rest of the file still defines its key and parses as valid TOML.
+
+    :param codex_home: Private per-session ``CODEX_HOME`` directory.
+    """
+    config_path = codex_home / "config.toml"
+    if config_path.is_symlink() or not config_path.is_file():
+        return
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return
+    try:
+        tomlkit.parse(text)
+        return
+    except tomlkit.exceptions.TOMLKitError:
+        pass
+    lines = text.splitlines(keepends=True)
+    dropped_keys: list[str] = []
+    # At most two leading pins: one model line and one effort line.
+    for line in lines[:2]:
+        match = _PREPENDED_PIN_KEY_RE.match(line)
+        if match is None:
+            return
+        dropped_keys.append(match.group(1))
+        remainder = "".join(lines[len(dropped_keys) :])
+        try:
+            document = tomlkit.parse(remainder)
+        except tomlkit.exceptions.TOMLKitError:
+            continue
+        if not all(key in document for key in dropped_keys):
+            return
+        _write_private_config(config_path, remainder)
+        _logger.warning(
+            "Removed duplicate top-level %s from the session Codex config.toml",
+            " and ".join(dropped_keys),
+        )
+        return
 
 
 def _materialize_config_symlink(config_path: Path) -> None:
@@ -1913,6 +1930,7 @@ class CodexNativeAppServer:
             extend_model_catalog=codex_extended_catalog_requested(self.env),
             supported_efforts=CODEX_NATIVE_EFFORTS,
         )
+        _repair_prepended_pin_duplicates(self.codex_home)
         compose_profile_instructions = _materialize_codex_profile_for_start(
             self.codex_home,
             config_source,

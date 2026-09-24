@@ -383,15 +383,25 @@ class PiProviderConfig:
         return {"providers": providers}
 
     def _register_on_surface(
-        self, additional: dict[str, _PiProviderPayload], surface: DatabricksPiSurface
+        self,
+        additional: dict[str, _PiProviderPayload],
+        surface: DatabricksPiSurface,
+        entry: _PiModelEntry | None = None,
     ) -> None:
-        """Add the selected model to *additional* under *surface*'s provider."""
+        """Add the selected model to *additional* under *surface*'s provider.
+
+        :param additional: The additional-provider payloads to update in place.
+        :param surface: The surface whose provider receives the model.
+        :param entry: A prebuilt entry for the model (e.g. carrying configured
+            limits); a bare entry is built when omitted.
+        """
         provider_id = _SURFACE_PROVIDER_IDS[surface]
-        entry: _PiModelEntry = {"id": self.model, "input": ["text", "image"]}
-        # DeepSeek streams on reasoning_content; Pi only reads that channel when
-        # the model entry declares reasoning.
-        if "deepseek" in self.model.lower():
-            entry["reasoning"] = True
+        if entry is None:
+            entry = {"id": self.model, "input": ["text", "image"]}
+            # DeepSeek streams on reasoning_content; Pi only reads that channel
+            # when the model entry declares reasoning.
+            if "deepseek" in self.model.lower():
+                entry["reasoning"] = True
         existing = additional.get(provider_id)
         if existing is not None:
             # Copy rather than mutate: the payload is shared with
@@ -1047,6 +1057,8 @@ def _databricks_gateway_pi_provider(
     auth_command: str | None = None,
     static_api_key: str | None = None,
     declared_surface: DatabricksPiSurface | None = None,
+    configured_context_window: int | None = None,
+    configured_max_output_tokens: int | None = None,
 ) -> PiProviderConfig:
     """Build a multi-surface Pi config from a Databricks AI Gateway base URL.
 
@@ -1068,6 +1080,11 @@ def _databricks_gateway_pi_provider(
     :param declared_surface: The surface *gateway_base_url* names when *model*
         is a configured default. A default the listing omits is registered
         there rather than classified by name, so it keeps its own endpoint.
+    :param configured_context_window: The provider entry's explicit context
+        limit for its configured default; applied to that default's entry,
+        listed or not, ahead of any catalog value.
+    :param configured_max_output_tokens: The provider entry's explicit output
+        limit for its configured default, applied like the context limit.
     :returns: The Pi provider config — Anthropic base plus additional
         OpenAI/Gemini/completions providers for what the workspace serves.
     """
@@ -1149,21 +1166,68 @@ def _databricks_gateway_pi_provider(
     listed_anything = bool(claude_models or gpt_models or completions_models or gemini_models)
     if declared_surface is None or not listed_anything:
         return config
+    limits = {
+        "configured_context_window": configured_context_window,
+        "configured_max_output_tokens": configured_max_output_tokens,
+    }
     listed = config._model_registered_in_additional() or any(
         entry.get("id") == config.model for entry in config.extra_models
     )
     if listed:
-        return config
+        return _with_configured_default_limits(config, **limits)
     # The listing came back but omitted the configured default; keep it on the
     # surface its provider entry declares instead of guessing one from its name.
+    entry = _gateway_pi_model_entry(config.model, **limits)
     if declared_surface is DatabricksPiSurface.ANTHROPIC:
-        entry: _PiModelEntry = {"id": config.model, "input": ["text", "image"], "reasoning": True}
-        return replace(config, extra_models=[*config.extra_models, entry])
+        return replace(config, extra_models=[*config.extra_models, {**entry, "reasoning": True}])
     if declared_surface not in config.databricks_surfaces:
         return config
     additional = dict(config.additional_providers)
-    config._register_on_surface(additional, declared_surface)
+    config._register_on_surface(additional, declared_surface, entry)
     return replace(config, additional_providers=additional)
+
+
+def _with_configured_default_limits(
+    config: PiProviderConfig,
+    *,
+    configured_context_window: int | None,
+    configured_max_output_tokens: int | None,
+) -> PiProviderConfig:
+    """Apply a provider entry's explicit limits to its listed configured default.
+
+    Explicit ``context_window`` / ``max_output_tokens`` outrank the listing's
+    metadata, matching the single-family path.
+
+    :param config: The enumerated config whose ``model`` is the configured default.
+    :param configured_context_window: Explicit context limit, or ``None``.
+    :param configured_max_output_tokens: Explicit output limit, or ``None``.
+    :returns: *config*, with the default's entry updated where a limit is set.
+    """
+    if configured_context_window is None and configured_max_output_tokens is None:
+        return config
+
+    def apply(models: list[_PiModelEntry]) -> list[_PiModelEntry]:
+        updated: list[_PiModelEntry] = []
+        for model in models:
+            if model.get("id") != config.model:
+                updated.append(model)
+                continue
+            entry: _PiModelEntry = {**model}
+            if configured_context_window is not None:
+                entry["contextWindow"] = configured_context_window
+            if configured_max_output_tokens is not None:
+                entry["maxTokens"] = configured_max_output_tokens
+            updated.append(entry)
+        return updated
+
+    return replace(
+        config,
+        extra_models=apply(config.extra_models),
+        additional_providers={
+            pid: {**payload, "models": apply(payload["models"])}
+            for pid, payload in config.additional_providers.items()
+        },
+    )
 
 
 def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiProviderConfig | None:
@@ -1519,6 +1583,8 @@ def _inline_family_pi_provider(
                 auth_command=family.auth_command,
                 static_api_key=family.api_key,
                 declared_surface=declared_surface if model is None else None,
+                configured_context_window=family.context_window,
+                configured_max_output_tokens=family.max_output_tokens,
             )
             # An empty listing (unreachable workspace, a token without Unity
             # Catalog access) keeps the configured model on its own surface.

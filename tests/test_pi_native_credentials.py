@@ -411,6 +411,41 @@ def test_inline_databricks_gateway_partial_listing_keeps_default_on_declared_sur
     assert [m["id"] for m in rendered["omnigent-openai"]["models"]] == ["system.ai.gpt-5"]
 
 
+@pytest.mark.parametrize("default_listed", [True, False], ids=["listed", "omitted"])
+def test_inline_databricks_gateway_keeps_configured_limits_on_default(
+    monkeypatch: pytest.MonkeyPatch, default_listed: bool
+) -> None:
+    """Explicit ``context_window`` / ``max_output_tokens`` survive enumeration.
+
+    They outrank the listing's metadata for the configured default, whether the
+    workspace listed that default or the default had to be registered on its
+    declared surface.
+    """
+    gpt = [{"id": "system.ai.gpt-5", "contextWindow": 128000, "maxTokens": 16384}]
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: (
+            [{"id": "system.ai.claude-opus-5"}],
+            gpt if default_listed else [],
+            [],
+            [],
+        ),
+    )
+    config = _databricks_openai_gateway_config()
+    config["providers"]["openai-gateway"]["openai"].update(
+        {"context_window": 1_000_000, "max_output_tokens": 8192}
+    )
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+
+    assert provider is not None
+    rendered = provider.to_models_config()["providers"]
+    entry = next(m for m in rendered["omnigent-openai"]["models"] if m["id"] == "system.ai.gpt-5")
+    assert entry["contextWindow"] == 1_000_000
+    assert entry["maxTokens"] == 8192
+
+
 def test_inline_dedicated_gateway_host_stays_single_family(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

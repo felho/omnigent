@@ -482,6 +482,53 @@ def test_run_auth_command_uses_the_shell() -> None:
     assert creds._run_auth_command("exit 3") is None
 
 
+def test_inline_databricks_gateway_listed_default_follows_the_workspace_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A default the workspace lists is served on the surface the listing reports.
+
+    The entry's declared surface is a fallback for a default the listing omits;
+    a listed model follows the workspace's own capability data, as on the
+    cli-config and databricks-kind paths. Here a GPT default configured on the
+    MLflow surface is listed as a Responses model and is registered there.
+    """
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: (
+            [{"id": "system.ai.claude-opus-5"}],
+            [{"id": "system.ai.gpt-5"}],
+            [],
+            [],
+        ),
+    )
+    config = {
+        "providers": {
+            "oss-gateway": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": "https://wkspc.cloud.databricks.com/ai-gateway/mlflow/v1",
+                    "api_key": "gw-token",
+                    "wire_api": "chat",
+                    "models": {"default": "system.ai.gpt-5"},
+                },
+            }
+        }
+    }
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+
+    assert provider is not None
+    assert provider.model == "system.ai.gpt-5"
+    rendered = provider.to_models_config()["providers"]
+    assert "omnigent-mlflow" not in rendered
+    assert rendered["omnigent-openai"]["baseUrl"] == (
+        "https://wkspc.cloud.databricks.com/ai-gateway/codex/v1"
+    )
+    assert [m["id"] for m in rendered["omnigent-openai"]["models"]] == ["system.ai.gpt-5"]
+
+
 def test_inline_dedicated_gateway_host_stays_single_family(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

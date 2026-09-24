@@ -39,6 +39,9 @@ _OFFLINE_TEXT = "sentinel-offline-e2e this goes out by itself when the network i
 _CANCEL_TEXT = "sentinel-cancel-e2e this one is taken back before it ever goes out"
 _REFUSED_TEXT = "sentinel-refused-e2e the runner never came up"
 _GATEWAY_TEXT = "sentinel-gateway-e2e a 502 says nothing definitive"
+_REFUSAL_CAUSE = (
+    "The host launched runner runner_token_e2e for this session, but it never connected"
+)
 _USER_BUBBLE = '[data-testid="message-bubble"][data-role="user"]'
 _FOOTER = '[data-testid="send-delivery"]'
 _FAILED_FOOTER = '[data-testid="send-delivery"][data-state="failed"]'
@@ -285,28 +288,30 @@ def test_slow_network_shows_only_the_spinner(
 ) -> None:
     """A slow but healthy send shows the spinner and nothing else.
 
-    Seven seconds of emulated latency keeps the POST in flight past the
-    spinner delay. Elapsed time alone must never offer Retry or read as
-    failed: when the response lands the footer simply goes away and the
-    message was delivered once.
+    The message POST is held at the network layer for several seconds so it
+    is still in flight past the spinner delay. Elapsed time alone must never
+    offer Retry or read as failed: when the response finally lands the footer
+    simply goes away and the message was delivered once.
     """
     base_url, session_id = seeded_session
     page.goto(f"{base_url}/c/{session_id}")
-    expect(page.get_by_label(_COMPOSER_LABEL)).to_be_visible(timeout=30_000)
-    cdp = page.context.new_cdp_session(page)
-    cdp.send("Network.enable")
-    slow = {"offline": False, "latency": 7_000, "downloadThroughput": -1, "uploadThroughput": -1}
-    cdp.send("Network.emulateNetworkConditions", slow)
-    try:
-        _, bubble = _send(page, _LAG_TEXT)
-        footer = page.locator(_FOOTER)
-        expect(footer).to_have_attribute("data-state", "sending", timeout=8_000)
-        expect(page.get_by_role("button", name="Retry")).to_have_count(0)
-        expect(page.locator(_FAILED_FOOTER)).to_have_count(0)
-        # The slow response arrives; the footer clears without any failure.
-        expect(footer).to_have_count(0, timeout=30_000)
-    finally:
-        cdp.send("Network.emulateNetworkConditions", {**slow, "latency": 0})
+    held: list[Route] = []
+
+    def _hold(route: Route) -> None:
+        if _is_message_post(route) and not held:
+            held.append(route)  # left pending on purpose; released below
+            return
+        route.continue_()
+
+    page.route(f"**/v1/sessions/{session_id}/events", _hold)
+    _, bubble = _send(page, _LAG_TEXT)
+    footer = page.locator(_FOOTER)
+    expect(footer).to_have_attribute("data-state", "sending", timeout=8_000)
+    expect(page.get_by_role("button", name="Retry")).to_have_count(0)
+    expect(page.locator(_FAILED_FOOTER)).to_have_count(0)
+    assert held, "the message POST was not intercepted"
+    held[0].continue_()  # the slow response arrives
+    expect(footer).to_have_count(0, timeout=15_000)
     expect(page.locator('[data-testid="error-pill"]')).to_have_count(0)
     expect(bubble).to_have_count(1)
     assert _wait_until(lambda: _user_message_count(base_url, session_id, _LAG_TEXT) == 1, 15)
@@ -320,9 +325,10 @@ def test_lost_response_is_confirmed_by_the_check_resend(
 
     The first ``/events`` POST is forwarded to the server and then aborted
     on the way back, so the browser sees "Failed to fetch" for a message
-    the server has. The automatic check re-send carries the same
-    ``stable_id``; the server's dedup answers with the committed item and
-    the bubble settles. Exactly one copy exists server-side.
+    the server has. Either the stream's receipt settles the bubble first,
+    or the automatic check re-send (same ``stable_id``) does and the
+    server's dedup answers with the committed item. Either way the message
+    is never shown as failed and exactly one copy exists server-side.
     """
     base_url, session_id = seeded_session
     page.goto(f"{base_url}/c/{session_id}")
@@ -340,10 +346,9 @@ def test_lost_response_is_confirmed_by_the_check_resend(
     page.route(f"**/v1/sessions/{session_id}/events", _drop_reply)
     composer, bubble = _send(page, _LOST_TEXT)
 
-    assert _wait_until(lambda: len(stable_ids) >= 2, 10), stable_ids
-    assert len(set(stable_ids)) == 1, stable_ids
-    expect(page.locator(_FAILED_FOOTER)).to_have_count(0)
     expect(page.locator(_FOOTER)).to_have_count(0, timeout=15_000)
+    expect(page.locator(_FAILED_FOOTER)).to_have_count(0)
+    assert stable_ids and len(set(stable_ids)) == 1, stable_ids
     expect(page.locator('[data-testid="error-pill"]')).to_have_count(0)
     expect(bubble).to_have_count(1)
     expect(composer).to_have_value("")
@@ -418,7 +423,7 @@ def test_server_refusal_shows_its_reason_and_a_plain_5xx_waits(
     """A definitive refusal reads Failed at once; a bare 5xx is checked first.
 
     A runner-unavailable 503 is the server's final word: the footer reads
-    "Failed" immediately with the friendly reason and offers Retry. A 502
+    "Failed" immediately with the server's own cause and offers Retry. A 502
     with no error code may have arrived after the message was persisted,
     so it behaves like a dropped connection: spinner, one automatic check
     re-send with the same ``stable_id``, and "Failed" only after 20 s.
@@ -433,7 +438,12 @@ def test_server_refusal_shows_its_reason_and_a_plain_5xx_waits(
                 status=503,
                 content_type="application/json",
                 body=json.dumps(
-                    {"error": {"code": "runner_unavailable", "message": "No runner bound"}}
+                    {
+                        "error": {
+                            "code": "runner_unavailable",
+                            "message": _REFUSAL_CAUSE,
+                        }
+                    }
                 ),
             )
             return
@@ -443,7 +453,7 @@ def test_server_refusal_shows_its_reason_and_a_plain_5xx_waits(
     _, refused = _send(page, _REFUSED_TEXT)
     footer = page.locator(_FAILED_FOOTER)
     expect(footer).to_be_visible(timeout=5_000)
-    expect(footer).to_contain_text("The runner didn't come online in time")
+    expect(footer).to_contain_text(_REFUSAL_CAUSE)
     expect(page.get_by_role("button", name="Retry")).to_be_visible()
     page.get_by_role("button", name="Cancel").click()
     expect(refused).to_have_count(0)

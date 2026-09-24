@@ -10,6 +10,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import socket
 import sys
 import threading
@@ -93,6 +94,7 @@ class LatencyProxy:
         self._stopping = threading.Event()
         self.request_count = 0
         self.connection_count = 0
+        self._first_request_at: float | None = None
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._listener.bind(("127.0.0.1", 0))
@@ -104,7 +106,14 @@ class LatencyProxy:
     def record_request(self) -> None:
         """Record one client-to-server HTTP request."""
         with self._lock:
+            if self._first_request_at is None:
+                self._first_request_at = time.monotonic()
             self.request_count += 1
+
+    def first_request_time(self) -> float:
+        with self._lock:
+            assert self._first_request_at is not None, "CLI made no proxied HTTP request"
+            return self._first_request_at
 
     def snapshot(self) -> tuple[int, int]:
         """Return the request and connection counts."""
@@ -174,6 +183,7 @@ class JourneyTiming:
     """Timings and traffic counters for one remote-REPL journey."""
 
     prompt_ready_s: float
+    first_request_to_prompt_s: float
     first_reply_s: float
     second_reply_s: float
     startup_requests: int
@@ -185,6 +195,7 @@ class JourneyTiming:
         """Round timings for diagnostic output."""
         return {
             "prompt_ready_s": round(self.prompt_ready_s, 2),
+            "first_request_to_prompt_s": round(self.first_request_to_prompt_s, 2),
             "first_reply_s": round(self.first_reply_s, 2),
             "second_reply_s": round(self.second_reply_s, 2),
             "startup_requests": self.startup_requests,
@@ -221,6 +232,22 @@ def _build_repl_env(mock_llm_server_url: str, tmp_home: Path) -> dict[str, str]:
     )
     config_home = tmp_home / ".omnigent"
     config_home.mkdir(parents=True, exist_ok=True)
+    test_bin = tmp_home / "bin"
+    test_bin.mkdir()
+    if tmux := shutil.which("tmux"):
+        (test_bin / "tmux").symlink_to(tmux)
+    # Avoid host-specific CLI probes while retaining one slow readiness check.
+    slow_claude = test_bin / "claude"
+    slow_claude.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--version" ]; then\n'
+        "  /bin/sleep 5\n"
+        "  echo '2.99.0 (Claude Code)'\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 1\n"
+    )
+    slow_claude.chmod(0o755)
     (config_home / "config.yaml").write_text(
         "auto_open_conversation: false\ntui:\n  theme: dark\n",
     )
@@ -233,6 +260,7 @@ def _build_repl_env(mock_llm_server_url: str, tmp_home: Path) -> dict[str, str]:
         "OMNIGENT_SKIP_ONBOARD": "1",
         "OMNIGENT_NO_UPDATE_CHECK": "1",
         "PYTHONPATH": merged_pp,
+        "PATH": os.pathsep.join((str(test_bin), "/usr/bin", "/bin", "/usr/sbin", "/sbin")),
         "TERM": "xterm-256color",
         "LINES": "40",
         "COLUMNS": "120",
@@ -297,7 +325,9 @@ def _drive_remote_repl(
     )
     try:
         child.expect(_PROMPT_READY, timeout=_LAUNCH_TIMEOUT_S)
-        prompt_ready_s = time.monotonic() - start
+        prompt_ready_at = time.monotonic()
+        prompt_ready_s = prompt_ready_at - start
+        first_request_to_prompt_s = prompt_ready_at - proxy.first_request_time()
         startup_requests, _ = proxy.snapshot()
 
         child.send("hello one")
@@ -318,6 +348,7 @@ def _drive_remote_repl(
 
     return JourneyTiming(
         prompt_ready_s=prompt_ready_s,
+        first_request_to_prompt_s=first_request_to_prompt_s,
         first_reply_s=first_reply_s,
         second_reply_s=second_reply_s,
         startup_requests=startup_requests,

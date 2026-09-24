@@ -1312,6 +1312,164 @@ async def test_session_event_batch_is_ordered_and_idempotent(
     ]
 
 
+async def _start_batch_child(client: httpx.AsyncClient, subagent_id: str) -> str:
+    """Create a claude-native parent and mint one sub-agent child under it."""
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+    )
+    start = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_subagent_start",
+            "data": {
+                "subagent_id": subagent_id,
+                "agent_type": "Explore",
+                "description": "Batch append",
+                "tool_use_id": f"toolu_{subagent_id}",
+            },
+        },
+    )
+    return start.json()["child_session_id"]
+
+
+def _child_assistant_item(index: int) -> dict[str, Any]:
+    return {
+        "type": "external_conversation_item",
+        "data": {
+            "source_id": f"child-assistant:{index}:message",
+            "item_type": "message",
+            "response_id": f"resp_child_{index}",
+            "item_data": {
+                "role": "assistant",
+                "agent": "claude-native-ui",
+                "content": [{"type": "output_text", "text": f"step {index}"}],
+            },
+        },
+    }
+
+
+def _count_appends(monkeypatch: pytest.MonkeyPatch, session_id: str) -> list[int]:
+    """Record the item count of every store append for ``session_id``."""
+    appends: list[int] = []
+    original_append = SqlAlchemyConversationStore.append
+
+    def counting_append(
+        self: SqlAlchemyConversationStore, conversation_id: str, items: list[Any]
+    ) -> Any:
+        if conversation_id == session_id:
+            appends.append(len(items))
+        return original_append(self, conversation_id, items)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "append", counting_append)
+    return appends
+
+
+async def test_session_event_item_batch_persists_with_one_store_append(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child transcript array costs one append, not one per item."""
+    child_id = await _start_batch_child(client, "one-append-child")
+    appends = _count_appends(monkeypatch, child_id)
+
+    response = await client.post(
+        f"/v1/sessions/{child_id}/events",
+        json=[_child_assistant_item(index) for index in range(5)],
+    )
+
+    assert response.status_code == 202, response.text
+    assert len(response.json()) == 5
+    assert appends == [5]
+    items = (await client.get(f"/v1/sessions/{child_id}/items")).json()["data"]
+    assert [item["content"][0]["text"] for item in items] == [f"step {i}" for i in range(5)]
+    assert [item["id"] for item in items] == [ack["item_id"] for ack in response.json()]
+
+
+async def test_session_event_item_batch_rejects_an_invalid_item_without_partial_writes(
+    client: httpx.AsyncClient,
+) -> None:
+    """The single append is all-or-nothing, so a bad item persists nothing."""
+    child_id = await _start_batch_child(client, "atomic-child")
+    invalid = _child_assistant_item(1)
+    invalid["data"]["source_id"] = " "
+
+    response = await client.post(
+        f"/v1/sessions/{child_id}/events",
+        json=[_child_assistant_item(0), invalid],
+    )
+
+    assert response.status_code == 400, response.text
+    items = (await client.get(f"/v1/sessions/{child_id}/items")).json()["data"]
+    assert items == []
+
+
+async def test_session_event_item_batch_dedupes_a_repeated_source_id(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source item repeated inside one array persists and publishes once."""
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, event: published.append(event),
+    )
+    child_id = await _start_batch_child(client, "repeat-child")
+    published.clear()
+
+    response = await client.post(
+        f"/v1/sessions/{child_id}/events",
+        json=[_child_assistant_item(0), _child_assistant_item(0)],
+    )
+
+    assert response.status_code == 202, response.text
+    first, second = response.json()
+    assert first["item_id"] == second["item_id"]
+    assert len(published) == 1
+    items = (await client.get(f"/v1/sessions/{child_id}/items")).json()["data"]
+    assert [item["id"] for item in items] == [first["item_id"]]
+
+
+async def test_session_event_item_batch_with_queued_input_keeps_per_event_drain(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Queued web input keeps the per-event path so each user item drains in order."""
+    from omnigent.runtime import pending_inputs
+
+    child_id = await _start_batch_child(client, "pending-child")
+    pending_id = pending_inputs.record(
+        child_id, [{"type": "input_text", "text": "check the logs"}], created_by="alice"
+    )
+    appends = _count_appends(monkeypatch, child_id)
+    user_item = {
+        "type": "external_conversation_item",
+        "data": {
+            "source_id": "child-user:0:message",
+            "item_type": "message",
+            "response_id": "resp_child_user",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "check the logs"}],
+            },
+        },
+    }
+
+    response = await client.post(
+        f"/v1/sessions/{child_id}/events",
+        json=[user_item, _child_assistant_item(0)],
+    )
+
+    assert response.status_code == 202, response.text
+    assert appends == [1, 1]
+    assert not pending_inputs.has_pending(child_id)
+    items = (await client.get(f"/v1/sessions/{child_id}/items")).json()["data"]
+    assert items[0]["created_by"] == "alice"
+    assert pending_id not in json.dumps(pending_inputs.snapshot_for(child_id))
+
+
 async def test_session_event_batch_rejects_body_over_ten_mib(
     client: httpx.AsyncClient,
 ) -> None:

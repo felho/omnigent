@@ -17,6 +17,7 @@ import secrets
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 import httpx
@@ -2537,35 +2538,33 @@ async def _persist_external_devin_subagent_start(
     )
 
 
-async def _persist_external_conversation_item(
+@dataclass
+class _PreparedExternalItem:
+    """An ``external_conversation_item`` staged for append, before any store write.
+
+    :param body: The event the item was parsed from.
+    :param item: The anchor item, with its idempotency id and any folded
+        pending-input file blocks.
+    :param batch: Items to append for this event: skipped Kiro pairs, then
+        the anchor.
+    :param drained: The pending-input entry drained for a user message.
+    :param skipped_kiro_pending: Kiro pending entries the transcript skipped.
+    """
+
+    body: SessionEventInput
+    item: NewConversationItem
+    batch: list[NewConversationItem]
+    drained: pending_inputs.DrainedInput | None
+    skipped_kiro_pending: list[pending_inputs.DrainedInput]
+
+
+def _prepare_external_conversation_item(
     session_id: str,
     conv: Conversation,
     body: SessionEventInput,
-    conversation_store: ConversationStore,
-    created_by: str | None = None,
-    background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
-    enabled: bool = True,
-) -> str:
-    """
-    Persist and broadcast a conversation item produced outside AP.
-
-    This is the transcript bridge path for native Claude. It appends
-    user messages, assistant messages, tool calls, and tool results
-    without starting or steering the placeholder Omnigent agent.
-
-    :param session_id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    :param conv: Conversation row for title seeding.
-    :param body: External item event body.
-    :param conversation_store: Store used to append the item.
-    :param created_by: Authenticated identity of the actor whose
-        request triggered the forwarder POST, e.g.
-        ``"alice@example.com"``. Used to attribute user messages typed
-        directly in the native terminal (no pending-input entry exists
-        for those). ``None`` in single-user / unauthenticated mode —
-        no label is stamped in that case.
-    :returns: Store-assigned conversation item id.
-    """
+    created_by: str | None,
+) -> _PreparedExternalItem:
+    """Parse one external item and drain its pending input, without writing."""
     item = _parse_external_conversation_item(body)
     # An at-least-once producer (the native transcript forwarders) retries a
     # timed-out POST it cannot know the disposition of, so the item's id is
@@ -2598,7 +2597,6 @@ async def _persist_external_conversation_item(
     # The vendor CLI's own interrupt record is exempt: it is synthesized by
     # Claude (not a queued web message) and has no pending entry, so
     # draining for it would hand the queued message's uploads to the marker.
-    cleared_pending_id: str | None = None
     drained: pending_inputs.DrainedInput | None = None
     skipped_kiro_pending: list[pending_inputs.DrainedInput] = []
     if (
@@ -2616,7 +2614,6 @@ async def _persist_external_conversation_item(
         else:
             drained = pending_inputs.resolve_oldest(session_id)
         if drained is not None:
-            cleared_pending_id = drained.pending_id
             item = _merge_pending_file_blocks(item, drained.content)
             # Apply the original sender's identity recorded at POST time.
             # The transcript forwarder is the single writer here and has no
@@ -2643,27 +2640,40 @@ async def _persist_external_conversation_item(
     # anchor is already persisted (a forwarder retry), append returns every
     # item as deduplicated and the queue entries are restored below.
     skipped_new_items = _build_skipped_kiro_items(session_id, skipped_kiro_pending)
-    batch = [*skipped_new_items, item]
-    pending_background_title = prepare_background_session_title(
-        coordinator=background_title_coordinator,
-        conversation=conv,
-        event=SessionEventInput(type=item.type, data=item.data.model_dump()),
-        enabled=enabled and (drained is None or drained.background_titles_enabled),
+    return _PreparedExternalItem(
+        body=body,
+        item=item,
+        batch=[*skipped_new_items, item],
+        drained=drained,
+        skipped_kiro_pending=skipped_kiro_pending,
     )
-    persisted_items = await asyncio.to_thread(conversation_store.append, session_id, batch)
+
+
+async def _finalize_external_conversation_item(
+    session_id: str,
+    conv: Conversation,
+    prepared: _PreparedExternalItem,
+    persisted_items: Sequence[ConversationItem],
+    conversation_store: ConversationStore,
+    background_title_coordinator: BackgroundSessionTitleCoordinator | None,
+    enabled: bool,
+) -> str:
+    """Publish one appended external item's side effects; return its id."""
+    drained = prepared.drained
+    item = prepared.item
     persisted = persisted_items[-1]
     if persisted.deduplicated:
         # A re-post of an already-committed item: nothing new to render or
         # title. Every pending entry consumed above belongs to a LATER user
         # message — restore in original queue order (skipped entries preceded
         # the match; restore prepends, so reverse).
-        for entry in reversed([*skipped_kiro_pending, drained]):
+        for entry in reversed([*prepared.skipped_kiro_pending, drained]):
             if entry is not None:
                 pending_inputs.restore(session_id, entry)
         return persisted.id
     # Not a duplicate: publish side effects for each skipped Kiro pair.
     # Items are [user0, error0, user1, error1, ...]; 2 per skipped entry.
-    for i, skipped in enumerate(skipped_kiro_pending):
+    for i, skipped in enumerate(prepared.skipped_kiro_pending):
         persisted_user = persisted_items[i * 2]
         persisted_error = persisted_items[i * 2 + 1]
         if not persisted_user.deduplicated:
@@ -2671,18 +2681,125 @@ async def _persist_external_conversation_item(
                 session_id, persisted_user, cleared_pending_id=skipped.pending_id
             )
             _publish_external_conversation_item(session_id, persisted_error)
+    pending_background_title = prepare_background_session_title(
+        coordinator=background_title_coordinator,
+        conversation=conv,
+        event=SessionEventInput(type=item.type, data=item.data.model_dump()),
+        enabled=enabled and (drained is None or drained.background_titles_enabled),
+    )
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
     if pending_background_title is not None:
         pending_background_title.schedule(expected_seed_title=conv.title)
-    message_id = body.data.get("message_id")
+    message_id = prepared.body.data.get("message_id")
     _publish_external_conversation_item(
         session_id,
         persisted,
-        cleared_pending_id=cleared_pending_id,
+        cleared_pending_id=drained.pending_id if drained is not None else None,
         message_id=message_id if isinstance(message_id, str) else None,
     )
     _drive_terminal_resolved_elicitation(session_id, persisted)
     return persisted.id
+
+
+async def _persist_external_conversation_item(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+    created_by: str | None = None,
+    background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    enabled: bool = True,
+) -> str:
+    """
+    Persist and broadcast a conversation item produced outside AP.
+
+    This is the transcript bridge path for native Claude. It appends
+    user messages, assistant messages, tool calls, and tool results
+    without starting or steering the placeholder Omnigent agent.
+
+    :param session_id: Session/conversation identifier,
+        e.g. ``"conv_abc123"``.
+    :param conv: Conversation row for title seeding.
+    :param body: External item event body.
+    :param conversation_store: Store used to append the item.
+    :param created_by: Authenticated identity of the actor whose
+        request triggered the forwarder POST, e.g.
+        ``"alice@example.com"``. Used to attribute user messages typed
+        directly in the native terminal (no pending-input entry exists
+        for those). ``None`` in single-user / unauthenticated mode —
+        no label is stamped in that case.
+    :returns: Store-assigned conversation item id.
+    """
+    (item_id,) = await _persist_external_conversation_items(
+        session_id,
+        conv,
+        [(body, created_by)],
+        conversation_store,
+        background_title_coordinator=background_title_coordinator,
+        enabled=enabled,
+    )
+    return item_id
+
+
+def _can_batch_external_conversation_items(session_id: str, conv: Conversation) -> bool:
+    """Whether an item array may take the single-append path.
+
+    Queued web input (and Kiro's text matching) drains item by item with
+    dedupe restores in between, so those sessions keep the per-event path.
+    """
+    return not _is_kiro_native_session(conv) and not pending_inputs.has_pending(session_id)
+
+
+async def _persist_external_conversation_items(
+    session_id: str,
+    conv: Conversation,
+    events: Sequence[tuple[SessionEventInput, str | None]],
+    conversation_store: ConversationStore,
+    background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    enabled: bool = True,
+) -> list[str]:
+    """
+    Persist a run of external items with ONE store append, in order.
+
+    A sub-agent forwarder posts up to 100 items per request, and each append
+    pays the store's fixed cost (lock, dedupe probe, payload encode), so one
+    append per item would scale a full array past the forwarder's post
+    timeout. The single append is all-or-nothing and idempotent on each
+    item's ``source_id``.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param conv: Conversation row for title seeding.
+    :param events: ``(event, created_by)`` pairs in transcript order;
+        ``created_by`` is as for :func:`_persist_external_conversation_item`.
+    :param conversation_store: Store used to append the items.
+    :returns: Store-assigned conversation item ids, one per event.
+    """
+    prepared = [
+        _prepare_external_conversation_item(session_id, conv, body, created_by)
+        for body, created_by in events
+    ]
+    persisted_items = await asyncio.to_thread(
+        conversation_store.append,
+        session_id,
+        [new_item for entry in prepared for new_item in entry.batch],
+    )
+    item_ids: list[str] = []
+    offset = 0
+    for entry in prepared:
+        entry_items = persisted_items[offset : offset + len(entry.batch)]
+        offset += len(entry.batch)
+        item_ids.append(
+            await _finalize_external_conversation_item(
+                session_id,
+                conv,
+                entry,
+                entry_items,
+                conversation_store,
+                background_title_coordinator,
+                enabled,
+            )
+        )
+    return item_ids
 
 
 def _build_skipped_kiro_items(

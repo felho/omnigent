@@ -200,6 +200,7 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
+    _can_batch_external_conversation_items,
     _child_session_summaries_from_conversations,
     _dispatch_session_event_to_runner,
     _enrich_terminal_status_with_subagent_output,
@@ -216,6 +217,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _persist_external_antigravity_subagent_start,
     _persist_external_codex_subagent_start,
     _persist_external_conversation_item,
+    _persist_external_conversation_items,
     _persist_external_devin_subagent_start,
     _persist_external_session_usage,
     _persist_host_launch_failure_turn,
@@ -539,8 +541,10 @@ def register_events_routes(
         entries succeed. Batch execution is not atomic: if an entry fails,
         earlier entries remain applied, later entries are not attempted, and
         the error response does not include acknowledgements from earlier
-        entries. Messages count as in flight for the whole request, including
-        runner launch.
+        entries. The exception is an array of only ``external_conversation_item``
+        events, which persists all-or-nothing in one store append (see
+        :func:`_post_external_conversation_item_batch`). Messages count as in
+        flight for the whole request, including runner launch.
         """
         with contextlib.ExitStack() as in_flight:
             if isinstance(body, list):
@@ -554,6 +558,8 @@ def register_events_routes(
                         "session event batch exceeds the 100-event limit",
                         code=ErrorCode.INVALID_INPUT,
                     )
+                if all(event.type == _EXTERNAL_CONVERSATION_ITEM_TYPE for event in body):
+                    return await _post_external_conversation_item_batch(request, session_id, body)
                 return [
                     await _post_event_impl(
                         request,
@@ -571,6 +577,87 @@ def register_events_routes(
             )
 
     router.include_router(event_router)
+
+    async def _resolve_event_created_by(
+        request: Request,
+        session_id: str,
+        conv: Any,
+        user_id: str | None,
+        body: SessionEventInput,
+    ) -> str | None:
+        """Return the attribution for one event: the caller, or a runner's ``created_by``."""
+        created_by = _attribution_user(user_id)
+        body_created_by = _attribution_user(body.created_by)
+        if body_created_by is not None:
+            if not _has_runner_created_by_authority(request, conv):
+                raise OmnigentError(
+                    "created_by is reserved for runner-originated session events",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            try:
+                await _require_access_and_level(
+                    body_created_by,
+                    session_id,
+                    LEVEL_EDIT,
+                    permission_store,
+                    conversation_store,
+                )
+            except OmnigentError:
+                pass
+            else:
+                created_by = body_created_by
+        return created_by
+
+    async def _post_external_conversation_item_batch(
+        request: Request,
+        session_id: str,
+        events: list[SessionEventInput],
+    ) -> list[dict[str, bool | str]]:
+        """
+        Persist an array of ``external_conversation_item`` events in one append.
+
+        Sub-agent transcript forwarders post these arrays (up to 100 items).
+        Authorizing once (a sub-agent's check walks its parent chain) and
+        appending once keeps a full array inside the forwarder's post timeout;
+        per-item handling scales with the array and times out on every retry.
+        A session with queued web input keeps the per-event path so
+        pending-input drain order is unchanged.
+
+        :param request: The incoming request.
+        :param session_id: Session/conversation identifier.
+        :param events: Non-empty events, all ``external_conversation_item``.
+        :returns: One ``{"queued": False, "item_id": ...}`` per event.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise _session_not_found()
+        if not _can_batch_external_conversation_items(session_id, conv):
+            return [await _post_event_impl(request, session_id, event) for event in events]
+        add_audit_attrs(event_type=_EXTERNAL_CONVERSATION_ITEM_TYPE)
+        persist_events: list[tuple[SessionEventInput, str | None]] = []
+        for event in events:
+            if event.tools:
+                try:
+                    parse_client_side_tool_specs(event.tools)
+                except ValueError as exc:
+                    raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+            created_by = await _resolve_event_created_by(request, session_id, conv, user_id, event)
+            persist_events.append((event, created_by))
+        item_ids = await _persist_external_conversation_items(
+            session_id,
+            conv,
+            persist_events,
+            conversation_store,
+            background_title_coordinator=background_title_coordinator,
+            enabled=background_session_titles_enabled(request.headers),
+        )
+        return [{"queued": False, "item_id": item_id} for item_id in item_ids]
 
     async def _post_event_impl(
         request: Request,
@@ -680,26 +767,7 @@ def register_events_routes(
             # Marked only after authorization, so an unauthorized caller
             # cannot flip a session to "running" even transiently.
             in_flight.enter_context(_mark_dispatch_in_flight(session_id))
-        created_by = _attribution_user(user_id)
-        body_created_by = _attribution_user(body.created_by)
-        if body_created_by is not None:
-            if not _has_runner_created_by_authority(request, conv):
-                raise OmnigentError(
-                    "created_by is reserved for runner-originated session events",
-                    code=ErrorCode.FORBIDDEN,
-                )
-            try:
-                await _require_access_and_level(
-                    body_created_by,
-                    session_id,
-                    LEVEL_EDIT,
-                    permission_store,
-                    conversation_store,
-                )
-            except OmnigentError:
-                pass
-            else:
-                created_by = body_created_by
+        created_by = await _resolve_event_created_by(request, session_id, conv, user_id, body)
         # Validate event type at the route boundary. Anything not in
         # ``_ALLOWED_EVENT_TYPES`` is a client mistake — failing here
         # is far better than silently persisting an item the agent

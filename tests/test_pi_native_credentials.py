@@ -160,12 +160,13 @@ def test_inline_databricks_gateway_enumerates_all_families(
 ) -> None:
     """An inline gateway on a Databricks AI Gateway surfaces every family.
 
-    ``omnigent setup`` writes a single-family ``openai-gateway`` when the user
-    adds the Databricks AI Gateway as an OpenAI endpoint. Pi must not be capped
-    to that one family: the gateway fronts a workspace serving Claude, GPT and
-    Gemini, so the resolver enumerates the workspace and exposes all of them —
-    Claude on Pi's native Anthropic surface, GPT/Gemini as additional providers
-    — rather than an OpenAI-only config.
+    The web UI's credential flow writes a single-family ``openai-gateway`` when
+    the Databricks AI Gateway is entered for Codex, and pins it as Pi's default
+    when nothing else serves Pi. Pi must not be capped to that one family: the
+    gateway fronts a workspace serving Claude, GPT and Gemini, so the resolver
+    enumerates the workspace and exposes all of them — Claude on Pi's native
+    Anthropic surface, GPT/Gemini as additional providers — while the configured
+    default stays the launch model.
     """
     canned = (
         [{"id": "system.ai.claude-opus-5"}],  # claude → anthropic surface
@@ -198,6 +199,133 @@ def test_inline_databricks_gateway_enumerates_all_families(
     assert [m["id"] for m in provider.extra_models] == ["system.ai.claude-opus-5"]
     # GPT and Gemini surface as additional providers (the openai-only bug hid these).
     assert set(provider.additional_providers) == {"omnigent-openai", "omnigent-mlflow"}
+    # The configured default is still what Pi launches with, served by its surface.
+    assert provider.model == "system.ai.gpt-5"
+    rendered = provider.to_models_config()["providers"]
+    assert [m["id"] for m in rendered["omnigent-openai"]["models"]] == ["system.ai.gpt-5"]
+
+
+def _databricks_openai_gateway_config(**family_extra: object) -> dict[str, object]:
+    return {
+        "providers": {
+            "openai-gateway": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": "https://wkspc.cloud.databricks.com/ai-gateway/codex/v1",
+                    "api_key": "gw-token",
+                    "wire_api": "responses",
+                    "models": {"default": "system.ai.gpt-5", **family_extra},
+                },
+            }
+        }
+    }
+
+
+def test_inline_databricks_gateway_keeps_configured_model_when_listing_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed workspace listing keeps the configured model on its own surface.
+
+    A token without Unity Catalog access (or an unreachable workspace) must not
+    swap the working OpenAI config for a Claude default the gateway may reject.
+    """
+
+    def _boom(host: str, token: str):
+        raise RuntimeError("403 from unity-catalog/model-services")
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _boom)
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_openai_gateway_config)
+
+    assert provider is not None
+    assert provider.api == "openai-responses"
+    assert provider.base_url == "https://wkspc.cloud.databricks.com/ai-gateway/codex/v1"
+    assert provider.model == "system.ai.gpt-5"
+    assert not provider.additional_providers
+
+
+def test_inline_databricks_gateway_respects_curated_tiers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured multi-model tier map is a shortlist; it is not widened."""
+
+    def _unexpected(host: str, token: str):
+        raise AssertionError("a curated tier map must not trigger enumeration")
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _unexpected)
+
+    provider = creds.resolve_pi_native_provider(
+        config_loader=lambda: _databricks_openai_gateway_config(mini="system.ai.gpt-5-mini")
+    )
+
+    assert provider is not None
+    assert provider.api == "openai-responses"
+    assert provider.curated_models is True
+    assert [m["id"] for m in provider.extra_models] == ["system.ai.gpt-5", "system.ai.gpt-5-mini"]
+
+
+def test_inline_dedicated_gateway_host_stays_single_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dedicated ``ai-gateway`` host names no workspace, so nothing is enumerated."""
+
+    def _unexpected(host: str, token: str):
+        raise AssertionError("a dedicated gateway host must not trigger enumeration")
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _unexpected)
+    config = {
+        "providers": {
+            "anthropic-gateway": {
+                "kind": "gateway",
+                "default": "pi",
+                "anthropic": {
+                    "base_url": "https://123.ai-gateway.cloud.databricks.com/anthropic",
+                    "api_key": "gw-token",
+                    "models": {"default": "system.ai.claude-opus-5"},
+                },
+            }
+        }
+    }
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+
+    assert provider is not None
+    assert provider.api == "anthropic-messages"
+    assert provider.base_url == "https://123.ai-gateway.cloud.databricks.com/anthropic"
+    assert provider.model == "system.ai.claude-opus-5"
+    assert not provider.additional_providers
+
+
+def test_databricks_gateway_builder_derives_codex_surface_from_anthropic_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dedicated host's Anthropic URL yields ``/codex/v1``, not ``/anthropic/codex/v1``."""
+    monkeypatch.setattr(
+        creds, "_databricks_workspace_url_for_gateway", lambda url: "https://wkspc.example.com"
+    )
+    monkeypatch.setattr(creds, "_run_auth_command", lambda command: "tok")
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: (
+            [{"id": "system.ai.claude-opus-5"}],
+            [{"id": "system.ai.gpt-5"}],
+            [],
+            [],
+        ),
+    )
+
+    provider = creds._databricks_gateway_pi_provider(
+        gateway_base_url="https://123.ai-gateway.cloud.databricks.com/anthropic",
+        model=None,
+        auth_command="print-token",
+    )
+
+    codex_url = "https://123.ai-gateway.cloud.databricks.com/codex/v1"
+    assert provider.base_url == "https://123.ai-gateway.cloud.databricks.com/anthropic"
+    assert provider.databricks_surfaces[creds.DatabricksPiSurface.RESPONSES] == codex_url
+    assert provider.additional_providers["omnigent-openai"]["baseUrl"] == codex_url
 
 
 def test_inline_non_databricks_gateway_stays_single_family() -> None:

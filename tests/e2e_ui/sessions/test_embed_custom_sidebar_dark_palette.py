@@ -191,8 +191,10 @@ def _install_embed_host(page: Page, host_dist: Path) -> None:
         request = route.request
         path = urlparse(request.url).path
         if path.startswith(_HOST_BASE):
-            asset = host_dist / path[len(_HOST_BASE) :]
-            if asset.is_file():
+            # Contain the URL-derived suffix: an absolute or ../ suffix must
+            # never let the handler serve files outside the built host page.
+            asset = (host_dist / path[len(_HOST_BASE) :].lstrip("/")).resolve()
+            if asset.is_relative_to(host_dist.resolve()) and asset.is_file():
                 route.fulfill(path=str(asset))
             else:
                 route.fulfill(status=404, body="not found")

@@ -1684,6 +1684,152 @@ async def test_native_message_relaunch_host_refusal_names_reason(
     )
 
 
+async def test_native_message_no_relaunch_exit_report_owner_sees_cause(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Owner sees the original runner's exit report in the persisted failure.
+
+    When no relaunch was attempted (the host disconnected before the message
+    arrived) and the host already sent an exit report for the original runner,
+    the owner must see the full report — not a generic fallback.  Mirrors the
+    scoping applied to the relaunch path.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_native_session(client, comm)
+    session_id = session["id"]
+    original_runner_id = session["runner_id"]
+
+    set_runner_client(None)
+    caplog.set_level(logging.ERROR)
+
+    # Send the exit report for the original runner while the host is still
+    # connected (so conn.owner is available for scoping), then drop the
+    # tunnel so no relaunch is attempted.
+    daemon_report = (
+        "runner process exited with code 1\n--- runner log tail ---\nValueError: bad tunnel token"
+    )
+    exit_frame = HostRunnerExitedFrame(runner_id=original_runner_id, error=daemon_report)
+    await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(exit_frame)})
+
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+    registry = app.state.host_registry
+    while registry.get(_HOST_ID) is not None:
+        await asyncio.sleep(0.01)
+
+    msg_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        },
+    )
+    assert msg_resp.status_code == 202, msg_resp.text
+
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    error_items = [i for i in items if i["type"] == "error"]
+    assert len(error_items) == 1, f"expected one error item, got {items}"
+    assert error_items[0]["code"] == "runner_failed_to_start"
+    message = error_items[0]["message"]
+    # Unauthenticated fixture: user_id=None → get_visible always returns the
+    # full report (same rule as the relaunch path).
+    assert "ValueError: bad tunnel token" in message, message
+    assert "visible to the host owner" not in message, message
+
+    # The operator-facing ERROR carries the full report for all sessions.
+    assert any(
+        r.levelno == logging.ERROR
+        and session_id in r.getMessage()
+        and "ValueError: bad tunnel token" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+
+
+async def test_native_message_no_relaunch_exit_report_non_owner_gets_phase_message(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Non-owner viewer gets the phase message, not the raw host log tail.
+
+    The runner's exit report is host-owner-scoped; a different session
+    viewer must not see host-provided log text in the persisted error item
+    (it is readable by any session collaborator).  The full report still
+    lands in the operator ERROR log.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.host_registry import RunnerExitReports
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_native_session(client, comm)
+    session_id = session["id"]
+    original_runner_id = session["runner_id"]
+
+    # Pin distinct owner and viewer identities and record the report as
+    # belonging to the host owner (not the viewer).
+    real_record = RunnerExitReports.record
+
+    def _record_as_host_owner(
+        self: RunnerExitReports, runner_id: str, error: str, owner: str | None
+    ) -> None:
+        del owner
+        real_record(self, runner_id, error, owner="host-owner@example.com")
+
+    monkeypatch.setattr(RunnerExitReports, "record", _record_as_host_owner)
+    monkeypatch.setattr(
+        routes_events, "_get_user_id", lambda request, auth_provider: "viewer@example.com"
+    )
+
+    set_runner_client(None)
+    caplog.set_level(logging.ERROR)
+
+    daemon_report = (
+        "runner process exited with code 1\n--- runner log tail ---\nSECRET_TOKEN=hunter2"
+    )
+    exit_frame = HostRunnerExitedFrame(runner_id=original_runner_id, error=daemon_report)
+    await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(exit_frame)})
+
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+    registry = app.state.host_registry
+    while registry.get(_HOST_ID) is not None:
+        await asyncio.sleep(0.01)
+
+    msg_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        },
+    )
+    assert msg_resp.status_code == 202, msg_resp.text
+
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    error_items = [i for i in items if i["type"] == "error"]
+    assert len(error_items) == 1, f"expected one error item, got {items}"
+    message = error_items[0]["message"]
+    # Non-owner: phase-only, no secret log tail.
+    assert "exited" in message, message
+    assert "visible to the host owner" in message, message
+    assert "SECRET_TOKEN" not in message, message
+    # The operator-facing ERROR carries the full report.
+    assert any(
+        r.levelno == logging.ERROR and "SECRET_TOKEN=hunter2" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+
+
 async def test_native_message_no_host_tunnel_reports_host_offline(
     client: httpx.AsyncClient,
     app: FastAPI,

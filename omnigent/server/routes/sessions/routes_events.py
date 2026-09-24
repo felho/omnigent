@@ -2257,7 +2257,36 @@ def register_events_routes(
                         else None
                     )
                     if exit_cause:
-                        offline_message = exit_cause
+                        # Persist only what this requester is authorized to
+                        # read; other session viewers must not see
+                        # host-provided log tails.
+                        visible_cause = (
+                            runner_exit_reports.get_visible(conv.runner_id, user_id)
+                            if runner_exit_reports is not None
+                            else None
+                        )
+                        _logger.error(
+                            "Runner %s for session %s exited before a message "
+                            "could be delivered: %s",
+                            conv.runner_id,
+                            session_id,
+                            exit_cause,
+                            extra=debug_event(
+                                "runner_exited_before_send",
+                                session_id=session_id,
+                                runner_id=conv.runner_id,
+                                host_id=conv.host_id,
+                            ),
+                        )
+                        offline_message = (
+                            visible_cause
+                            if visible_cause
+                            else (
+                                "The runner for this session exited. The exit "
+                                "report is in the runner log on the host, "
+                                "visible to the host owner."
+                            )
+                        )
                     else:
                         _host_reg_now = getattr(request.app.state, "host_registry", None)
                         # Only report the host as offline when a host is

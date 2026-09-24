@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -67,6 +67,7 @@ from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     BEDROCK_KIND,
     CLI_CONFIG_KIND,
+    DATABRICKS_KIND,
     GEMINI_FAMILY,
     OPENAI_FAMILY,
     PI_SURFACE,
@@ -389,9 +390,10 @@ def _provider_entry_locally_credentialed(
       (which expands ``$VAR`` / ``api_key_ref`` via :func:`resolve_secret`)
       and fails rather than skipping the provider, so an entry pointing at an
       unset ``env:`` variable or a missing keychain secret is a first-turn
-      auth failure, not a credential. Usable kinds that carry no inline
-      family config (``databricks``) resolve their credential elsewhere at
-      launch and keep counting as sources here.
+      auth failure, not a credential. A ``databricks`` entry's named profile
+      must itself be locally credentialed
+      (:func:`_databricks_named_profile_credentialed`); other usable kinds
+      without inline family config resolve elsewhere and keep counting.
 
     Local env/keychain resolution only — no network I/O — and never raises.
 
@@ -407,6 +409,15 @@ def _provider_entry_locally_credentialed(
     """
     if provider.kind in unusable_kinds:
         return False
+    if provider.kind == DATABRICKS_KIND:
+        # Launch treats the entry's named profile as authoritative, so the
+        # entry is a credential source only when that profile is locally
+        # credentialed. A server-managed ``connection: databricks`` entry
+        # resolves its credential server-side (locally undetectable), so it
+        # keeps counting.
+        if getattr(provider, "connection", None) is not None:
+            return True
+        return _databricks_named_profile_credentialed(provider.profile)
     candidates = (family,) if family is not None else (ANTHROPIC_FAMILY, OPENAI_FAMILY)
     inline = [name for name in candidates if name in provider.families]
     if not inline:
@@ -548,28 +559,85 @@ def _claude_managed_gateway_configured() -> bool:
         return False
 
 
+def _runner_forwarded_env_names() -> frozenset[str]:
+    """The env var names a spawned runner would inherit as credentials.
+
+    Mirrors the host's runner-env build (``_build_runner_env`` in
+    :mod:`omnigent.host.connect`): the harness credential allowlist
+    (:data:`~omnigent.host.connect.HARNESS_CREDENTIAL_ENV_VARS`, which
+    already includes the ``OMNIGENT_``-prefixed variants) plus any extra
+    names the host owner lists in ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``.
+    Env vars referenced by the ``providers:`` config forward too, but those
+    are judged through the provider-entry resolution checks, not the
+    ambient-environment ones. Never raises.
+
+    :returns: The forwarded credential env var names; empty on any error.
+    """
+    try:
+        from omnigent.host.connect import (
+            HARNESS_CREDENTIAL_ENV_VARS,
+            RUNNER_ENV_PASSTHROUGH_ENV_VAR,
+        )
+
+        extras = frozenset(
+            name.strip()
+            for name in os.environ.get(RUNNER_ENV_PASSTHROUGH_ENV_VAR, "").split(",")
+            if name.strip()
+        )
+        return HARNESS_CREDENTIAL_ENV_VARS | extras
+    except Exception:
+        _logger.debug("readiness: runner env allowlist lookup failed", exc_info=True)
+        return frozenset()
+
+
+def _runner_visible_env_credential(var: str) -> bool:
+    """Whether *var* is set here AND would be forwarded to a spawned runner.
+
+    The in-process SDK harnesses execute inside runner subprocesses, and the
+    host's runner-env build strips everything outside its allowlists — so a
+    credential env var visible to the daemon but not forwarded (e.g. an
+    ambient ``OPENROUTER_API_KEY`` or ``DATABRICKS_TOKEN`` with no
+    ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` entry) cannot authenticate a launch
+    and must not read ready. The ``OMNIGENT_``-prefixed variant is checked
+    too. Env reads only; never raises.
+
+    :param var: The canonical env var name, e.g. ``"OPENAI_API_KEY"``.
+    :returns: ``True`` when a forwarded spelling of *var* is set and
+        non-empty.
+    """
+    from omnigent.util.env_credentials import env_names_with_omnigent_prefix
+
+    forwarded = _runner_forwarded_env_names()
+    return any(
+        name in forwarded and os.environ.get(name, "").strip()
+        for name in env_names_with_omnigent_prefix(var)
+    )
+
+
 def _ambient_family_env_key_configured(family: str) -> bool:
-    """Whether an ambient env API key serving *family* is set.
+    """Whether an ambient env API key serving *family* would reach the runner.
 
     Checks the same vendor env vars ambient detection adopts
     (:data:`~omnigent.onboarding.ambient._ENV_KEY_FAMILY` over
     :data:`~omnigent.onboarding.providers.PROVIDER_ENV_VARS`), including their
     ``OMNIGENT_``-prefixed variants — e.g. ``ANTHROPIC_API_KEY`` for the
     ``anthropic`` family, ``OPENAI_API_KEY`` / ``OPENROUTER_API_KEY`` for
-    ``openai``. The daemon spawns runners with its own environment, so a key
-    visible here is a key the harness will inherit.
+    ``openai``. A key counts only when the runner-env build would actually
+    forward it (:func:`_runner_visible_env_credential`): the daemon's own
+    environment is stripped before a runner spawns, so a daemon-only key
+    (an ambient ``OPENROUTER_API_KEY`` with no passthrough) is not a launch
+    credential.
 
     :param family: A model family, e.g. ``"anthropic"`` or ``"openai"``.
-    :returns: ``True`` when any such variable is set and non-empty.
+    :returns: ``True`` when any such variable is set and runner-visible.
     """
     from omnigent.onboarding.ambient import _ENV_KEY_FAMILY
     from omnigent.onboarding.providers import PROVIDER_ENV_VARS
-    from omnigent.util.env_credentials import getenv_nonempty_with_omnigent_prefix
 
     for provider, env_var in PROVIDER_ENV_VARS.items():
         if _ENV_KEY_FAMILY.get(provider) != family:
             continue
-        if getenv_nonempty_with_omnigent_prefix(env_var) is not None:
+        if _runner_visible_env_credential(env_var):
             return True
     return False
 
@@ -644,53 +712,95 @@ def _databricks_file_has_credentialed_profile(path: str) -> bool:
         section_names = list(parser.sections())
         if parser.defaults():
             section_names.append(parser.default_section)
-        for name in section_names:
-            section = parser[name]
-            if not section.get("host", "").strip():
-                continue
-            has_pat = bool(section.get("token", "").strip())
-            has_oauth = bool(
-                section.get("client_id", "").strip() and section.get("client_secret", "").strip()
-            )
-            has_basic = bool(
-                section.get("username", "").strip() and section.get("password", "").strip()
-            )
-            auth_type = section.get("auth_type", "").strip().lower()
-            if not auth_type:
-                if has_pat or has_oauth or has_basic:
-                    return True
-                continue
-            # An explicit auth_type selects ONE method; require that method's
-            # locally stored material rather than trusting the declaration.
-            if auth_type == "pat":
-                if has_pat:
-                    return True
-                continue
-            if auth_type == "basic":
-                if has_basic:
-                    return True
-                continue
-            if auth_type in ("oauth-m2m", "oauth"):
-                if has_oauth:
-                    return True
-                continue
-            if auth_type == "azure-client-secret":
-                if (
-                    section.get("azure_client_id", "").strip()
-                    and section.get("azure_client_secret", "").strip()
-                    and section.get("azure_tenant_id", "").strip()
-                ):
-                    return True
-                continue
-            # Externally resolved methods (databricks-cli, external-browser,
-            # metadata-service, github-oidc, azure-cli, …) keep their material
-            # outside this file; the declaration is the local signal.
-            return True
-        return False
+        return any(_databricks_section_carries_credentials(parser[name]) for name in section_names)
     except Exception as exc:
         # Log only the exception class: configparser errors can embed the
         # offending file's contents, which may include credential material.
         _logger.debug("readiness: databricks config parse failed (%s)", type(exc).__name__)
+        return False
+
+
+def _databricks_section_carries_credentials(section: Mapping[str, str]) -> bool:
+    """Whether one Databricks config profile section is locally usable.
+
+    The field logic behind :func:`_databricks_file_has_credentialed_profile`
+    and :func:`_databricks_named_profile_credentialed`; see the former for
+    the method-by-method rules.
+
+    :param section: A parsed profile section mapping (``configparser``
+        section proxy).
+    :returns: ``True`` when the section names a workspace host and its
+        authentication method's locally required material is present.
+    """
+    if not section.get("host", "").strip():
+        return False
+    has_pat = bool(section.get("token", "").strip())
+    has_oauth = bool(
+        section.get("client_id", "").strip() and section.get("client_secret", "").strip()
+    )
+    has_basic = bool(section.get("username", "").strip() and section.get("password", "").strip())
+    auth_type = section.get("auth_type", "").strip().lower()
+    if not auth_type:
+        return has_pat or has_oauth or has_basic
+    # An explicit auth_type selects ONE method; require that method's
+    # locally stored material rather than trusting the declaration.
+    if auth_type == "pat":
+        return has_pat
+    if auth_type == "basic":
+        return has_basic
+    if auth_type in ("oauth-m2m", "oauth"):
+        return has_oauth
+    if auth_type == "azure-client-secret":
+        return bool(
+            section.get("azure_client_id", "").strip()
+            and section.get("azure_client_secret", "").strip()
+            and section.get("azure_tenant_id", "").strip()
+        )
+    # Externally resolved methods (databricks-cli, external-browser,
+    # metadata-service, github-oidc, azure-cli, …) keep their material
+    # outside this file; the declaration is the local signal.
+    return True
+
+
+def _databricks_named_profile_credentialed(profile: str | None) -> bool:
+    """Whether the Databricks config declares *profile* with usable material.
+
+    A ``kind: databricks`` provider entry names a profile that launch treats
+    as authoritative (the ucode lookup resolves exactly that profile), so
+    the entry is a credential source only when the named profile actually
+    exists in the effective config file — the ``DATABRICKS_CONFIG_FILE``
+    override when set, else ``~/.databrickscfg`` — and carries its method's
+    material (:func:`_databricks_section_carries_credentials`). A
+    nonexistent or uncredentialed profile is a first-turn auth failure, not
+    a credential. Local file read only; never raises.
+
+    :param profile: The entry's profile name, e.g. ``"work"``; ``None`` /
+        empty reads the ``DEFAULT`` section.
+    :returns: ``True`` when the named profile exists and is credentialed.
+    """
+    import configparser
+
+    try:
+        path = os.environ.get("DATABRICKS_CONFIG_FILE", "").strip()
+        if not path:
+            from omnigent.onboarding.databricks_config import _DATABRICKSCFG_PATH
+
+            path = str(_DATABRICKSCFG_PATH)
+        if not os.path.exists(path):
+            return False
+        parser = configparser.ConfigParser()
+        parser.read(path)
+        name = (profile or "").strip() or parser.default_section
+        if name == parser.default_section:
+            if not parser.defaults():
+                return False
+        elif not parser.has_section(name):
+            return False
+        return _databricks_section_carries_credentials(parser[name])
+    except Exception as exc:
+        # Log only the exception class: configparser errors can embed the
+        # offending file's contents, which may include credential material.
+        _logger.debug("readiness: databricks profile lookup failed (%s)", type(exc).__name__)
         return False
 
 
@@ -711,17 +821,23 @@ def _databricks_workspace_configured() -> bool:
     :returns: ``True`` when an ambient Databricks credential source is
         resolvable.
     """
-    if os.environ.get("DATABRICKS_HOST", "").strip():
-        if os.environ.get("DATABRICKS_TOKEN", "").strip():
+    # Env-based Databricks credentials count only when the runner-env build
+    # would forward them: DATABRICKS_* is outside the harness credential
+    # allowlist, so without an OMNIGENT_RUNNER_ENV_PASSTHROUGH entry a
+    # daemon-only DATABRICKS_HOST/TOKEN never reaches the executor.
+    if _runner_visible_env_credential("DATABRICKS_HOST"):
+        if _runner_visible_env_credential("DATABRICKS_TOKEN"):
             return True
-        if (
-            os.environ.get("DATABRICKS_CLIENT_ID", "").strip()
-            and os.environ.get("DATABRICKS_CLIENT_SECRET", "").strip()
-        ):
+        if _runner_visible_env_credential(
+            "DATABRICKS_CLIENT_ID"
+        ) and _runner_visible_env_credential("DATABRICKS_CLIENT_SECRET"):
             return True
     config_override = os.environ.get("DATABRICKS_CONFIG_FILE", "").strip()
-    if config_override and _databricks_file_has_credentialed_profile(config_override):
-        return True
+    if config_override:
+        # An explicit override selects the config file exclusively — mirror
+        # that precedence rather than falling back to a default file the
+        # resolution would not read.
+        return _databricks_file_has_credentialed_profile(config_override)
     try:
         from omnigent.onboarding.databricks_config import _DATABRICKSCFG_PATH
 
@@ -809,7 +925,10 @@ def _antigravity_credential_configured() -> bool:
 
         if antigravity_api_key_configured():
             return True
-        if any(os.environ.get(var) for var in ANTIGRAVITY_ENV_VARS):
+        # Only env keys the runner-env build forwards count: a daemon-only
+        # ANTIGRAVITY_API_KEY (not on the harness credential allowlist, no
+        # passthrough) never reaches the executor.
+        if any(_runner_visible_env_credential(var) for var in ANTIGRAVITY_ENV_VARS):
             return True
     except Exception:
         _logger.debug("readiness: antigravity credential check failed", exc_info=True)

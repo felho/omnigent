@@ -53,6 +53,10 @@ def _isolate_cli_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
         "DATABRICKS_CLIENT_ID",
         "DATABRICKS_CLIENT_SECRET",
         "DATABRICKS_CONFIG_FILE",
+        # The operator's runner-env passthrough list: readiness now counts an
+        # ambient env credential only when the runner-env build would forward
+        # it, so a developer's real passthrough would flip verdicts here.
+        "OMNIGENT_RUNNER_ENV_PASSTHROUGH",
     ):
         monkeypatch.delenv(var, raising=False)
         monkeypatch.delenv(f"OMNIGENT_{var}", raising=False)
@@ -945,12 +949,17 @@ def test_sdk_harness_ready_via_databricks_workspace(
 
     monkeypatch.setenv("DATABRICKS_HOST", "https://example.cloud.databricks.com")
     monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-test-token")
+    # DATABRICKS_* is outside the harness credential allowlist, so env-based
+    # readiness additionally requires the operator's runner-env passthrough
+    # to actually deliver the credentials to the executor.
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "DATABRICKS_HOST,DATABRICKS_TOKEN")
     result = configured_harness_map()
     assert result["claude-sdk"] is True
     assert result["openai-agents"] is True
 
     monkeypatch.delenv("DATABRICKS_HOST")
     monkeypatch.delenv("DATABRICKS_TOKEN")
+    monkeypatch.delenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH")
     config_file = tmp_path / "databrickscfg-override"
     config_file.write_text("[work]\nhost = https://example.cloud.databricks.com\ntoken = t\n")
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(config_file))
@@ -980,6 +989,101 @@ def test_databricks_workspace_url_alone_is_not_a_credential(
     """
     _no_clis_installed(monkeypatch)
     monkeypatch.setenv("DATABRICKS_HOST", "https://example.cloud.databricks.com")
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "DATABRICKS_HOST")
+    result = configured_harness_map()
+    assert result["claude-sdk"] == "needs-auth"
+    assert result["openai-agents"] == "needs-auth"
+
+
+def test_daemon_only_env_credentials_do_not_ready_sdk_harnesses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Env credentials the runner-env build strips are not launch credentials.
+
+    The SDK executors run inside runner subprocesses, whose environment is
+    filtered down to the harness credential allowlist plus the operator's
+    ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``. A daemon-only ``DATABRICKS_HOST`` /
+    ``DATABRICKS_TOKEN`` pair or ``OPENROUTER_API_KEY`` never reaches the
+    executor, so readiness must keep warning; listing the names in the
+    passthrough makes each count.
+    """
+    _no_clis_installed(monkeypatch)
+    monkeypatch.setenv("DATABRICKS_HOST", "https://example.cloud.databricks.com")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-test-token")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    result = configured_harness_map()
+    assert result["claude-sdk"] == "needs-auth"
+    assert result["openai-agents"] == "needs-auth"
+
+    monkeypatch.setenv(
+        "OMNIGENT_RUNNER_ENV_PASSTHROUGH",
+        "DATABRICKS_HOST, DATABRICKS_TOKEN, OPENROUTER_API_KEY",
+    )
+    result = configured_harness_map()
+    assert result["claude-sdk"] is True
+    assert result["openai-agents"] is True
+
+
+def test_databricks_provider_with_missing_profile_is_not_a_credential(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``kind: databricks`` provider must name a locally credentialed profile.
+
+    Launch treats the entry's named profile as authoritative (the ucode
+    lookup resolves exactly that profile), so a default databricks provider
+    referencing a nonexistent or uncredentialed profile is a first-turn auth
+    failure, not a credential source — readiness must keep warning. A named
+    profile that exists with host + token flips it ready.
+    """
+    import omnigent.onboarding.databricks_config as dbc
+
+    _no_clis_installed(monkeypatch)
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {"providers": {"dbx": {"kind": "databricks", "profile": "work", "default": True}}}
+        )
+    )
+    # No databricks config file at all: the named profile cannot resolve.
+    result = configured_harness_map()
+    assert result["claude-sdk"] == "needs-auth"
+    assert result["openai-agents"] == "needs-auth"
+
+    # The named profile existing but carrying no auth material is equally
+    # unlaunchable (the ucode lookup resolves exactly this profile).
+    cfg = tmp_path / "databrickscfg"
+    cfg.write_text("[work]\nhost = https://example.cloud.databricks.com\n")
+    monkeypatch.setattr(dbc, "_DATABRICKSCFG_PATH", cfg)
+    result = configured_harness_map()
+    assert result["claude-sdk"] == "needs-auth"
+    assert result["openai-agents"] == "needs-auth"
+
+    # The named profile present and credentialed makes the entry a source.
+    cfg.write_text("[work]\nhost = https://example.cloud.databricks.com\ntoken = t\n")
+    result = configured_harness_map()
+    assert result["claude-sdk"] is True
+    assert result["openai-agents"] is True
+
+
+def test_databricks_config_override_is_exclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``DATABRICKS_CONFIG_FILE`` suppresses the default file.
+
+    Credential resolution honors the override exclusively, so a credentialed
+    default ``~/.databrickscfg`` must not flip readiness while an
+    uncredentialed override is selected.
+    """
+    import omnigent.onboarding.databricks_config as dbc
+
+    _no_clis_installed(monkeypatch)
+    default_cfg = tmp_path / "databrickscfg-default"
+    default_cfg.write_text("[DEFAULT]\nhost = https://example.cloud.databricks.com\ntoken = t\n")
+    monkeypatch.setattr(dbc, "_DATABRICKSCFG_PATH", default_cfg)
+    override = tmp_path / "databrickscfg-override"
+    override.write_text("[work]\n")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(override))
     result = configured_harness_map()
     assert result["claude-sdk"] == "needs-auth"
     assert result["openai-agents"] == "needs-auth"

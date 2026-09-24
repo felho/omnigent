@@ -1,37 +1,11 @@
-"""UI journey regression for a stranded failed sub-agent.
+"""A failed sub-agent's inbox result must survive an empty parent auto-wake turn.
 
-A failed sub-agent's result is delivered to the parent inbox and the
-framework posts the auto-wake notice, but when the parent's auto-wake turn
-completes EMPTY (an empty ``response.completed`` — an acknowledged
-intermittent model behavior), no recovery wake fires and no durable
-failed-child state surfaces. The orchestrator sits idle forever with the
-failed-child payload stranded in its inbox; the user sees nothing (the SPA
-deliberately hides ``subagent_wake`` system markers), and the workflow only
-advances when a human sends another message.
-
-Journey (all through the real SPA against a live server + runner + mock LLM):
-
-1. The user asks the orchestrator to dispatch its ``researcher`` sub-agent.
-2. The researcher's model calls all fail (mock provider 429s), so the child
-   session terminates ``failed`` and the runner posts the
-   ``[System: sub-agent … finished (failed) — 1 result waiting in inbox …]``
-   wake notice to the parent.
-3. The parent's auto-wake turn is scripted to complete with EMPTY text —
-   mirroring the reported Codex-native ``{"response": {"output": []}}``.
-4. The user sends nothing further.
-
-Contract under test (the fix target): the stranded failed-child result must
-remain actionable — the framework fires a bounded recovery wake, whose turn
-(scripted here as the parent's 4th model response) surfaces the failure in
-the transcript with NO further user input. While the bug is live the final
-assertion times out: the parent's wake-pending flag was discarded at turn
-start (``_run_turn_bg``), so ``_rewake_parent_if_inbox_stranded`` returns
-early and the 4th parent model request never happens.
-
-Invoke with::
-
-    pytest tests/e2e_ui/agents/test_failed_subagent_empty_wake_strand.py \
-        -v --ui-skip-build
+The child fails, its result lands in the parent inbox, and the framework posts
+the auto-wake notice — but the parent's wake turn completes with empty model
+output (the reported Codex-native ``{"response": {"output": []}}``). The
+framework must still surface the failure with no further user input; while the
+bug is live no recovery wake fires and the final assertion times out with the
+orchestrator idle and the failed result stranded.
 """
 
 from __future__ import annotations
@@ -50,8 +24,6 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-# Private helpers from the parent conftest — same import pattern the
-# sibling agents-rail fixtures use.
 from tests.e2e_ui.conftest import (
     _ensure_runner_online,
     _server_state,
@@ -65,13 +37,11 @@ _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _SUBAGENT_ROW = '[data-testid="subagent-row"]'
 _SUBAGENT_STATUS_DOT = '[data-testid="subagent-status-dot"]'
 
-# The auto-wake notice is emitted ONLY by _format_subagent_wake_notice;
+# The auto-wake notice is emitted only by _format_subagent_wake_notice;
 # "finished (failed)" pins it to a FAILED child terminal delivery.
 _FAILED_WAKE_FRAGMENT = "finished (failed)"
 _WAKE_NOTICE_SIGNATURE = "waiting in inbox"
 
-# Child failure + wake + empty turn are all mock-fast, but each hop is a
-# real subprocess round trip; budgets mirror the sibling agents tests.
 pytestmark = [pytest.mark.timeout(600)]
 
 
@@ -102,11 +72,9 @@ class StrandSession:
 def _strand_director_yaml() -> str:
     """Build the orchestrator spec (parent + one researcher sub-agent).
 
-    Mirrors the omnigent-flavored inline ``type: agent`` shape parsed by
-    ``omnigent/inner/loader.py:_parse_tool`` (same as the joke-director
-    fixture in this directory's conftest). The child carries no ``auth``
-    block: the e2e-ui server/runner export ``OPENAI_BASE_URL`` pointing at
-    the mock server, and per-run content-routing tokens select each queue.
+    The child carries no ``auth`` block: the e2e-ui server/runner export
+    ``OPENAI_BASE_URL`` pointing at the mock server, and per-run
+    content-routing tokens select each queue.
     """
     return f"""\
 name: {_ORCHESTRATOR_NAME}
@@ -141,19 +109,11 @@ def strand_session(
 ) -> Iterator[StrandSession]:
     """Create a runner-bound orchestrator session wired for the strand repro.
 
-    Mock queues (content-routed so concurrent turns cannot race):
-
-    Parent (selected by ``routing_token`` in the user's message):
-      1. dispatch: ``sys_session_send`` tool call to ``researcher``.
-      2. after tool result: text acknowledging the dispatch.
-      3. the auto-wake turn after the child FAILS: EMPTY text — the
-         reported empty ``response.completed``.
-      4. the recovery-wake turn: text carrying ``surface_code``. Reached
-         only if the framework re-wakes the parent after the empty turn.
-
-    Child (selected by ``child_token`` in the dispatch args): a run of
-    provider errors deep enough to outlast SDK retries, so the child's
-    turn terminates with an executor error and the child goes ``failed``.
+    Parent queue (selected by ``routing_token`` in the user's message):
+    dispatch tool call, post-dispatch ack, the EMPTY auto-wake turn, and a
+    recovery-wake turn carrying ``surface_code``. Child queue (selected by
+    ``child_token`` in the dispatch args): provider 429s deep enough to
+    outlast SDK retries, so the child terminates ``failed``.
     """
     suffix = uuid.uuid4().hex[:10]
     routing_token = f"strand-parent-{suffix}"
@@ -298,20 +258,11 @@ def test_failed_subagent_result_survives_empty_wake_turn(
     page: Page,
     strand_session: StrandSession,
 ) -> None:
-    """A failed child's stranded result must surface after an empty wake turn.
-
-    With the bug live, everything up
-    to and including the empty auto-wake turn happens (asserted as
-    preconditions), and then NOTHING — the final expectation times out
-    because no recovery wake ever fires and the failed-child payload stays
-    silently stranded in the parent inbox.
-    """
+    """A failed child's stranded result must surface after an empty wake turn."""
     chat = strand_session
     page.goto(f"{chat.base_url}/c/{chat.session_id}")
 
-    # 1. The user asks for a dispatch; the scripted parent dispatches the
-    #    researcher and acknowledges. This is the LAST user input the
-    #    session ever receives.
+    # The dispatch request is the LAST user input the session ever receives.
     _send(
         page,
         "Please dispatch the researcher sub-agent to investigate. "
@@ -321,11 +272,8 @@ def test_failed_subagent_result_survives_empty_wake_turn(
         timeout=120_000
     )
 
-    # 2. The child's provider calls all 429 → its turn errors terminally →
-    #    the runner marks the child failed and posts the failed-child wake
-    #    notice. The SPA hides subagent_wake markers, so assert the notice
-    #    via the session snapshot — this is the reported state: failed
-    #    result delivered to the inbox + wake posted.
+    # The SPA hides subagent_wake markers, so assert the failed-child wake
+    # notice via the session snapshot: failed result in inbox + wake posted.
     _wait_until(
         lambda: (
             _FAILED_WAKE_FRAGMENT in _items_blob(chat.base_url, chat.session_id)
@@ -339,8 +287,7 @@ def test_failed_subagent_result_survives_empty_wake_turn(
         ),
     )
 
-    # The child's failure IS user-visible in the Agents rail: the
-    # researcher row shows the destructive "failed" status.
+    # The child's failure IS user-visible in the Agents rail.
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name=re.compile("^Agents")).click()
@@ -350,23 +297,18 @@ def test_failed_subagent_result_survives_empty_wake_turn(
         re.compile("failed", re.IGNORECASE), timeout=60_000
     )
 
-    # 3. The auto-wake turn runs and completes EMPTY: the parent's third
-    #    scripted model response ("") is served. Parent requests so far:
-    #    dispatch tool-call round + post-tool text (turn 1) + wake turn.
+    # The auto-wake turn consumes the parent's third scripted response ("").
     _wait_until(
         lambda: _parent_llm_request_count(chat.mock_url, chat.routing_token) >= 3,
         timeout_s=120,
         what="the parent's empty auto-wake turn to consume its model response",
     )
 
-    # 4. THE BUG. No further user input is sent. A failed child result
-    #    already delivered to the inbox must not go silent merely because
-    #    the wake turn returned an empty completion: the framework must
-    #    re-wake the parent (bounded), whose next scripted turn surfaces
-    #    the failure in the transcript. While the bug is live, the
-    #    wake-pending flag was discarded at turn start, the recovery check
-    #    no-ops, the parent's 4th model request never happens, and this
-    #    times out with the orchestrator idle and the user none the wiser.
+    # No further user input. The framework must re-wake the parent (bounded),
+    # whose next scripted turn surfaces the failure in the transcript. While
+    # the bug is live the wake-pending flag was discarded at turn start, the
+    # recovery check no-ops, the parent's 4th model request never happens,
+    # and this times out with the orchestrator idle.
     expect(page.locator(_ASSISTANT, has_text=chat.surface_code).first).to_be_visible(
         timeout=120_000
     )

@@ -77,25 +77,7 @@ async def _stream_with_reasoning_effort_fallback(
     connection_params: dict[str, str] | None,
     timeout: int | None,
 ) -> AsyncIterator[dict[str, Any]]:
-    """Yield *chunks*, retrying once without ``reasoning_effort`` on rejection.
-
-    A provider that rejects the parameter fails at stream open (HTTP 400
-    before any chunk arrives), so the retry only fires when nothing has
-    been yielded yet — a mid-stream failure is never a capability
-    rejection and re-raises unchanged.
-
-    :param chunks: The original streaming chunk iterator.
-    :param adapter: The provider adapter to retry on.
-    :param messages: Chat Completions messages.
-    :param provider: Provider identifier, e.g. ``"xai"``.
-    :param model: Model id without provider prefix.
-    :param endpoint: The effective base URL the call is routed to.
-    :param tools: Tool schemas or ``None``.
-    :param extra: The extra-params dict the first attempt used.
-    :param connection_params: Per-call connection overrides.
-    :param timeout: Request timeout in seconds or ``None``.
-    :returns: Async iterator of Chat Completions chunk dicts.
-    """
+    """Retry a parameter rejection only if no chunks were yielded."""
     yielded = False
     try:
         async for chunk in chunks:
@@ -118,9 +100,7 @@ async def _stream_with_reasoning_effort_fallback(
     assert not isinstance(retry_chunks, dict)
     async for chunk in retry_chunks:
         yield chunk
-    # The stripped retry streamed to completion, so the rejection is
-    # real — learn it. A retry that fails learns nothing, so a 400 that
-    # merely looked like a param rejection self-corrects.
+    # Learn only after the stripped stream completes.
     record_reasoning_effort_rejection(provider, model, endpoint)
 
 
@@ -290,12 +270,7 @@ class _ResponsesNamespace:
                     "type": "json_schema",
                     "json_schema": {k: v for k, v in fmt.items() if k != "type"},
                 }
-        # Send reasoning_effort optimistically, but skip models with a
-        # seeded/learned HTTP 400 rejection (e.g. xAI rejects it on
-        # grok-4). An unlisted model that rejects it self-heals below:
-        # strip the param, retry once, and remember the rejection —
-        # scoped to the effective endpoint, so one gateway's 400 never
-        # suppresses the param for the same model reached elsewhere.
+        # A learned rejection applies only at the endpoint that returned it.
         endpoint = (connection_params or {}).get("base_url") or (
             PROVIDER_CONFIGS.get(routed.provider) or ""
         )
@@ -345,9 +320,7 @@ class _ResponsesNamespace:
             stripped = strip_rejected_reasoning_effort(extra, exc)
             if stripped is None:
                 raise
-            # One inline retry without the rejected param — a capability
-            # rejection is deterministic, so it stays outside the generic
-            # transient-failure backoff loop.
+            # Capability rejections are deterministic; retry without backoff.
             result = await adapter.chat_completions(
                 messages,
                 routed.model,
@@ -357,9 +330,7 @@ class _ResponsesNamespace:
                 connection_params=connection_params,
                 timeout=timeout,
             )
-            # Learn the rejection only after the stripped retry succeeded,
-            # so a 400 that merely looked like a param rejection
-            # self-corrects instead of durably disabling the param.
+            # A failed stripped retry must not disable the parameter.
             record_reasoning_effort_rejection(routed.provider, routed.model, endpoint)
         assert isinstance(result, dict)
         return chat_response_to_response(result)

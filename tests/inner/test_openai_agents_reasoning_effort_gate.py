@@ -1,14 +1,4 @@
-"""Tests for the executor-path ``reasoning_effort`` gate.
-
-The openai-agents SDK forwards the session's reasoning effort into every
-Chat Completions request body, so a reasoning-enabled turn on a model that
-rejects the parameter (xAI's grok-4: HTTP 400 "Argument not supported on
-this model: reasoning_effort") failed the whole turn. These tests cover the
-``chat.completions.create`` proxy in
-``omnigent/inner/openai_agents_sdk_executor.py``: the seeded skip, the
-strip-and-retry-once fallback, the learn-after-confirmed-retry rule, and
-that unrelated errors and unset efforts pass through untouched.
-"""
+"""Cover seeded skips and confirmed-rejection retries in the SDK proxy."""
 
 from __future__ import annotations
 
@@ -33,10 +23,7 @@ def _fresh_cache() -> None:
 
 
 def _param_rejection() -> openai.BadRequestError:
-    """Build the openai-client exception shape an xAI-style 400 raises.
-
-    :returns: A ``BadRequestError`` whose body names ``reasoning_effort``.
-    """
+    """Build the OpenAI client's xAI-style parameter rejection."""
     body = (
         b'{"error": {"message": "Argument not supported on this model: '
         b'reasoning_effort", "type": "invalid_request_error"}}'
@@ -50,10 +37,7 @@ def _param_rejection() -> openai.BadRequestError:
 
 
 def _unrelated_400() -> openai.BadRequestError:
-    """Build a 400 that must not trigger the fallback.
-
-    :returns: A ``BadRequestError`` about a different parameter.
-    """
+    """Build a 400 that must not trigger the fallback."""
     response = httpx.Response(
         400,
         content=b'{"error": {"message": "max_tokens is too large"}}',
@@ -66,18 +50,12 @@ class _FakeCompletions:
     """Records ``create()`` kwargs; raises scripted errors first."""
 
     def __init__(self, errors: list[Exception] | None = None) -> None:
-        """
-        :param errors: Exceptions to raise, one per call, before succeeding.
-        """
+        """Queue per-call errors before succeeding."""
         self.calls: list[dict[str, Any]] = []
         self._errors = list(errors or [])
 
     async def create(self, **kwargs: Any) -> str:
-        """
-        :param kwargs: The request body kwargs.
-        :returns: A sentinel result once the scripted errors are exhausted.
-        :raises Exception: The next scripted error, when one remains.
-        """
+        """Record the request and return a sentinel after queued errors."""
         self.calls.append(kwargs)
         if self._errors:
             raise self._errors.pop(0)
@@ -206,10 +184,7 @@ class _FakeStreamingCompletions:
         self.calls: list[dict[str, Any]] = []
 
     async def create(self, **kwargs: Any) -> _FakeStream:
-        """
-        :param kwargs: The request body kwargs.
-        :returns: A fresh fake stream.
-        """
+        """Record the request and return a fresh fake stream."""
         self.calls.append(kwargs)
         return _FakeStream()
 
@@ -218,9 +193,7 @@ class _FakeChat:
     """Bare ``chat`` namespace exposing ``completions``."""
 
     def __init__(self, completions: Any) -> None:
-        """
-        :param completions: The completions object to expose.
-        """
+        """Expose the supplied completions object."""
         self.completions = completions
 
 
@@ -228,10 +201,7 @@ class _FakeClient:
     """Bare client shape for ``_wrap_client_for_reasoning_models``."""
 
     def __init__(self, completions: Any, base_url: str) -> None:
-        """
-        :param completions: The completions object behind ``.chat``.
-        :param base_url: The client base URL the gate should see.
-        """
+        """Expose completions and a provider base URL."""
         self.chat = _FakeChat(completions)
         self.base_url = base_url
 

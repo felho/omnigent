@@ -906,24 +906,10 @@ async def _create_with_reasoning_effort_gate(
     *,
     base_url: str,
 ) -> Any:  # type: ignore[explicit-any]
-    """Call ``completions.create`` with per-model ``reasoning_effort`` gating.
+    """Skip known rejections and retry newly rejected models without the param.
 
-    The openai-agents SDK forwards the session's reasoning effort into every
-    Chat Completions body, but some providers accept the parameter on only a
-    subset of models (xAI rejects it on grok-4 with HTTP 400 "Argument not
-    supported on this model: reasoning_effort"), failing the whole turn.
-    Mirrors the ``omnigent.llms.client`` fallback: skip pairs with a
-    seeded/learned rejection, otherwise send optimistically and, on a 400
-    naming the parameter, strip it and retry once. The rejection is learned
-    only after the stripped retry is confirmed — for ``stream=True`` the
-    openai client raises at request time on an error status, so returning at
-    all means the stream opened cleanly.
-
-    :param completions: The real ``AsyncCompletions`` object.
-    :param kwargs: The ``create()`` kwargs the SDK built (not mutated).
-    :param base_url: The client's base URL, for provider inference when the
-        model id has no ``provider/`` prefix.
-    :returns: Whatever the underlying ``create()`` returns.
+    The OpenAI client raises before yielding a stream on an HTTP error, so a
+    successful stripped retry confirms the rejection for both wire modes.
     """
     effort = kwargs.get("reasoning_effort")
     if not isinstance(effort, str):
@@ -937,39 +923,21 @@ async def _create_with_reasoning_effort_gate(
     except Exception as exc:
         if not is_reasoning_effort_rejection(exc):
             raise
-        # One inline retry without the rejected param — a capability
-        # rejection is deterministic, so no backoff applies.
+        # Capability rejections are deterministic; retry without backoff.
         result = await completions.create(**_without_reasoning_effort(kwargs))
         record_reasoning_effort_rejection(provider, model, base_url)
         return result
 
 
 class _ReasoningBlockFilterCompletions:
-    """Wraps ``AsyncCompletions`` for the chat-completions reasoning quirks.
-
-    Sits between the openai-agents SDK's ``OpenAIProvider`` and the real
-    ``AsyncOpenAI.chat.completions`` so that (a) ``reasoning_effort`` is
-    gated per model (see :func:`_create_with_reasoning_effort_gate`) and
-    (b) reasoning-model list content never reaches ``ChatCmplStreamHandler``.
-
-    :param completions: The real ``AsyncCompletions`` object.
-    :param base_url: The owning client's base URL, for provider inference.
-    """
+    """Gate ``reasoning_effort`` and filter reasoning-model stream content."""
 
     def __init__(self, completions: Any, base_url: str = "") -> None:  # type: ignore[explicit-any]
         self._completions = completions
         self._base_url = base_url
 
     async def create(self, **kwargs: Any) -> Any:  # type: ignore[explicit-any]
-        """
-        Proxy ``create()`` through the ``reasoning_effort`` gate; wrap the
-        result in :class:`_ReasoningBlockFilterStream` when streaming is
-        enabled.
-
-        :param kwargs: Forwarded to the underlying ``create()``.
-        :returns: A :class:`_ReasoningBlockFilterStream` when ``stream=True``,
-            otherwise the raw ``ChatCompletion`` response.
-        """
+        """Proxy the call and wrap streaming results in a content filter."""
         result = await _create_with_reasoning_effort_gate(
             self._completions, kwargs, base_url=self._base_url
         )
@@ -982,11 +950,7 @@ class _ReasoningBlockFilterCompletions:
 
 
 class _ReasoningBlockFilterChat:
-    """Wraps ``AsyncChat`` to expose a :class:`_ReasoningBlockFilterCompletions`.
-
-    :param chat: The real ``AsyncOpenAI.chat`` object.
-    :param base_url: The owning client's base URL, for provider inference.
-    """
+    """Expose gated completions through the ``AsyncChat`` proxy."""
 
     def __init__(self, chat: Any, base_url: str = "") -> None:  # type: ignore[explicit-any]
         self._chat = chat
@@ -999,18 +963,7 @@ class _ReasoningBlockFilterChat:
 
 
 def _wrap_client_for_reasoning_models(client: AsyncOpenAIClient) -> AsyncOpenAIClient:
-    """Wrap *client* for the chat-completions reasoning quirks.
-
-    Replaces ``client.chat`` with a :class:`_ReasoningBlockFilterChat`
-    proxy that intercepts every ``chat.completions.create()`` to gate
-    ``reasoning_effort`` per model (with the strip-and-retry fallback) and
-    to wrap streaming results in :class:`_ReasoningBlockFilterStream`.  All
-    other attribute accesses fall through to the real client.
-
-    :param client: The ``AsyncOpenAI`` (or compatible) client to wrap.
-    :returns: The same *client* object with ``chat`` replaced by the filter
-        proxy. The object is modified in-place and returned for chaining.
-    """
+    """Install the completions gate and streaming content filter on *client*."""
     # Patch ``chat`` directly on the client instance so the proxy intercepts
     # every ``client.chat.completions.create()`` call the SDK makes.
     # ``object.__setattr__`` bypasses both the OpenAI SDK's own ``__setattr__``

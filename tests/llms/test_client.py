@@ -785,9 +785,7 @@ class _CapturingAdapter:
     """Adapter stub that captures the ``extra`` dict passed to chat_completions.
 
     :param captured_extra: List to append the extra dict into on each call.
-    :param side_effects: Optional per-call exceptions — each call pops the
-        first item and raises it when it is an exception; ``None`` items
-        mean "succeed".
+    :param side_effects: Per-call exceptions; ``None`` means succeed.
     """
 
     def __init__(
@@ -938,14 +936,8 @@ async def test_text_without_json_schema_not_translated(
     assert "text" not in extra
 
 
-# ── reasoning_effort gating and self-healing fallback ──────────────
-
-
 def _reasoning_effort_400() -> httpx.HTTPStatusError:
-    """Build the xAI-style HTTP 400 that rejects ``reasoning_effort``.
-
-    :returns: The constructed error.
-    """
+    """Build an xAI-style ``reasoning_effort`` rejection."""
     return httpx.HTTPStatusError(
         "HTTP 400",
         request=httpx.Request("POST", "http://test/v1/chat/completions"),
@@ -963,13 +955,7 @@ def _patch_chat_path(
     provider: str = "xai",
     model: str = "test-model",
 ) -> None:
-    """Route ``Client().responses.create`` to *adapter*'s chat path.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :param adapter: The adapter stub to route calls to.
-    :param provider: Routed provider name, e.g. ``"xai"``.
-    :param model: Routed bare model id.
-    """
+    """Route ``Client().responses.create`` to *adapter*'s chat path."""
     from omnigent.llms.routing import RoutedModel
 
     routed = RoutedModel(provider=provider, model=model)
@@ -1051,7 +1037,7 @@ async def test_param_rejection_strips_and_retries_once(
     assert captured[0].get("reasoning_effort") == "low"
     assert "reasoning_effort" not in captured[1]
 
-    # The rejection is learned — the next call skips the param up front.
+    # A later call skips the learned rejection.
     await Client().responses.create(
         input=[{"role": "user", "content": "hi"}],
         model="xai/grok-new",
@@ -1065,12 +1051,7 @@ async def test_param_rejection_strips_and_retries_once(
 async def test_failed_stripped_retry_learns_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A 400 that matched but whose stripped retry also fails is not learned.
-
-    A false-positive match (an unrelated 400 whose body happens to echo the
-    param and mention support) must self-correct: the retry fails the same
-    way, the error surfaces, and later calls keep sending the param.
-    """
+    """A failed stripped retry must not disable the parameter."""
     captured: list[dict[str, Any]] = []
     adapter = _CapturingAdapter(
         captured, side_effects=[_reasoning_effort_400(), _reasoning_effort_400(), None]
@@ -1085,7 +1066,7 @@ async def test_failed_stripped_retry_learns_nothing(
         )
     assert len(captured) == 2, "expected optimistic send + one stripped retry"
 
-    # Nothing was learned — the next call still sends the param.
+    # The next call still sends the param.
     await Client().responses.create(
         input=[{"role": "user", "content": "hi"}],
         model="xai/grok-new",
@@ -1119,14 +1100,7 @@ async def test_unrelated_400_is_not_retried(
 
 
 class _StreamingCapturingAdapter:
-    """Adapter stub for the streaming path with per-call failure control.
-
-    :param captured_extra: List to append each call's extra dict into.
-    :param fail_first_open: Raise the param-rejection 400 when opening
-        the first stream.
-    :param fail_mid_stream: Raise the param-rejection 400 after the
-        first chunk of the first stream.
-    """
+    """Capture streaming calls and optionally fail at open or mid-stream."""
 
     def __init__(
         self,
@@ -1148,16 +1122,7 @@ class _StreamingCapturingAdapter:
         extra: dict[str, Any],
         **kwargs: Any,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Return a chunk iterator, failing per the configured mode.
-
-        :param messages: Chat messages (ignored).
-        :param model: Model id (ignored).
-        :param tools: Tool schemas (ignored).
-        :param stream: Streaming flag (ignored — always streams).
-        :param extra: The extra kwargs dict — captured per call.
-        :param kwargs: Additional kwargs (ignored).
-        :returns: Async iterator of Chat Completions chunk dicts.
-        """
+        """Return a stream with the configured failure point."""
         call_index = len(self._captured)
         self._captured.append(dict(extra))
 
@@ -1198,9 +1163,7 @@ async def test_streaming_param_rejection_strips_and_retries(
     assert captured[0].get("reasoning_effort") == "low"
     assert "reasoning_effort" not in captured[1]
 
-    # The completed stripped retry learned the rejection, scoped to the
-    # effective endpoint (default xAI routing here) — a different endpoint
-    # is unaffected.
+    # Learning at xAI's endpoint must not affect another endpoint.
     from omnigent.llms.reasoning_effort_support import accepts_reasoning_effort
 
     assert not accepts_reasoning_effort("xai", "grok-new", "https://api.x.ai/v1")

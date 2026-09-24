@@ -1,9 +1,4 @@
-"""Tests for per-model ``reasoning_effort`` gating and the 400 fallback.
-
-Covers ``omnigent/llms/reasoning_effort_support.py``: the seeded
-rejections, the rejection-detection heuristics on live provider error
-bodies, and the learn-and-skip cache.
-"""
+"""Test provider gating, rejection detection, and the learned cache."""
 
 from __future__ import annotations
 
@@ -30,20 +25,12 @@ def _fresh_cache() -> None:
 
 
 def _http_error(status_code: int, body: str) -> httpx.HTTPStatusError:
-    """Build an ``HTTPStatusError`` with the given status and body.
-
-    :param status_code: HTTP status code, e.g. ``400``.
-    :param body: Raw response body text.
-    :returns: The constructed error.
-    """
+    """Build an ``HTTPStatusError`` with the given status and body."""
     return httpx.HTTPStatusError(
         f"HTTP {status_code}",
         request=httpx.Request("POST", "http://test/v1/chat/completions"),
         response=httpx.Response(status_code, content=body.encode()),
     )
-
-
-# ── accepts_reasoning_effort ─────────────────────────────────────────
 
 
 @pytest.mark.parametrize(
@@ -82,9 +69,6 @@ def test_recorded_rejection_is_learned() -> None:
     assert accepts_reasoning_effort("groq", "grok-new")
 
 
-# ── is_reasoning_effort_rejection ────────────────────────────────────
-
-
 @pytest.mark.parametrize(
     "body",
     [
@@ -106,13 +90,10 @@ def test_param_rejection_bodies_detected(body: str) -> None:
         (400, '{"error": "messages: field required"}'),
         # 400 that echoes the param without a support complaint.
         (400, '{"error": "invalid value for reasoning_effort: bogus"}'),
-        # Value rejection — the *effort value* is wrong, not the
-        # capability; stripping would mask the caller's error and the
-        # successful stripped retry would durably disable the param.
+        # Invalid effort values must not disable a supported parameter.
         (400, '{"error": "reasoning_effort must be one of the supported values: low, high"}'),
         (400, '{"error": "Unsupported value \'xhigh\' for reasoning_effort."}'),
-        # Body that echoes the param and mentions support of something
-        # else without a capability-rejection phrase.
+        # Mentioning support of something else is not a capability rejection.
         (400, '{"error": "reasoning_effort requires a supporting beta header"}'),
         # Right body, wrong status — not a capability rejection.
         (503, '{"error": "Argument not supported on this model: reasoning_effort"}'),
@@ -132,12 +113,7 @@ def test_non_http_errors_not_matched() -> None:
 
 
 def _openai_error(status_code: int, body: str) -> openai.APIStatusError:
-    """Build the openai-client exception shape the executor path raises.
-
-    :param status_code: HTTP status code, e.g. ``400``.
-    :param body: Raw response body text.
-    :returns: The constructed error.
-    """
+    """Build the OpenAI client exception shape the executor path raises."""
     response = httpx.Response(
         status_code,
         content=body.encode(),
@@ -179,9 +155,6 @@ def test_seed_applies_at_any_endpoint() -> None:
     assert not accepts_reasoning_effort("xai", "grok-4")
 
 
-# ── gating_identity ────────────────────────────────────────────────
-
-
 def test_gating_identity_splits_provider_prefix() -> None:
     """``provider/model`` strings gate on the split pair, case-normalized."""
     assert gating_identity("xai/grok-4") == ("xai", "grok-4")
@@ -197,9 +170,6 @@ def test_gating_identity_defaults_to_openai() -> None:
     """An unknown or empty base URL defaults the provider to openai."""
     assert gating_identity("grok-4", "") == ("openai", "grok-4")
     assert gating_identity("grok-4", "http://127.0.0.1:8123/v1") == ("openai", "grok-4")
-
-
-# ── strip_rejected_reasoning_effort ──────────────────────────────────
 
 
 def test_strip_returns_copy_without_param() -> None:

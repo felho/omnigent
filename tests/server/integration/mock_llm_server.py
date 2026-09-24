@@ -790,11 +790,7 @@ class QueuedResponse:
     status_code: int = 500
     delay: float = 0.0
     truncate_after: int | None = None
-    # Request-body keys this response rejects with HTTP 400 when present and
-    # non-null (xAI-style "Argument not supported on this model: <key>").
-    # Mimics providers that reject unsupported params (e.g. grok-4 rejecting
-    # ``reasoning_effort``): the same entry serves the scripted response once
-    # the client stops sending the offending key.
+    # Reject non-null request params with an xAI-style 400 until omitted.
     reject_params: list[str] | None = None
     # Usage overrides. On ``/v1/responses`` merged into the response usage.
     # On ``/v1/messages`` merged into the Anthropic
@@ -1030,13 +1026,7 @@ _state = MockState()
 
 
 def _reject_unsupported_param(qr: QueuedResponse, parsed: object) -> JSONResponse | None:
-    """Return an xAI-style HTTP 400 when the request carries a rejected param.
-
-    :param qr: The queued response (its ``reject_params`` drive the check).
-    :param parsed: The parsed request body.
-    :returns: A 400 ``JSONResponse`` naming the first offending key, or
-        ``None`` when nothing in ``reject_params`` is present in the body.
-    """
+    """Return a 400 when a queued response rejects a present request param."""
     if not qr.reject_params or not isinstance(parsed, dict):
         return None
     for key in qr.reject_params:

@@ -1,28 +1,6 @@
-"""E2E coverage for xAI ``reasoning_effort`` gating.
+"""Exercise Grok capability gating over HTTP through the real LLM client.
 
-The Chat Completions path in ``omnigent/llms/client.py`` used to
-forward ``reasoning_effort`` to every non-OpenAI provider
-unconditionally. xAI accepts the parameter on only a subset of Grok
-models, so a reasoning-configured call to ``grok-4``,
-``grok-code-fast-1``, or ``grok-4-fast-reasoning`` was rejected by
-api.x.ai with HTTP 400 ("Argument not supported on this model:
-reasoning_effort") and the turn failed.
-
-These tests drive the REAL ``omnigent.llms.Client`` over live HTTP
-against the repo's mock OpenAI-compatible provider (the same
-``mock_llm_server_url`` rig the rest of ``tests/e2e`` uses, standing
-in for ``https://api.x.ai/v1`` via ``connection_params``) and assert
-on the outbound ``/v1/chat/completions`` request body the provider
-actually receives:
-
-- Grok models with known rejections must NOT receive
-  ``reasoning_effort``.
-- Supported Grok models and non-xAI providers must keep receiving it
-  (guards against over-fixing).
-
-Runs entirely against the mock LLM server — no real API key needed::
-
-    pytest tests/e2e/test_xai_reasoning_effort_e2e.py -v
+The mock provider captures outbound Chat Completions requests; no xAI key is needed.
 """
 
 from __future__ import annotations
@@ -33,25 +11,20 @@ import pytest
 
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests
 
-# Grok models that api.x.ai rejects ``reasoning_effort`` on (HTTP 400).
+# Models observed to reject ``reasoning_effort`` at api.x.ai.
 UNSUPPORTED_GROK_MODELS = [
     "grok-4",
     "grok-code-fast-1",
     "grok-4-fast-reasoning",
 ]
 
-# A Grok model that accepts ``reasoning_effort`` — the fix must keep
-# sending it here.
+# A Grok model that accepts the parameter.
 SUPPORTED_GROK_MODEL = "grok-3-mini"
 
 
 @pytest.fixture(autouse=True)
 def _fresh_rejection_cache() -> None:
-    """Isolate the learned-rejection cache across tests.
-
-    Import-tolerant so the suite still runs — and fails on the observed
-    behavior, not on a missing module — against a tree without the fix.
-    """
+    """Keep learned rejections from leaking between tests."""
     try:
         from omnigent.llms.reasoning_effort_support import clear_learned_rejections
     except ImportError:
@@ -61,12 +34,7 @@ def _fresh_rejection_cache() -> None:
 
 @pytest.fixture(autouse=True)
 def _no_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep the client's localhost calls off any ambient HTTP proxy.
-
-    The adapter's ``httpx.AsyncClient`` honours proxy env vars
-    (``trust_env=True``); on proxied CI hosts that would bounce the
-    mock-server request through a corporate proxy and 502.
-    """
+    """Keep localhost mock requests off ambient HTTP proxies."""
     for var in (
         "HTTP_PROXY",
         "HTTPS_PROXY",
@@ -81,15 +49,7 @@ def _no_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 async def _send_reasoning_turn(mock_llm_server_url: str, model: str) -> None:
-    """Drive one reasoning-enabled ``responses.create`` call at *model*.
-
-    Uses the real multi-provider client — the exact request-construction
-    path the bug lives in — with ``connection_params`` pointing the
-    provider adapter at the mock server instead of the vendor endpoint.
-
-    :param mock_llm_server_url: The mock provider's base URL.
-    :param model: Provider-prefixed model string, e.g. ``"xai/grok-4"``.
-    """
+    """Send one reasoning-enabled turn to the mock provider."""
     from omnigent.llms import Client
 
     client = Client()
@@ -105,12 +65,7 @@ async def _send_reasoning_turn(mock_llm_server_url: str, model: str) -> None:
 
 
 def _last_request_for(mock_llm_server_url: str, bare_model: str) -> dict[str, Any]:
-    """Return the latest captured provider request for *bare_model*.
-
-    :param mock_llm_server_url: The mock provider's base URL.
-    :param bare_model: Model id without provider prefix, e.g. ``"grok-4"``.
-    :returns: The captured Chat Completions request body.
-    """
+    """Return the latest captured request for *bare_model*."""
     requests = get_mock_requests(mock_llm_server_url, key=bare_model)
     assert requests, f"no captured provider request for model {bare_model!r}"
     return requests[-1]
@@ -121,11 +76,7 @@ async def test_xai_unsupported_grok_models_omit_reasoning_effort(
     mock_llm_server_url: str,
     bare_model: str,
 ) -> None:
-    """Unsupported Grok models must not receive ``reasoning_effort``.
-
-    api.x.ai rejects the parameter on these models with HTTP 400, so
-    forwarding it fails every reasoning-enabled turn.
-    """
+    """Unsupported Grok models must not receive ``reasoning_effort``."""
     configure_mock_llm(mock_llm_server_url, [{"text": "ok"}], key=bare_model)
 
     await _send_reasoning_turn(mock_llm_server_url, f"xai/{bare_model}")
@@ -141,11 +92,7 @@ async def test_xai_unsupported_grok_models_omit_reasoning_effort(
 async def test_xai_supported_grok_model_keeps_reasoning_effort(
     mock_llm_server_url: str,
 ) -> None:
-    """A Grok model that accepts the parameter must keep receiving it.
-
-    Guards the fix's allowlist: gating must not strip reasoning from
-    the Grok models that do support ``reasoning_effort``.
-    """
+    """A supported Grok model must still receive ``reasoning_effort``."""
     configure_mock_llm(mock_llm_server_url, [{"text": "ok"}], key=SUPPORTED_GROK_MODEL)
 
     await _send_reasoning_turn(mock_llm_server_url, f"xai/{SUPPORTED_GROK_MODEL}")
@@ -160,13 +107,7 @@ async def test_xai_supported_grok_model_keeps_reasoning_effort(
 async def test_unlisted_model_self_heals_on_live_rejection(
     mock_llm_server_url: str,
 ) -> None:
-    """An unlisted model that rejects the param strips it and retries.
-
-    The seed set is an optimization, not a correctness dependency: when
-    a model outside it returns the xAI-style HTTP 400 naming
-    ``reasoning_effort``, the client must retry once without the param
-    (the turn succeeds) and skip it on subsequent calls to that model.
-    """
+    """An unlisted rejection triggers one retry and then a learned skip."""
     bare_model = "grok-experimental-reasoner"
     configure_mock_llm(
         mock_llm_server_url,
@@ -181,7 +122,7 @@ async def test_unlisted_model_self_heals_on_live_rejection(
         key=bare_model,
     )
 
-    # First turn: optimistic send -> 400 -> stripped retry succeeds.
+    # First turn: optimistic send, then stripped retry.
     await _send_reasoning_turn(mock_llm_server_url, f"xai/{bare_model}")
     requests = get_mock_requests(mock_llm_server_url, key=bare_model)
     assert len(requests) == 2, (
@@ -195,7 +136,7 @@ async def test_unlisted_model_self_heals_on_live_rejection(
         f"reasoning_effort={requests[1].get('reasoning_effort')!r}"
     )
 
-    # Second turn: the rejection is remembered — no wasted round trip.
+    # Second turn skips the rejected param.
     await _send_reasoning_turn(mock_llm_server_url, f"xai/{bare_model}")
     requests = get_mock_requests(mock_llm_server_url, key=bare_model)
     assert len(requests) == 3, "the learned rejection must skip the wasted round trip"
@@ -207,11 +148,7 @@ async def test_unlisted_model_self_heals_on_live_rejection(
 async def test_non_xai_provider_keeps_reasoning_effort_passthrough(
     mock_llm_server_url: str,
 ) -> None:
-    """Every other provider keeps the prior pass-through behaviour.
-
-    The gating is seeded per-model; a non-xAI OpenAI-compatible
-    provider (groq here) must still receive ``reasoning_effort``.
-    """
+    """A non-xAI provider keeps the parameter."""
     bare_model = "llama-3.3-70b-versatile"
     configure_mock_llm(mock_llm_server_url, [{"text": "ok"}], key=bare_model)
 

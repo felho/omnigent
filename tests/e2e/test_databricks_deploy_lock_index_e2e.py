@@ -1,25 +1,8 @@
 """Databricks deploy lock generation must not bake a machine mirror index.
 
-Guards the operator journey: a machine whose uv configuration registers a
-private mirror — as the *default* index (``[[index]] ... default = true``,
-which outranks ``--index-url``) and as an extra named index (which outranks
-even ``--default-index``) — and whose shell exports the generic
-``UV_INDEX_URL`` at that mirror runs the Databricks deploy. If any of them
-leaks into the generated ``deploy/databricks/src/uv.lock``, its ``registry``
-sources and direct wheel ``url`` entries point at the mirror host, which the
-Databricks Apps build runtime cannot reach, so the app install fails and the
-app never starts.
-
-The test stands up two local "simple" indexes (a stand-in for public PyPI and
-a stand-in for the machine mirror, both serving the same tiny wheel), points a
-machine-level uv config and ``UV_INDEX_URL`` at the mirror, and invokes the
-real ``run_uv_lock`` from ``deploy/databricks/deploy.py`` with its pinned
-public index pointed at the public stand-in. The app pyproject also carries a
-local wheel via ``[tool.uv.sources]``, like the real generated one, proving
-the hermetic lock still honors the project's own path sources. The generated
-lock must never reference the mirror host. When the lock resolved against the
-pinned index, the test also proves the Apps-runtime half of the journey: with
-the mirror down, ``uv sync --locked`` still installs cleanly.
+Machine config and ``UV_INDEX_URL`` point at a local mirror, while a second
+index stands in for public PyPI. ``run_uv_lock`` must preserve a local wheel
+source and produce a lock that still installs after the mirror stops.
 """
 
 from __future__ import annotations

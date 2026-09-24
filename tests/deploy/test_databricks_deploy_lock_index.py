@@ -1,16 +1,7 @@
 """The deploy's app lock must resolve only from public PyPI.
 
-The generated ``deploy/databricks/src/uv.lock`` installs inside the Databricks
-Apps build runtime, which reaches only public PyPI. Ambient machine settings
-routinely point somewhere else: the generic ``UV_INDEX_URL`` (exported
-globally on machines behind a corporate mirror just to make uv work locally)
-and machine-level uv config ``[[index]]`` entries, which outrank the weak
-``--index-url`` flag and — for non-default entries — even ``--default-index``.
-
-``run_uv_lock`` therefore locks hermetically: ``--no-config`` shuts out
-machine config, every index env var is stripped from the child env, the index
-is pinned to public PyPI, and the deploy fails loudly when the generated lock
-still resolved from another registry.
+Ambient uv index variables and machine config must not override that index.
+A lock resolved from another registry must fail before deployment.
 """
 
 from __future__ import annotations

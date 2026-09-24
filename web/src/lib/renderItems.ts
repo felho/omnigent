@@ -1585,8 +1585,7 @@ function buildAssistantItems(
     }
 
     if (b.type === "teammate_message") {
-      // Idle pings and spawn markers feed the Agents rail's roster
-      // only — never a chat bubble (the raw idle JSON was the bug).
+      // Idle and spawn items update the rail without becoming chat bubbles.
       if (b.kind === "message") {
         items.push({
           kind: "teammate_message",

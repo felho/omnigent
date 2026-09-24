@@ -477,8 +477,7 @@ function routingDecisionToBlock(item: RoutingDecisionItem): RoutingDecisionBlock
 }
 
 function teammateMessageToBlock(item: TeammateMessageItem): TeammateMessageBlock {
-  // Coerce missing optionals (server-side exclude_none) to one shape;
-  // an unknown kind renders as prose rather than vanishing.
+  // Unknown kinds render as prose rather than vanishing.
   const kind = item.kind === "idle" || item.kind === "spawn" ? item.kind : "message";
   return {
     type: "teammate_message",

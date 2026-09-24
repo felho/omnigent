@@ -50,8 +50,7 @@ from omnigent.server.schemas import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
-# Newest teammate_message items consulted per roster build. Teammate
-# counts are tiny; the cap only bounds work on a very chatty team.
+# Bound the newest-first roster scan for long-running sessions.
 _TEAMMATE_ITEM_SCAN_LIMIT = 500
 _TEAMMATE_PREVIEW_LIMIT = 150
 
@@ -70,18 +69,7 @@ def _teammate_summaries(
     items: list[ConversationItem],
     session_id: str,
 ) -> list[TeammateSummary]:
-    """
-    Fold newest-first ``teammate_message`` items into per-teammate summaries.
-
-    The first item seen per teammate is its newest state: its kind
-    decides ``status`` and its timestamp is ``last_activity_at``. The
-    newest prose delivery supplies the preview and summary; the newest
-    color attribute supplies the color.
-
-    :param items: Newest-first ``teammate_message`` items for the session.
-    :param session_id: The parent session id echoed on each summary.
-    :returns: Summaries ordered by most recent activity, newest first.
-    """
+    """Fold newest-first teammate items into status and delivery previews."""
     summaries: dict[str, TeammateSummary] = {}
     for item in items:
         data = item.data

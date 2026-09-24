@@ -7702,12 +7702,8 @@ _COMMAND_STDOUT_RE = re.compile(r"<local-command-stdout>(.*?)</local-command-std
 _BASH_INPUT_RE = re.compile(r"<bash-input>(.*?)</bash-input>", re.DOTALL)
 _BASH_STDOUT_RE = re.compile(r"<bash-stdout>(.*?)</bash-stdout>", re.DOTALL)
 _BASH_STDERR_RE = re.compile(r"<bash-stderr>(.*?)</bash-stderr>", re.DOTALL)
-# Teammate deliveries (Claude Code agent teams). An in-process
-# teammate's message to the lead lands on the user channel as one or
-# more ``<teammate-message>`` blocks inside CLI framing text; each
-# prose block pairs with a machine-side ``idle_notification`` JSON
-# twin on the same channel. Parsed into ``teammate_message`` items so
-# neither half renders verbatim as a user bubble.
+# Claude wraps teammate deliveries in tags containing prose or idle JSON.
+# Parse them before either can become a user bubble.
 _TEAMMATE_MESSAGE_RE = re.compile(
     r"<teammate-message\b([^>]*)>(.*?)</teammate-message>", re.DOTALL
 )
@@ -8050,13 +8046,7 @@ def _is_task_notification_text(text: str) -> bool:
 
 
 def _teammate_idle_result(body: str) -> str | None:
-    """
-    Return the idle notification's ``result`` text when *body* is one.
-
-    :param body: A ``<teammate-message>`` block body, stripped.
-    :returns: The ``result`` string (``""`` when the ping carries none)
-        for an ``idle_notification`` JSON twin, else ``None`` for prose.
-    """
+    """Return an idle notification's result, or ``None`` for prose."""
     if not body.startswith("{"):
         return None
     try:
@@ -8070,19 +8060,7 @@ def _teammate_idle_result(body: str) -> str | None:
 
 
 def _teammate_message_payloads(content: str) -> list[_JsonObject] | None:
-    """
-    Parse ``<teammate-message>`` blocks out of a user transcript record.
-
-    The surrounding CLI framing text ("Another Claude session sent a
-    message:" + the trailing peer-security notice) is dropped — it is
-    context for the model, not user content.
-
-    :param content: Raw ``role=user`` record content string.
-    :returns: One ``teammate_message`` data payload per parseable
-        block, or ``None`` when no complete block exists (not a
-        teammate delivery, or a markup drift — the caller then keeps
-        the record on the plain-message path).
-    """
+    """Parse Claude teammate deliveries; preserve incomplete records as plain messages."""
     if not content.lstrip().startswith(_TEAMMATE_DELIVERY_PREFIX):
         return None
 
@@ -8115,20 +8093,7 @@ def _teammate_message_payloads(content: str) -> list[_JsonObject] | None:
 
 
 def _teammate_spawn_payload(tool_name: str, arguments: _JsonObject) -> _JsonObject | None:
-    """
-    Detect an in-process teammate spawn in an ``Agent``/``Task`` call.
-
-    A teammate spawn carries a ``name`` argument; classic Task-tool
-    sub-agents carry ``subagent_type`` instead (and surface as shadow
-    child sessions via their on-disk meta files). The spawn item makes
-    a still-working teammate visible in the rail before its first
-    delivery.
-
-    :param tool_name: The ``tool_use`` block's tool name.
-    :param arguments: The ``tool_use`` block's ``input`` dict.
-    :returns: A ``teammate_message`` data payload of kind ``"spawn"``,
-        or ``None`` when the call is not a teammate spawn.
-    """
+    """Detect named Agent/Task spawns; classic subagents use ``subagent_type``."""
     if tool_name not in AGENT_TOOL_NAMES:
         return None
     if "subagent_type" in arguments:

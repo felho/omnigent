@@ -1,13 +1,4 @@
-"""Integration tests for ``GET /v1/sessions/{id}/teammates``.
-
-The endpoint folds a session's ``teammate_message`` items — mirrored
-from a native harness transcript by the claude-native bridge — into one
-display-only summary per teammate, so the Agents rail can show
-harness-internal teammates (which have no Omnigent session and can
-never appear in ``child_sessions``). Tests seed items directly via the
-SqlAlchemy store: the route depends only on
-``list_items(type="teammate_message", order="desc")``.
-"""
+"""Integration tests for the session teammate roster endpoint."""
 
 from __future__ import annotations
 
@@ -59,15 +50,7 @@ async def test_teammates_folds_items_into_roster(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    """
-    The roster carries one summary per teammate with its newest state.
-
-    ``buddy`` goes spawn → prose → idle, so its newest item decides
-    ``status="idle"`` while the newest prose delivery supplies the
-    summary and preview. ``scout`` has only a spawn item, so it reads
-    ``active`` — the state a still-working teammate shows before its
-    first delivery.
-    """
+    """Use the newest state and prose while retaining spawn-only teammates."""
     session = await _create_session(client)
     conv_store = SqlAlchemyConversationStore(db_uri)
     conv_store.append(

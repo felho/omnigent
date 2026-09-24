@@ -689,13 +689,7 @@ function SubagentRow({
   );
 }
 
-/**
- * Row for a harness-internal teammate (today: Claude Code agent
- * teams). Unlike a child session it has no conversation to navigate
- * to, no cost/model row, and no session id — so the row is a plain
- * (non-link) entry carrying a "Teammate" badge to keep it
- * distinguishable from the sub-agent rows around it.
- */
+/** Plain row: an in-process teammate has no child conversation to open. */
 function TeammateRow({ teammate }: { teammate: TeammateInfo }) {
   const status: AgentStatus =
     teammate.status === "idle"

@@ -1,29 +1,6 @@
-r"""UI journeys: Claude Code in-process teammates in the Omnigent web UI.
+r"""Browser journeys for Claude Code in-process teammates.
 
-Claude Code (the ``claude-native`` wrapper) can spawn an in-process *teammate*
-through its own ``Agent`` tool when agent teams are enabled — a named agent
-that shares the parent process and is never created via ``sys_session_create``,
-so Omnigent has no child-session row for it. Two user-visible symptoms follow
-on the running build:
-
-1. A running teammate appears nowhere in the Subagents rail (list or graph
-   view). The rail renders from ``useChildSessions`` — the Omnigent session
-   tree — and while Task-tool workers get shadow child rows via the
-   claude-native forwarder's ``external_subagent_start`` event, teammates
-   never do, so an actively running teammate looks like nothing is happening.
-
-2. Teammate deliveries reach the parent transcript as ``<teammate-message>``
-   text, including a machine-side ``idle_notification`` JSON twin for every
-   teammate turn, and the chat renders that JSON object verbatim in a user
-   bubble instead of a readable item.
-
-Both journeys drive the REAL ``claude`` CLI against the scripted mock LLM:
-the parent model's turn is a scripted ``Agent`` tool call that spawns the
-in-process teammate ``buddy``, the teammate's own turns are scripted replies
-(its prose goes to the lead via a scripted ``SendMessage``), and Claude Code's
-genuine team machinery produces the deliveries Omnigent must render. The
-tests assert the EXPECTED behavior, so on the buggy build each fails at
-exactly its reported symptom.
+Nightly cases use the Claude CLI and a mock LLM; Chromium replays transcript items.
 """
 
 from __future__ import annotations
@@ -78,9 +55,7 @@ _TEAMMATE_SETTINGS = json.dumps({"teammateMode": "in-process"})
 _TEAMMATE = "buddy"
 _TEAMMATE_DESCRIPTION = "Probe teammate"
 
-# Content-routing tokens for the mock LLM queues. Longest match wins, so the
-# stage-2 tokens are longer than the stage-1 tokens that remain in the
-# conversation history, and the title-request decoy is longest of all.
+# Longest token match wins; later-stage and title tokens outrank earlier turns.
 _SPAWN_TOKEN = "tok-teamprobe-parent-spawn"
 _TASK_TOKEN = "tok-teamprobe-teammate-task"
 _RELAY_TOKEN = "tok-teamprobe-relay-buddy-chat"
@@ -100,14 +75,14 @@ _TURN_TIMEOUT_MS = 120_000
 # Spawn turn + in-process teammate turn + idle delivery + parent wake turn.
 _SPAWN_IDLE_TIMEOUT_MS = 240_000
 _CHAT_TIMEOUT_MS = 180_000
-# Short budget for the buggy-build assertions so a failing run stays tight.
+# Fail promptly after a successful turn if the UI still lacks the item.
 _BUG_ASSERT_TIMEOUT_MS = 10_000
 
 
 def test_teammate_transcript_reaches_browser_without_claude_cli(
     page: Page, seeded_session: tuple[str, str], tmp_path: Path
 ) -> None:
-    """Bridge transcript items survive the forwarder HTTP path and render in Chromium."""
+    """Bridge items use the forwarder event shape through HTTP to Chromium."""
     base_url, session_id = seeded_session
     delivery = (
         "Another Claude session sent a message:\n"
@@ -204,16 +179,7 @@ def native_claude_teams_session(
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[tuple[str, str]]:
-    """A runner-bound claude-native session with agent teams enabled (mock LLM).
-
-    Claude Code gates agent teams on ``CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS``
-    reaching the ``claude`` process (a ``--settings`` ``env`` block is applied
-    too late for the gate), and the terminal child inherits the runner's env —
-    so the shared runner is respawned with the variable set, and torn down
-    afterwards so later tests respawn it clean.
-
-    :returns: ``(base_url, session_id)``.
-    """
+    """Respawn the runner so Claude inherits the agent-teams environment gate."""
     runner_id = str(_server_state["runner_id"])
     os.environ[_TEAMS_ENV] = "1"
     respawned: subprocess.Popen[bytes] | None = None
@@ -284,14 +250,7 @@ def _script_spawn_turns(mock_url: str) -> None:
 
 
 def _script_chat_turns(mock_url: str) -> None:
-    """Script the mock LLM for: user's TUI message reaches ``buddy``, buddy answers.
-
-    The lead relays the user's question via ``SendMessage`` (a scripted model
-    cannot route free text itself), and buddy sends its prose reply back to
-    the lead the way real teammates do — a ``SendMessage`` to ``team-lead`` —
-    then idles, which is what produces the prose + ``idle_notification`` pair
-    in the parent transcript.
-    """
+    """Script the lead's relay and buddy's answer through ``SendMessage``."""
     relay_args = json.dumps(
         {
             "to": _TEAMMATE,
@@ -330,14 +289,7 @@ def _script_chat_turns(mock_url: str) -> None:
 
 
 def _boot_and_spawn_teammate(page: Page, base_url: str, session_id: str, mock_url: str) -> None:
-    """Open the session, spawn the in-process teammate, and wait until it idled.
-
-    The ``IDLE_ACK`` bubble is the parent's response to the wake turn Claude
-    Code runs when the teammate's idle notification is delivered, so its
-    visibility guarantees the teammate exists and its delivery has already
-    been mirrored into the Omnigent transcript — without depending on how
-    (or whether) the delivery itself is rendered.
-    """
+    """Spawn buddy and wait for the parent's response to its idle wake."""
     page.goto(f"{base_url}/c/{session_id}")
     _open_terminal_view(page)
     _wait_terminal_connected(page)
@@ -370,14 +322,7 @@ def test_running_teammate_visible_in_subagents_rail(
     native_claude_teams_session: tuple[str, str],
     mock_llm_server_url: str,
 ) -> None:
-    """A spawned in-process teammate has an entry in the Subagents rail.
-
-    Journey: start a claude-native session → the agent spawns the named
-    in-process teammate ``buddy`` via its own ``Agent`` tool → open the
-    Workspace rail's Agents tab. Expected: some entry names the running
-    teammate (list or graph view). On the buggy build the rail shows only
-    the main Claude Code row, so the teammate assertion fails.
-    """
+    """Show a spawned in-process teammate in the Agents rail."""
     base_url, session_id = native_claude_teams_session
     _boot_and_spawn_teammate(page, base_url, session_id, mock_llm_server_url)
 
@@ -412,15 +357,7 @@ def test_teammate_turns_render_prose_not_raw_idle_json(
     native_claude_teams_session: tuple[str, str],
     mock_llm_server_url: str,
 ) -> None:
-    """Teammate turns render as readable prose, never as raw idle_notification JSON.
-
-    Journey: spawn the in-process teammate ``buddy`` → from the session TUI,
-    message it and get its answer back into the parent conversation. Expected:
-    the chat shows the teammate's prose reply as a readable item and never
-    prints the machine-side ``{"type":"idle_notification",...}`` twin as a raw
-    JSON object. On the buggy build the raw JSON is rendered verbatim, so the
-    final assertion fails.
-    """
+    """Show buddy's prose without the machine-side idle JSON twin."""
     base_url, session_id = native_claude_teams_session
     _boot_and_spawn_teammate(page, base_url, session_id, mock_llm_server_url)
 
@@ -430,9 +367,7 @@ def test_teammate_turns_render_prose_not_raw_idle_json(
     _type_into_tui(page, f"hey {_TEAMMATE}, how is it going? {_RELAY_TOKEN}")
     _ensure_chat_view(page)
 
-    # The teammate's prose answer must reach the conversation in readable
-    # form (it does today too — wrapped in raw <teammate-message> text), and
-    # the wake ack proves the post-reply deliveries were already mirrored.
+    # The wake ack follows buddy's delivery in the parent transcript.
     body = page.locator("body")
     expect(body).to_contain_text(_TEAMMATE_CHAT_MARKER, timeout=_CHAT_TIMEOUT_MS)
     expect(body).to_contain_text(_CHAT_ACK, timeout=_CHAT_TIMEOUT_MS)

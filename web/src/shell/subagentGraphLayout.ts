@@ -187,9 +187,7 @@ export function buildTree(
   };
 }
 
-// Node-id prefix for harness-internal teammates. A teammate has no
-// session id, so the graph mints a synthetic id; the click handler
-// treats these nodes as non-navigable.
+// Teammates have no session id; graph nodes use a synthetic prefix.
 export const TEAMMATE_NODE_PREFIX = "teammate:";
 
 export function buildGraphLayout(
@@ -211,8 +209,7 @@ export function buildGraphLayout(
     childrenMap,
     0,
   );
-  // Teammates hang off the root as leaves — they run inside the root
-  // harness process and have no child sessions of their own.
+  // Teammates run inside the root harness and have no children.
   for (const teammate of teammates) {
     tree.children.push({
       id: `${TEAMMATE_NODE_PREFIX}${teammate.teammate_id}`,

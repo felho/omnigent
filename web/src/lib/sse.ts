@@ -1303,9 +1303,9 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
 
   if (itemType === "teammate_message") {
     const teammateId = typeof rec.teammate_id === "string" ? rec.teammate_id : "";
-    // Drop a malformed frame (no teammate) rather than rendering a broken item.
+    // Drop malformed frames without a teammate id.
     if (!teammateId) return null;
-    // Coerce missing optionals (server exclude_none); unknown kinds render as prose.
+    // Unknown kinds render as prose rather than vanishing.
     const kind = rec.kind === "idle" || rec.kind === "spawn" ? rec.kind : "message";
     return {
       type: "teammate_message",

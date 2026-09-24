@@ -258,6 +258,75 @@ def test_login_unexpected_probe_answer_omits_proxy_hint_when_no_proxy_covers_hos
     assert "NO_PROXY" not in result.output
 
 
+def test_login_probe_hint_ignores_other_scheme_proxy_vars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proxy var for a different scheme cannot have answered, so no hint.
+
+    httpx routes an http:// request only through HTTP_PROXY/ALL_PROXY —
+    an HTTPS_PROXY-only environment must not be blamed for it.
+    """
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: _response(500))
+    for var in _PROXY_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.corp.example:3128")
+
+    result = CliRunner().invoke(cli_group, ["login", "http://omni.internal:8000"])
+
+    assert result.exit_code != 0
+    assert "Unexpected response from http://omni.internal:8000/v1/me: HTTP 500" in result.output
+    assert "NO_PROXY" not in result.output
+
+
+def test_login_probe_hint_honors_port_qualified_no_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A port-qualified NO_PROXY entry covering the target suppresses the hint.
+
+    httpx honors ``NO_PROXY=host:port`` entries, so when one excludes the
+    target the answer really came from the server.
+    """
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: _response(500))
+    for var in _PROXY_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.corp.example:3128")
+    monkeypatch.setenv("NO_PROXY", "omni.internal:8000")
+
+    result = CliRunner().invoke(cli_group, ["login", "http://omni.internal:8000"])
+
+    assert result.exit_code != 0
+    assert "Unexpected response from http://omni.internal:8000/v1/me: HTTP 500" in result.output
+    assert "NO_PROXY" not in result.output
+
+
+def test_login_unrecognized_401_falls_back_to_oidc_ticket_flow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 401 without a recognized login_url keeps the OIDC compatibility path.
+
+    Older OIDC servers and auth middlewares answer 401 without the JSON
+    ``login_url`` payload; login must still try ``/auth/cli-login`` for
+    them (regression pin for the documented compatibility exception —
+    only non-401 probe answers fail on the probe itself).
+    """
+    html_401 = httpx.Response(
+        401,
+        content=b"<html>authentication required</html>",
+        request=httpx.Request("GET", "https://probe.invalid/v1/me"),
+    )
+    posted: list[str] = []
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: html_401)
+    monkeypatch.setattr(httpx, "post", lambda url, **kw: posted.append(url) or _response(503))
+    for var in _PROXY_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+    result = CliRunner().invoke(cli_group, ["login", "http://omni.internal:8000"])
+
+    assert result.exit_code != 0
+    assert posted == ["http://omni.internal:8000/auth/cli-login"]
+    assert "OMNIGENT_AUTH_PROVIDER" in result.output
+
+
 def test_login_probe_keeps_env_proxy_support_for_non_loopback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -12503,7 +12503,9 @@ def login(server_url: str) -> None:
         )
 
     # Fall through: OIDC mode (or a 401 without a recognized login_url —
-    # let the ticket endpoint's error message guide the user).
+    # older OIDC servers and auth middlewares answer 401 without the JSON
+    # ``login_url`` payload, so the ticket flow stays the compatibility
+    # path for any 401 and its endpoint's error message guides the user).
     import webbrowser
 
     from omnigent.cli_auth import store_token
@@ -12573,33 +12575,47 @@ def login(server_url: str) -> None:
 
 _CLI_LOGIN_TIMEOUT_SECONDS = 300  # 5 minutes
 
-_PROXY_ENV_VARS = (
-    "HTTP_PROXY",
-    "http_proxy",
-    "HTTPS_PROXY",
-    "https_proxy",
-    "ALL_PROXY",
-    "all_proxy",
-)
+# The proxy env vars httpx consults for each target scheme: only the
+# matching scheme's proxy (or the scheme-agnostic ALL_PROXY) can route a
+# request, so a hint must never blame e.g. HTTPS_PROXY for an http:// target.
+_PROXY_ENV_VARS_BY_SCHEME = {
+    "http": ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"),
+    "https": ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"),
+}
 
 
 def _proxy_interference_hint(base_url: str) -> str:
     """A NO_PROXY hint when an env-configured proxy could answer for *base_url*.
+
+    Tracks httpx's actual routing: only proxy variables that apply to the
+    target's scheme count, and ``NO_PROXY`` entries — bare hostnames or
+    port-qualified ``host:port`` forms — that exclude the target suppress
+    the hint.
 
     :param base_url: Server base URL, e.g. ``"http://omni.internal:6767"``.
     :returns: A newline-prefixed hint, or ``""`` when no env proxy applies.
     """
     if not _trust_env_for(base_url):
         return ""
-    if not any(os.environ.get(var) for var in _PROXY_ENV_VARS):
-        return ""
     from urllib.parse import urlsplit
-    from urllib.request import proxy_bypass_environment
 
-    # NO_PROXY may already exclude this host, in which case the answer
-    # really came from the server and blaming a proxy would misdirect.
-    host = urlsplit(base_url).hostname
-    if host and proxy_bypass_environment(host):
+    parts = urlsplit(base_url)
+    scheme = (parts.scheme or "http").lower()
+    relevant_vars = _PROXY_ENV_VARS_BY_SCHEME.get(scheme, ("ALL_PROXY", "all_proxy"))
+    if not any(os.environ.get(var) for var in relevant_vars):
+        return ""
+    # Runtime-only stdlib helper (present in CPython, absent from typeshed);
+    # it implements the NO_PROXY list matching we need here.
+    from urllib.request import proxy_bypass_environment  # type: ignore[missing-module-attribute]
+
+    # NO_PROXY may already exclude this host (as a bare hostname or a
+    # port-qualified host:port entry, both of which httpx honors), in which
+    # case the answer really came from the server and blaming a proxy would
+    # misdirect. Pass host:port only when the URL carries an explicit port,
+    # mirroring httpx's port matching.
+    host = parts.hostname
+    bypass_target = f"{host}:{parts.port}" if host and parts.port else host
+    if bypass_target and proxy_bypass_environment(bypass_target):
         return ""
     return (
         "\nA proxy from your environment (HTTP_PROXY/HTTPS_PROXY) may be "

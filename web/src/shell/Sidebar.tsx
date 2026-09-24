@@ -473,12 +473,7 @@ export function computeShiftSelectRange(
   return visibleIds.slice(start, end + 1);
 }
 
-/**
- * Fire the post-stop toast. The confirm dialog closing is otherwise the
- * only acknowledgement a stop gets — and when the stopped session isn't
- * the open one, nothing else on screen changes for up to a liveness-poll
- * interval, so the stop must say it landed.
- */
+/** Acknowledge a stop even when its session is not open. */
 function showStoppedToast(label: string) {
   showToast(
     <span>

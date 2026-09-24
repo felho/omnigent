@@ -111,13 +111,7 @@ export function ConnectionIndicator({
     );
   }
 
-  // An explicitly-stopped session says so — for every session shape,
-  // terminal-first included. Unlike the silent `runner_asleep` (an idle
-  // sleep the user never asked for), the user just confirmed "Stop
-  // session", so the only acknowledgement must not be the dialog closing:
-  // without this band the stopped session is indistinguishable from a
-  // running one. Passive and muted — the composer stays open and the next
-  // message relaunches the runner, which is exactly what the copy says.
+  // Show explicit stops even in terminal-first sessions; idle sleep stays silent.
   if (liveness.kind === "stopped") {
     return (
       <div
@@ -161,8 +155,7 @@ export function ConnectionIndicator({
 
   // `online`/`unknown` for a non-terminal-first session and
   // `runner_asleep`/`host_asleep` for any session: status lives in the
-  // sidebar / the composer stays open, so render nothing here. (`stopped`
-  // renders its own band above — the user explicitly asked for that state.)
+  // sidebar / the composer stays open, so render nothing here.
   return null;
 }
 

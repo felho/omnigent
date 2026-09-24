@@ -1,32 +1,6 @@
-"""Browser e2e: stopping a session must visibly say it is stopped.
+"""Browser e2e: a confirmed host-bound session stop has visible feedback.
 
-Journey: connect a real ``omnigent host`` daemon, create a host-bound session
-(the only kind whose sidebar kebab offers "Stop session"), open it, stop it
-via kebab -> "Stop session" -> confirm, and wait for the stop to land (the
-host tears the session's dedicated runner down, ``/health`` flips
-``runner_online`` to false).
-
-The bug: after the stop lands, nothing on any stop-relevant surface says the
-session is stopped. The confirm dialog closes silently, the chat surface
-renders no banner (a host-up + runner-down session classifies as
-``runner_asleep``, for which ``ConnectionIndicator`` deliberately renders
-nothing), the composer keeps its normal "Send a message..." placeholder, the
-sidebar row shows no stopped-state badge (``SessionStateBadge`` has no such
-state), and no toast fires. The stopped session is indistinguishable from a
-running one.
-
-The only copy matching a stopped/asleep wording anywhere on the page is the
-files panel's incidental "Asleep" (host-served files) pill, which describes
-file serving rather than the stop and is invisible whenever the files panel
-is closed — the final assertion excludes the files panel subtree for that
-reason.
-
-The final assertion encodes the fixed behavior: once the frontend has
-observed the runner offline, SOME visible stopped/asleep indication must
-appear on a surface the stopping user is looking at (chat banner, composer
-hint, sidebar badge, toast). It is deliberately copy-agnostic (any wording
-that communicates "not running" passes) so it survives whatever copy the fix
-chooses.
+Use a real host daemon and runner, then check the UI after the runner drops.
 """
 
 from __future__ import annotations
@@ -47,21 +21,16 @@ from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_ex
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
-# Host daemons register their tunnel within seconds; runner cold boot on the
-# host adds more. Generous ceilings so a busy CI box doesn't false-fail.
+# Allow for host registration and runner cold boot on a busy CI worker.
 _HOST_ONLINE_TIMEOUT_S = 60.0
 _RUNNER_ONLINE_TIMEOUT_S = 120.0
 _RUNNER_OFFLINE_TIMEOUT_S = 60.0
 _POLL_S = 0.5
 
-# How long the UI gets to render stop feedback after the stop lands. The
-# frontend health poll runs every ~10s, so 30s is ample time to observe
-# runner_online=false and paint whatever indication a fix adds.
+# The frontend health poll runs about every 10s.
 _FEEDBACK_TIMEOUT_S = 30.0
 
-# Any wording that communicates "this session is not running" satisfies the
-# fixed behavior; the reproduction fails because NO such copy renders on any
-# stop-relevant surface at all.
+# Keep the end-to-end assertion independent of the exact UI copy.
 _STOPPED_COPY = re.compile(r"stopped|asleep|not running|disconnected|offline", re.IGNORECASE)
 
 
@@ -71,22 +40,11 @@ def _client(base_url: str) -> httpx.Client:
 
 
 def _spawn_host_daemon(tmp_path: Path, live_server: str) -> subprocess.Popen[bytes]:
-    """Spawn an ``omnigent host`` daemon pointed at the test server.
-
-    Mirrors ``tests/e2e/test_host_opencode_native_e2e.py``. The daemon env
-    carries the repo on PYTHONPATH (forwarded to spawned runners via the
-    host's runner-env allowlist) and loopback NO_PROXY so the tunnel never
-    routes through an ambient CI proxy.
-
-    :param tmp_path: Per-test temp dir for the daemon log.
-    :param live_server: Base URL of the spawned test server.
-    :returns: The daemon process handle.
-    """
+    """Spawn an isolated host daemon whose runners import this checkout."""
     import os as _os
 
     env = _os.environ.copy()
-    # Absolute repo + sdk paths: the host-spawned runner resolves imports via
-    # this forwarded PYTHONPATH, and relative ambient entries break in its cwd.
+    # Runners inherit this absolute PYTHONPATH after changing directory.
     env["PYTHONPATH"] = _os.pathsep.join(
         [
             str(_REPO_ROOT),
@@ -96,7 +54,6 @@ def _spawn_host_daemon(tmp_path: Path, live_server: str) -> subprocess.Popen[byt
     )
     env["NO_PROXY"] = "127.0.0.1,localhost"
     env["no_proxy"] = "127.0.0.1,localhost"
-    # Isolate the daemon registry/pidfiles from any co-resident daemon.
     data_dir = tmp_path / "omnigent-data"
     data_dir.mkdir(parents=True, exist_ok=True)
     env["OMNIGENT_DATA_DIR"] = str(data_dir)
@@ -112,7 +69,6 @@ def _spawn_host_daemon(tmp_path: Path, live_server: str) -> subprocess.Popen[byt
 
 
 def _online_host_id(client: httpx.Client) -> str:
-    """Poll ``GET /v1/hosts`` until the daemon registers online."""
     deadline = time.monotonic() + _HOST_ONLINE_TIMEOUT_S
     while time.monotonic() < deadline:
         resp = client.get("/v1/hosts")
@@ -125,7 +81,6 @@ def _online_host_id(client: httpx.Client) -> str:
 
 
 def _hello_world_agent_id(client: httpx.Client) -> str:
-    """Find the pre-registered ``hello_world`` agent's id."""
     resp = client.get("/v1/agents")
     resp.raise_for_status()
     agent_id = next(
@@ -137,7 +92,6 @@ def _hello_world_agent_id(client: httpx.Client) -> str:
 
 
 def _wait_runner_online(client: httpx.Client, session_id: str, *, online: bool) -> None:
-    """Poll ``GET /health`` until the session's runner liveness matches."""
     timeout = _RUNNER_ONLINE_TIMEOUT_S if online else _RUNNER_OFFLINE_TIMEOUT_S
     deadline = time.monotonic() + timeout
     last: object = None
@@ -154,22 +108,11 @@ def _wait_runner_online(client: httpx.Client, session_id: str, *, online: bool) 
 
 
 def _sidebar_row(page: Page, session_id: str) -> Locator:
-    """Locate the sidebar row (``<li>``) for *session_id* by its href."""
     return page.locator("li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
 
 
 def _visible_stop_feedback(page: Page) -> list[str]:
-    """Visible stopped/asleep/not-running copy outside the files panel.
-
-    The files panel's "Asleep" (host-served files) pill and its
-    ``RunnerAsleepHint`` describe file serving, not the stop, and are
-    invisible whenever the files panel is closed — so the files panel
-    subtree (root class ``@container/filespanel``) is excluded. Anything
-    else that matches counts as genuine stop feedback.
-
-    :param page: The Playwright page to scan.
-    :returns: The matched visible texts (empty = no feedback rendered).
-    """
+    """Find visible stop feedback, excluding unrelated files-panel status."""
     texts: list[str] = []
     for loc in page.get_by_text(_STOPPED_COPY).all():
         try:
@@ -188,18 +131,7 @@ def host_bound_session(
     live_server: str,
     tmp_path: Path,
 ) -> Iterator[tuple[str, str]]:
-    """A host-spawned session whose kebab offers "Stop session".
-
-    Spawns a real ``omnigent host`` daemon against the test server and
-    creates a ``hello_world`` session bound to it, so the host launches a
-    dedicated runner for the session — the exact shape whose sidebar row
-    is stoppable (``isSessionStoppable``: host_id + runner_id).
-
-    :param live_server: Spawned server fixture (base URL).
-    :param tmp_path: Per-test temp dir (daemon log, isolated data dir,
-        session workspace).
-    :returns: ``(base_url, session_id)`` for the host-bound session.
-    """
+    """Create a real host-spawned runner with a stoppable sidebar row."""
     client = _client(live_server)
     daemon = _spawn_host_daemon(tmp_path, live_server)
     session_id: str | None = None
@@ -215,13 +147,11 @@ def host_bound_session(
         )
         create.raise_for_status()
         session_id = str(create.json()["id"])
-        # The host cold-boots a dedicated runner; wait until its tunnel is
-        # live so the UI reads a genuinely RUNNING session before the stop.
+        # Ensure the UI begins with a live runner, not startup grace.
         _wait_runner_online(client, session_id, online=True)
         yield live_server, session_id
     finally:
-        # Best-effort: stop the session's runner so no orphan outlives the
-        # test, then bring the daemon down (it reaps its children).
+        # Reap the runner and daemon even if the browser assertion fails.
         if session_id is not None:
             with contextlib.suppress(httpx.HTTPError):
                 client.post(
@@ -237,35 +167,16 @@ def host_bound_session(
         client.close()
 
 
-# Opt out of the e2e workflows' stricter --timeout=180: the fixture's host
-# registration + runner cold-boot ceilings alone can exceed it on a cold box.
+# Cold host registration and runner startup can exceed the e2e default timeout.
 @pytest.mark.timeout(420)
 def test_stop_session_shows_stopped_state(
     page: Page,
     host_bound_session: tuple[str, str],
 ) -> None:
-    """Stopping a session via the sidebar kebab must visibly say it stopped.
-
-    Drives the exact user journey of the report: open a running host-bound
-    session, stop it from the sidebar kebab, confirm, and look at the screen.
-
-    The journey up to the stop landing is all verified to WORK (kebab offers
-    the item, the confirm dialog closes, ``/health`` flips
-    ``runner_online=false``) — the reproduction is the final assertion: after
-    the frontend has had ample time to observe the stop, no visible
-    stopped/asleep/not-running indication exists on any stop-relevant
-    surface (the files panel's incidental host-served "Asleep" pill is
-    excluded; see :func:`_visible_stop_feedback`).
-
-    :param page: Playwright page fixture (fresh context per test).
-    :param host_bound_session: ``(base_url, session_id)`` for a running
-        host-bound session.
-    """
+    """Confirm a sidebar stop, then find visible feedback after runner teardown."""
     base_url, session_id = host_bound_session
 
-    # Wait for a successful /health poll so the frontend has observed the
-    # runner ONLINE before the stop — a fresh session inside its cold-boot
-    # grace would otherwise mask the post-stop state as `starting`.
+    # Let the frontend observe the live runner before stopping it.
     with page.expect_response(
         lambda r: "/health" in r.url and "session_id" in r.url and r.status == 200,
         timeout=30_000,
@@ -275,14 +186,12 @@ def test_stop_session_shows_stopped_state(
     composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
 
-    # Sanity: the session really is running before the stop.
     with _client(base_url) as client:
         health = client.get("/health", params={"session_id": session_id}).json()
         assert health.get("session", {}).get("runner_online") is True, (
             f"runner should be online before the stop, got: {health}"
         )
 
-        # The user journey: sidebar row -> kebab -> "Stop session" -> confirm.
         row = _sidebar_row(page, session_id)
         expect(row).to_be_visible()
         row.hover()
@@ -294,23 +203,10 @@ def test_stop_session_shows_stopped_state(
         expect(confirm).to_be_visible()
         confirm.click()
 
-        # The dialog closes on success — silently (this is part of the bug:
-        # closing is the only acknowledgement the user gets).
         expect(confirm).not_to_be_visible(timeout=30_000)
 
-        # The stop lands server-side: the host kills the session's runner and
-        # its tunnel drops.
         _wait_runner_online(client, session_id, online=False)
 
-    # THE BUG: nothing on the stop-relevant surfaces says the
-    # session is stopped. The chat surface renders no banner (host-up +
-    # runner-down classifies as `runner_asleep`, for which
-    # `ConnectionIndicator` deliberately renders nothing), the composer keeps
-    # its normal placeholder, the sidebar row has no stopped-state badge
-    # (`SessionStateBadge` has no such state), and no toast fires. A genuine
-    # fix renders stop feedback the stopping user can see — any visible copy
-    # matching _STOPPED_COPY outside the files panel. Today NOTHING renders,
-    # so this polls out.
     deadline = time.monotonic() + _FEEDBACK_TIMEOUT_S
     feedback: list[str] = []
     while time.monotonic() < deadline:

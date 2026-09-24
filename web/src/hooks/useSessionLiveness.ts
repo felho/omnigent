@@ -31,17 +31,7 @@ import { clearSessionStopped, useStoppedSessions } from "@/store/stoppedSessions
  */
 export const STARTING_GRACE_S = 45;
 
-/**
- * How long (seconds) after a confirmed stop to treat a lingering
- * `runner_online: true` poll read as stale rather than a relaunch.
- *
- * The stop mutation resolves only after the server tore the runner down,
- * but runner liveness is poll-driven (~10s interval), so the map can keep
- * reporting the pre-stop `true` for up to one interval. Within this grace
- * the stop marker wins (the view reads `stopped` immediately); past it, a
- * `true` read is a genuine relaunch (or a runner the stop never dropped)
- * and the marker is cleared.
- */
+/** Ignore a stale online poll for one interval after a confirmed stop. */
 export const STOPPED_STALE_ONLINE_GRACE_S = 15;
 
 /** The subset of a conversation row this hook reads. */
@@ -125,14 +115,8 @@ export function livenessRowFromSession(
  *   host relaunches the runner on the next message, so the composer stays
  *   open. The open view renders no banner for this state — typing
  *   silently relaunches the runner (which then flips it to `starting`).
- * - `stopped` — this client explicitly stopped the session (the kebab's
- *   "Stop session" confirmed and the server acknowledged it). Physically
- *   identical to `runner_asleep` — the composer stays open and the next
- *   message relaunches the runner — but unlike an idle sleep the user just
- *   ASKED for this state, so the open view says so instead of rendering
- *   nothing. Wins over a stale-online poll read (the runner-liveness poll
- *   can lag the stop by one interval) and clears once the runner is
- *   genuinely observed back online (a relaunch).
+ * - `stopped` — an acknowledged explicit stop; unlike `runner_asleep`, the
+ *   open view says so. The composer can still relaunch the runner.
  * - `host_asleep` — the session is host-bound, the host tunnel is down, but
  *   the host is a resumable managed host: the server wakes the sandbox on the
  *   next message (the send-message relaunch path calls `resume_managed_host`).
@@ -197,15 +181,9 @@ function isOwner(conv: Pick<Conversation, "permission_level"> | null | undefined
  * | 6 | false         | undefined   | set     | (any)      | unknown (host unseen)|
  * | 7 | false         | null/false  | null    | (any)      | local_stranded       |
  *
- * `†stopped` = this client's kebab "Stop session" was confirmed for this
- * session (see `stoppedSessions`). While the marker stands, a not-true
- * runner read surfaces `stopped` instead of the silent `runner_asleep`
- * (a just-sent turn still upgrades to `starting`, and a confirmed-dead
- * host still wins — rows 3/3'/3" precede it). On row 1, a `true` read
- * within {@link STOPPED_STALE_ONLINE_GRACE_S} of the stop is the poll
- * lagging the teardown, so `stopped` shows immediately; past the grace
- * (or with a turn in flight) the `true` read is a genuine relaunch and
- * the marker is cleared.
+ * `†stopped` = a confirmed stop marker: a fresh marker also outranks a
+ * stale-online poll; a dead host or just-sent turn takes precedence.
+ * A later online read clears the marker after the poll grace.
  *
  * `*fresh` = `created_at` is within {@link STARTING_GRACE_S} of now AND
  * the runner tunnel has never been observed online (initial cold boot).
@@ -296,21 +274,14 @@ function useSessionLivenessRaw(
   if (runnerOnline === true) everOnlineRef.current.seen = true;
   const runnerEverOnline = everOnlineRef.current.seen;
 
-  // This client's confirmed "Stop session" for this session, if any. The
-  // poll can keep reading the pre-stop `runner_online: true` for up to one
-  // interval after the stop lands, so within STOPPED_STALE_ONLINE_GRACE_S
-  // the marker outranks a `true` read; past it, `true` is a genuine
-  // relaunch (or a runner the stop never dropped) and the marker is
-  // forgotten — in an effect, since clearing mutates shared state.
+  // Keep the confirmed stop visible during one stale-online poll interval.
   const stoppedAtMs = useStoppedSessions((s) =>
     sessionId !== undefined ? s.stoppedAt[sessionId] : undefined,
   );
   const stopMarkerFresh =
     typeof stoppedAtMs === "number" &&
     Date.now() - stoppedAtMs < STOPPED_STALE_ONLINE_GRACE_S * 1000;
-  // Forget the marker on a `true` read that is past the staleness window,
-  // or that a just-sent turn explains (the user stopped, then immediately
-  // sent — the runner is back because they relaunched it).
+  // Clear after a real relaunch, in an effect because the store is shared.
   const clearStaleStop =
     sessionId !== undefined &&
     runnerOnline === true &&
@@ -320,10 +291,7 @@ function useSessionLivenessRaw(
     if (clearStaleStop && sessionId !== undefined) clearSessionStopped(sessionId);
   }, [clearStaleStop, sessionId]);
 
-  // 1. A live runner tunnel is the only thing that means "chat normally" —
-  // unless a just-confirmed stop says the read is stale (see above). A turn
-  // in flight overrides even a fresh marker: the user stopped and then
-  // immediately sent, so a `true` read is the relaunch, not staleness.
+  // 1. A new turn makes an online read a relaunch, not stale poll data.
   if (runnerOnline === true) {
     return stopMarkerFresh && !opts?.turnActive ? { kind: "stopped" } : { kind: "online" };
   }
@@ -375,12 +343,8 @@ function useSessionLivenessRaw(
     return { kind: "host_offline", isOwner: isOwner(conv) };
   }
 
-  // 3‴. An explicitly-stopped session (this client's confirmed Stop). The
-  // runner is down because the user asked — outrank the silent idle
-  // `runner_asleep` below so the stop is visible. A just-sent turn is
-  // relaunching it right now → the `starting` "Connecting…" intermediate.
-  // A confirmed-dead host (row 3) still wins: its banner is actionable,
-  // and "send a message to start it again" would be wrong there.
+  // 3‴. A confirmed stop is visible unless a turn is relaunching the runner.
+  // A dead host takes precedence above: sending cannot restart it.
   if (typeof stoppedAtMs === "number") {
     return opts?.turnActive ? { kind: "starting" } : { kind: "stopped" };
   }

@@ -59,8 +59,6 @@ function derive(
 describe("useSessionLiveness — derivation truth table", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    // The explicit-stop marker is module-global state; a leftover marker
-    // would flip unrelated cases below from runner_asleep to stopped.
     useStoppedSessions.setState({ stoppedAt: {} });
   });
 
@@ -316,26 +314,16 @@ describe("useSessionLiveness — derivation truth table", () => {
 
   describe('explicit stop (the kebab\'s confirmed "Stop session")', () => {
     it("stopped — not the silent runner_asleep — once the stop is confirmed", () => {
-      // The core of the fix: a host-up + runner-down session this client
-      // just STOPPED must say so. The same inputs without the marker are
-      // runner_asleep, which renders nothing at all.
       markSessionStopped(SID);
       expect(derive(false, true, conv({ host_id: "h1" }))).toEqual({ kind: "stopped" });
     });
 
     it("stopped wins over a stale-online poll read within the grace", () => {
-      // The stop mutation resolves after the server tore the runner down,
-      // but the ~10s liveness poll can keep reporting the pre-stop `true`.
-      // The user must see the stop acknowledged immediately, not after the
-      // next poll tick.
       markSessionStopped(SID);
       expect(derive(true, true, conv({ host_id: "h1" }))).toEqual({ kind: "stopped" });
     });
 
     it("a genuine relaunch (online past the grace) clears the marker", async () => {
-      // Past the staleness window a `true` read is a real relaunch — the
-      // session is online, and the marker must not replay "stopped" on a
-      // later natural runner drop.
       useStoppedSessions.setState({
         stoppedAt: { [SID]: Date.now() - (STOPPED_STALE_ONLINE_GRACE_S + 1) * 1000 },
       });
@@ -344,9 +332,6 @@ describe("useSessionLiveness — derivation truth table", () => {
     });
 
     it("a just-sent turn upgrades stopped to starting (the relaunch is visible)", () => {
-      // Sending a message relaunches the runner on the live host — the user
-      // acted on "send a message to start it again", so show the
-      // "Connecting…" intermediate rather than a lingering "stopped".
       markSessionStopped(SID);
       expect(derive(false, true, conv({ host_id: "h1" }), { turnActive: true })).toEqual({
         kind: "starting",
@@ -354,8 +339,6 @@ describe("useSessionLiveness — derivation truth table", () => {
     });
 
     it("a confirmed-dead host still outranks the stop marker", () => {
-      // "Send a message to start it again" would be wrong when the host
-      // itself is gone — the actionable host_offline banner must win.
       markSessionStopped(SID);
       expect(derive(false, false, conv({ host_id: "h1" }))).toEqual({
         kind: "host_offline",

@@ -22,6 +22,8 @@ def test_chat(page, chat_session_contract):
 
 The mutable handle exposes `session_id`, `url`, `event_posts`,
 `upload_requests`, `skills`, `skill_requests`, and `session_patches`. Use
+`set_items(...)` before navigation to replace history with arbitrary wire items,
+or `seed_transcript(...)` to generate Markdown/code turns. Use
 `set_skills(...)` to replace the session's `/v1/skills` response. To exercise
 loading UI, call `release = hold_skills()` before navigation, then call
 `release()` after the request appears in `skill_requests`. Session PATCH bodies

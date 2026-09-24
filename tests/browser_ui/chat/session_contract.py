@@ -258,6 +258,10 @@ class ChatSessionContract:
             raise ValueError("turns must be non-negative")
         self._items = transcript_items(turns)
 
+    def set_items(self, items: Sequence[Mapping[str, Any]]) -> None:
+        """Replace history with copies of the supplied wire items."""
+        self._items = [dict(item) for item in items]
+
     def set_catalog(
         self,
         *,

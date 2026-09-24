@@ -6,9 +6,11 @@ import os
 import signal
 import subprocess
 import time
+from collections.abc import Callable
 from urllib.parse import urlparse
 
 import httpx
+import pytest
 from playwright.sync_api import Page
 
 # Include the initial fetches and first query retries.
@@ -32,6 +34,8 @@ def _find_runner_pids() -> list[int]:
 def test_open_offline_session_no_resource_503_burst(
     page: Page,
     seeded_session: tuple[str, str],
+    request: pytest.FixtureRequest,
+    _recover_shared_runner: Callable[[], None],
 ) -> None:
     """Hold runner-proxied requests while an offline session opens."""
     base_url, session_id = seeded_session
@@ -49,6 +53,7 @@ def test_open_offline_session_no_resource_503_burst(
 
     runner_pids = _find_runner_pids()
     assert runner_pids, "no runner process found to kill"
+    request.addfinalizer(_recover_shared_runner)
     for pid in runner_pids:
         os.kill(pid, signal.SIGKILL)
 

@@ -162,6 +162,8 @@ const SDK_HARNESSES = new Set([
   "openai-agents-sdk",
   "agents_sdk",
   "antigravity",
+  "agy",
+  "google-antigravity",
 ]);
 
 /** Whether *harness* is an in-process SDK harness spelling. */

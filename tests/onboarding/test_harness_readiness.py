@@ -1245,6 +1245,37 @@ def test_malformed_databricks_config_contents_never_reach_logs(
     assert secret not in caplog.text
 
 
+def test_list_databricks_profiles_malformed_contents_never_reach_logs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``list_databricks_profiles`` itself logs only the exception class.
+
+    Direct coverage for the function's redaction behavior (the readiness test
+    above exercises readiness's own parser): a malformed ``~/.databrickscfg``
+    whose offending line embeds a token must produce an empty profile list and
+    a log record that never carries the file's contents.
+    """
+    import importlib
+    import logging
+
+    import omnigent.onboarding.databricks_config as dbc
+
+    secret = "dapi-super-secret-value"
+    # A token line before any section header makes configparser raise a
+    # MissingSectionHeaderError whose message embeds the line itself.
+    cfg = tmp_path / "databrickscfg-malformed-direct"
+    cfg.write_text(f"token = {secret}\n[DEFAULT]\nhost = https://example\n")
+    # The autouse fixture stubs list_databricks_profiles; reload to exercise
+    # the real parser, then pin its path at this test's malformed file.
+    importlib.reload(dbc)
+    monkeypatch.setattr(dbc, "_DATABRICKSCFG_PATH", cfg)
+    with caplog.at_level(logging.DEBUG):
+        assert dbc.list_databricks_profiles() == []
+    assert secret not in caplog.text
+
+
 def test_databricks_profileless_config_override_is_not_a_credential(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

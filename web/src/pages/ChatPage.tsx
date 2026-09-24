@@ -25,7 +25,6 @@ import {
   WandSparklesIcon,
   CornerUpLeftIcon,
   FileTextIcon,
-  FolderIcon,
   Loader2Icon,
   MessagesSquareIcon,
   TriangleAlertIcon,
@@ -42,10 +41,10 @@ import {
   ChatComposer,
   type ComposerKeyIntent,
   COMPOSER_COLUMN_WIDTH,
-  ComposerChipRow,
   ComposerFeedbackRow,
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
+import { ComposerMentionChips } from "@/components/composer/ComposerMentionChips";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { BackgroundTaskIndicator } from "@/components/composer/BackgroundTaskIndicator";
 import { SubagentTaskIndicator } from "@/components/composer/SubagentTaskIndicator";
@@ -120,7 +119,6 @@ import {
   buildMentionPreamble,
   detectMentionAt,
   type MentionItem,
-  mentionItemPath,
   mentionMarkerFor,
   type MentionState,
   parseMentionToken,
@@ -195,11 +193,11 @@ import { useMessageDeepLinkChatView } from "@/hooks/useMessageDeepLink";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
+import { useSlashCompletion } from "@/hooks/useSlashCompletion";
 import { HostBadge } from "@/components/HostBadge";
 import {
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,
-  rankedSlashCommandNames,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
@@ -2427,11 +2425,6 @@ function ComposerImpl(
   const [planModeBusy, setPlanModeBusy] = useState(false);
   const [goalDialogOpen, setGoalDialogOpen] = useState(false);
   const [inputFocused, setInputFocused] = useState(false);
-  // Index of the highlighted item in the slash-command suggestions menu.
-  // -1 means no item highlighted (menu closed or no matches). When the menu
-  // opens with matches the reset logic below pre-selects the first item (0)
-  // so Tab/Enter complete it immediately.
-  const [menuIndex, setMenuIndex] = useState(-1);
   // Active "@"-file-mention being typed, plus its highlighted row and the
   // workspace paths the user has already tagged. ``@``-mention is wired for
   // the native coding-agent sessions (see ``mentionEnabled``): those harnesses
@@ -2719,9 +2712,9 @@ function ComposerImpl(
   });
   const filesRef = useRef(files);
   filesRef.current = files;
-  // The hook re-creates its functions every render; the restore effects
-  // below key off conversation state, not attachment identity, so they
-  // reach the current function through a ref rather than a dependency.
+  // The restore effects below key off conversation state and reach the
+  // attachment actions through a ref rather than widening their dependency
+  // lists.
   const attachmentsRef = useRef({ restoreFiles, replaceFiles });
   attachmentsRef.current = { restoreFiles, replaceFiles };
 
@@ -2848,15 +2841,6 @@ function ComposerImpl(
   // Suggest names until a space starts the arguments; exclude file paths.
   const trimmedValue = value.trimStart();
   const hasCommandPrefix = trimmedValue.startsWith("/") || trimmedValue.startsWith(skillPrefix);
-  const menuOpen =
-    inputFocused &&
-    draft.quotes.length === 0 &&
-    hasCommandPrefix &&
-    !trimmedValue.slice(1).includes("/") &&
-    !trimmedValue.includes(" ") &&
-    files.length === 0;
-  // Query = what the user typed after the command or skill prefix.
-  const menuQuery = menuOpen ? trimmedValue.slice(1) : "";
   // Tint only the command or skill token, leaving arguments in the default color.
   const composerIsCommand =
     draft.quotes.length === 0 &&
@@ -2876,29 +2860,6 @@ function ComposerImpl(
       setPlanModeBusy(false);
     }
   };
-  // Filtered matches — kept in sync with what SlashCommandMenu renders so
-  // keyboard nav indexes into the same list.
-  const menuMatches = menuOpen ? rankedSlashCommandNames(slashCommands, menuQuery) : [];
-
-  // New queries select the first match; asynchronous arrivals retain the selected name.
-  const [previousMenuMatches, setPreviousMenuMatches] = useState<{
-    query: string;
-    names: string[];
-  }>({ query: "", names: [] });
-  if (
-    menuQuery !== previousMenuMatches.query ||
-    menuMatches.length !== previousMenuMatches.names.length ||
-    menuMatches.some((m, i) => m !== previousMenuMatches.names[i])
-  ) {
-    const previousName = previousMenuMatches.names[menuIndex];
-    const retainedIndex =
-      previousMenuMatches.query === menuQuery && previousName
-        ? menuMatches.indexOf(previousName)
-        : -1;
-    setPreviousMenuMatches({ query: menuQuery, names: menuMatches });
-    setMenuIndex(retainedIndex >= 0 ? retainedIndex : menuMatches.length > 0 ? 0 : -1);
-  }
-
   // "@"-mention is a drill-down file/folder browser. The token after "@"
   // doubles as a path: text up to the last "/" is the directory being
   // browsed; text after it filters that directory's entries. Opening a
@@ -3160,7 +3121,6 @@ function ComposerImpl(
    * All other commands execute immediately.
    */
   const applyMenuSelection = (cmd: string) => {
-    setMenuIndex(-1);
     if (slashCommandsWithArgs.has(cmd)) {
       // Fill in "cmd " and let the user type the argument.
       setValue(cmd + " ");
@@ -3173,6 +3133,23 @@ function ComposerImpl(
       executeSlashCommand(cmd, "");
     }
   };
+
+  // Slash-completion menu mechanics (shared useSlashCompletion): the menu
+  // opens while the focused draft is a lone command token with no
+  // attachments, and owns Escape, arrows, and Tab/Enter completion while
+  // open. What a selection does (fill vs execute) stays in the adapter.
+  const slashCompletion = useSlashCompletion({
+    text: value,
+    commands: slashCommands,
+    prefix: skillPrefix,
+    status: skillsStatus,
+    mobile: isMobile,
+    mobileEnterCompletes: false,
+    escapeClearsOnlyWithContent: true,
+    allowOpen: inputFocused && draft.quotes.length === 0 && files.length === 0,
+    onSelect: applyMenuSelection,
+    clearText: () => setValue(""),
+  });
 
   // Auto-grow the textarea from 1 row up to 10 rows, then let it scroll.
   // Growth stays in the flex column so the transcript viewport ends where the
@@ -3478,49 +3455,10 @@ function ComposerImpl(
     // "/"-command). Takes priority over history recall and submission.
     if (!shouldPreferSendOverCompletion && handleMentionKeyDown(e)) return;
 
-    if (menuOpen && (menuMatches.length > 0 || skillsStatus != null) && e.key === "Escape") {
-      e.preventDefault();
-      setValue("");
-      setMenuIndex(-1);
-      return;
-    }
-
-    // A loading-only menu has no completion yet; don't submit the partial token.
-    if (
-      menuOpen &&
-      skillsStatus === "loading" &&
-      menuMatches.length === 0 &&
-      !shouldPreferSendOverCompletion &&
-      (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !isMobile))
-    ) {
-      e.preventDefault();
-      return;
-    }
-
-    // When the suggestions menu is open, ArrowUp/Down navigate it and
-    // Enter/Tab complete the highlighted item. These take priority over
-    // history recall and normal submission.
-    if (menuOpen && menuMatches.length > 0) {
-      if (e.key === "ArrowDown") {
-        e.preventDefault();
-        setMenuIndex((i) => (i + 1) % menuMatches.length);
-        return;
-      }
-      if (e.key === "ArrowUp") {
-        e.preventDefault();
-        setMenuIndex((i) => (i <= 0 ? menuMatches.length - 1 : i - 1));
-        return;
-      }
-      if (
-        !shouldPreferSendOverCompletion &&
-        (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !isMobile)) &&
-        menuIndex >= 0
-      ) {
-        e.preventDefault();
-        applyMenuSelection(menuMatches[menuIndex]!);
-        return;
-      }
-    }
+    // Slash-completion menu keys (shared useSlashCompletion) — dismiss,
+    // navigate, or complete; takes priority over history recall and
+    // submission.
+    if (slashCompletion.handleKey(e, { shouldPreferSendOverCompletion })) return;
 
     // Mobile Enter behavior takes precedence over this desktop preference:
     // software-keyboard Enter inserts a newline and Send remains an explicit tap.
@@ -3810,10 +3748,10 @@ function ComposerImpl(
           beforeInput: (
             <>
               {/* Slash-command suggestions — floats above the composer box */}
-              {menuOpen && (
+              {slashCompletion.open && (
                 <SlashCommandMenu
-                  query={menuQuery}
-                  activeIndex={menuIndex}
+                  query={slashCompletion.query}
+                  activeIndex={slashCompletion.index}
                   onSelect={applyMenuSelection}
                   commands={slashCommands}
                   skillsStatus={skillsStatus}
@@ -3902,40 +3840,13 @@ function ComposerImpl(
                 <ComposerFeedbackRow tone="error">{attachmentError}</ComposerFeedbackRow>
               )}
               {/* "@"-mention chips — one per tagged workspace file/folder. Each is
-            delivered as a "[Attached: <path>]" marker at send time. */}
-              {mentionedItems.length > 0 && (
-                <ComposerChipRow className="gap-1.5">
-                  {mentionedItems.map((item, i) => (
-                    <span
-                      key={mentionItemPath(item)}
-                      className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                    >
-                      {item.isDir ? (
-                        <FolderIcon className="size-3 shrink-0" />
-                      ) : (
-                        <FileTextIcon className="size-3 shrink-0" />
-                      )}
-                      <span className="max-w-[200px] truncate" title={mentionItemPath(item)}>
-                        @{item.path}
-                        {item.isDir ? "/" : ""}
-                      </span>
-                      {item.lineRange && (
-                        <span className="shrink-0">
-                          :{item.lineRange.start}-{item.lineRange.end}
-                        </span>
-                      )}
-                      <button
-                        type="button"
-                        onClick={() => removeMentionedItem(i)}
-                        className="ml-0.5 rounded-full hover:text-foreground"
-                        aria-label={`Remove ${item.path}`}
-                      >
-                        <XIcon className="size-3" />
-                      </button>
-                    </span>
-                  ))}
-                </ComposerChipRow>
-              )}
+            delivered as a "[Attached: <path>]" marker at send time. Ranged
+            spans (from "Attach to agent") show their line range. */}
+              <ComposerMentionChips
+                items={mentionedItems}
+                onRemove={removeMentionedItem}
+                showLineRange
+              />
               {/* Inline slash-command feedback: errors and /help output */}
               {commandError !== null && <ComposerFeedbackRow>{commandError}</ComposerFeedbackRow>}
             </>

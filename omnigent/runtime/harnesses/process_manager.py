@@ -1591,14 +1591,26 @@ class HarnessProcessManager:
 
 
 async def sweep_orphaned_instance_dirs(tmp_parent: Path | None = None) -> int:
-    """Kill runner processes left behind by crashed AP instances and"""
+    """Reap dead instance dirs while retaining unverifiable trees for retry."""
     parent = tmp_parent if tmp_parent is not None else _default_tmp_parent()
     try:
-        children = list(parent.iterdir())
-    except FileNotFoundError:
-        return 0
+        if not parent.exists():
+            return 0
     except OSError as exc:
-        _logger.warning("cannot list instance-dir parent %s: %s; skipping sweep", parent, exc)
+        _logger.warning(
+            "cannot access %s for the orphan sweep: %s; skipping sweep",
+            parent,
+            exc,
+        )
+        return 0
+    try:
+        children = list(parent.iterdir())
+    except OSError as exc:
+        _logger.warning(
+            "cannot enumerate %s for the orphan sweep: %s; skipping sweep",
+            parent,
+            exc,
+        )
         return 0
     swept = 0
     for child in children:
@@ -1606,15 +1618,13 @@ async def sweep_orphaned_instance_dirs(tmp_parent: Path | None = None) -> int:
             continue
         sentinel = child / _AP_PID_FILE
         try:
-            if not child.is_dir():
-                continue
-            if not sentinel.exists():
+            if not child.is_dir() or not sentinel.exists():
                 # No sentinel — directory either pre-dates the
                 # convention or is mid-creation. Leave alone.
                 continue
         except OSError as exc:
             _logger.warning(
-                "could not stat instance dir %s: %s; skipping",
+                "cannot inspect %s during the orphan sweep: %s; skipping",
                 child,
                 exc,
             )

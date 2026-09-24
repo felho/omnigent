@@ -4964,6 +4964,57 @@ async def test_kiro_duplicate_repost_restores_skipped_entries_unpersisted() -> N
 
 
 @pytest.mark.asyncio
+async def test_external_item_append_failure_restores_drained_entries_in_order() -> None:
+    """A failed append restores skipped and matched Kiro drains in queue order."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions.orchestration import (
+        _persist_external_conversation_items,
+    )
+
+    class _FailingStore(_ConversationStore):
+        def append(self, conversation_id: str, items: list[Any]) -> list[Any]:
+            raise RuntimeError("store unavailable")
+
+    pending_inputs.reset_for_tests()
+    store = _FailingStore()
+    sid = "823dbd1aab969b5a813fac59bb977a77"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    recorded = [
+        pending_inputs.record(
+            sid, [{"type": "input_text", "text": text}], created_by="alice@example.com"
+        )
+        for text in ("first failed", "tell me a joke")
+    ]
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "tell me a joke"}],
+            },
+            "response_id": "kiro:prompt-joke",
+            "source_id": "kiro:prompt-joke:0",
+        },
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="store unavailable"):
+            await _persist_external_conversation_items(
+                sid,
+                conv,
+                [(body, None)],
+                store,  # type: ignore[arg-type]
+            )
+
+        snapshot = pending_inputs.snapshot_for(sid)
+        assert [entry["pending_id"] for entry in snapshot] == recorded
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_native_dispatch_reports_malformed_runner_error_body() -> None:
     """Opaque framework 500 bodies become explicit ensure errors.
 

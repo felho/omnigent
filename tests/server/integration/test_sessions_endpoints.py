@@ -1470,6 +1470,45 @@ async def test_session_event_item_batch_with_queued_input_keeps_per_event_drain(
     assert pending_id not in json.dumps(pending_inputs.snapshot_for(child_id))
 
 
+async def test_session_event_item_batch_failure_restores_a_drained_pending_input(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A batch that fails after draining queued input hands the entry back."""
+    from omnigent.runtime import pending_inputs
+
+    child_id = await _start_batch_child(client, "restore-child")
+    # Input queued after the batch gate passed (a race) still drains in prepare.
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_events._can_batch_external_conversation_items",
+        lambda _session_id, _conv: True,
+    )
+    pending_id = pending_inputs.record(
+        child_id, [{"type": "input_text", "text": "check the logs"}], created_by="alice"
+    )
+    user_item = {
+        "type": "external_conversation_item",
+        "data": {
+            "source_id": "child-user:0:message",
+            "item_type": "message",
+            "response_id": "resp_child_user",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "check the logs"}],
+            },
+        },
+    }
+    invalid = _child_assistant_item(0)
+    invalid["data"]["source_id"] = " "
+
+    response = await client.post(f"/v1/sessions/{child_id}/events", json=[user_item, invalid])
+
+    assert response.status_code == 400, response.text
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(child_id)] == [pending_id]
+    items = (await client.get(f"/v1/sessions/{child_id}/items")).json()["data"]
+    assert items == []
+
+
 async def test_session_event_batch_rejects_body_over_ten_mib(
     client: httpx.AsyncClient,
 ) -> None:

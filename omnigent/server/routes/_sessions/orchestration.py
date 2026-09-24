@@ -2681,6 +2681,7 @@ async def _finalize_external_conversation_item(
                 session_id, persisted_user, cleared_pending_id=skipped.pending_id
             )
             _publish_external_conversation_item(session_id, persisted_error)
+    # Relies on the previous item in the array having seeded ``conv.title`` in place.
     pending_background_title = prepare_background_session_title(
         coordinator=background_title_coordinator,
         conversation=conv,
@@ -2774,15 +2775,29 @@ async def _persist_external_conversation_items(
     :param conversation_store: Store used to append the items.
     :returns: Store-assigned conversation item ids, one per event.
     """
-    prepared = [
-        _prepare_external_conversation_item(session_id, conv, body, created_by)
-        for body, created_by in events
-    ]
-    persisted_items = await asyncio.to_thread(
-        conversation_store.append,
-        session_id,
-        [new_item for entry in prepared for new_item in entry.batch],
-    )
+    prepared: list[_PreparedExternalItem] = []
+    try:
+        for body, created_by in events:
+            prepared.append(
+                _prepare_external_conversation_item(session_id, conv, body, created_by)
+            )
+        persisted_items = await asyncio.to_thread(
+            conversation_store.append,
+            session_id,
+            [new_item for entry in prepared for new_item in entry.batch],
+        )
+    except BaseException:
+        # Nothing persisted: hand every drained entry back in original queue
+        # order (restore prepends, so reverse the consumption order).
+        consumed = [
+            drained
+            for entry in prepared
+            for drained in (*entry.skipped_kiro_pending, entry.drained)
+            if drained is not None
+        ]
+        for drained in reversed(consumed):
+            pending_inputs.restore(session_id, drained)
+        raise
     item_ids: list[str] = []
     offset = 0
     for entry in prepared:

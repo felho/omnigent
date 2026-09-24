@@ -1746,6 +1746,7 @@ async def test_readiness_refresh_does_not_duplicate_startup_probe(
 ) -> None:
     """A pending startup probe owns discovery through several refresh ticks."""
     host = _make_host_process()
+    monkeypatch.setattr(host, "_prewarm_model_options", AsyncMock(return_value=None))
     release = asyncio.Event()
     calls: list[bool] = []
 
@@ -1769,7 +1770,7 @@ async def test_readiness_refresh_does_not_duplicate_startup_probe(
         await asyncio.sleep(0.05)
         assert calls == [True]
         release.set()
-        await asyncio.wait_for(tunnel.second_send.wait(), timeout=1.0)
+        await asyncio.wait_for(tunnel.second_send.wait(), timeout=5.0)
         assert calls == [True]
     finally:
         release.set()

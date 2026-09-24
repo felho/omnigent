@@ -1618,19 +1618,7 @@ function buildAssistantItems(
   return items;
 }
 
-/**
- * Whether the transcript currently ends in a tool call with no result.
- *
- * Walks the trailing tool phase exactly like `trailingLiveToolCallIds`:
- * trailing `tool_result`s resolve their calls, `native_tool` is skipped, and
- * the walk stops at the first non-tool block (a call followed by narration is
- * no longer trailing). Used by the store to tell a genuine turn-end `idle`
- * from a false one published while a long, output-less tool is still running.
- *
- * @param blocks - The conversation's block list, newest last.
- * @returns `true` when a trailing tool call has neither an inline output nor
- *   a matching `tool_result`.
- */
+/** Whether a trailing tool call has no inline output or matching result. */
 export function hasUnresolvedTrailingToolCall(blocks: AnyBlock[]): boolean {
   const resolved = new Set<string>();
   for (let i = blocks.length - 1; i >= 0; i -= 1) {

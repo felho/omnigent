@@ -6360,28 +6360,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Captured BEFORE the patch below adopts event.responseId, so a
       // running/waiting status carrying an unseen id marks a new turn.
       const prevResponseId = useChatStore.getState().activeResponse?.responseId;
-      // Set when the patch callback classifies this edge as a false idle and
-      // drops it, so the id-keyed side effects below skip too — otherwise the
-      // sidebar dot would flip to idle while the chat stays working.
+      // Skip id-keyed side effects when the status patch drops a false idle.
       let ignoredFalseIdle = false;
       // The status patch is conversation-scoped; the cache/query side effects
       // further down are deliberately NOT (they are keyed by explicit id, so a
       // sub-agent's status still refreshes its parent's rail).
       applyToNamedConversation(event.conversationId, (s) => {
-        // A bare PTY-quiescence `idle` landing while the live turn still has
-        // an unresolved trailing tool call is a FALSE idle: a long,
-        // output-less tool keeps the pane unchanged past the idle watcher's
-        // threshold while the agent is still working (a harness with no
-        // status file has nothing else to say so). Adopting it would read as
-        // a turn end — the "Working…" shimmer dies and the in-flight tool
-        // collapses to "no output" — so drop the edge. It self-heals: the
-        // tool's eventual output mutates the pane, the watcher re-emits
-        // `running`, and the true turn-end idle is adopted because by then
-        // the call has a result (or trailing narration displaced it). An
-        // id-bearing terminal edge (status file / Stop hook) and a parked
-        // edge carrying a blocked-on reason stay authoritative, and a
-        // plain-text turn's bare idle still clears Working (no unresolved
-        // trailing call).
+        // A quiet, unresolved tool can trigger a bare PTY idle mid-turn.
+        // Keep Working lit; id-bearing and blocked-on edges remain authoritative.
         if (
           event.status === "idle" &&
           event.responseId === undefined &&

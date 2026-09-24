@@ -3149,8 +3149,7 @@ describe("chatStore — send while streaming (queueing)", () => {
     });
   });
 
-  // A tool_group whose execution has no output yet — a dispatched call whose
-  // result hasn't arrived, i.e. a tool genuinely in flight.
+  // A dispatched tool with no result yet.
   function inFlightToolGroup(callId: string, output: string | null = null) {
     return {
       type: "tool_group" as const,
@@ -3178,10 +3177,7 @@ describe("chatStore — send while streaming (queueing)", () => {
   }
 
   it("ignores a bare idle while the trailing tool call is still unresolved", () => {
-    // The PTY-diff idle watcher misreads a long, output-less tool call as
-    // quiescence and publishes a bare idle mid-turn. Adopting it would kill
-    // the "Working…" shimmer and collapse the in-flight tool to "no output"
-    // while the agent is still running — the edge must be dropped.
+    // A bare PTY idle must not end an unresolved tool call.
     useChatStore.setState({
       conversationId: "conv_abc",
       status: "streaming",

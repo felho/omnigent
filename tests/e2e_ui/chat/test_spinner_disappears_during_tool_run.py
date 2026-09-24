@@ -1,18 +1,4 @@
-"""The "Working…" spinner disappears while the agent is still running.
-
-A native harness without a status file derives running/idle solely from the
-tmux pane-diff idle watcher, so a long, output-less tool call (a
-filesystem-wide search) leaves the pane unchanged past the idle threshold and
-the watcher publishes a bare ``idle`` (no ``response_id``) mid-turn. The web
-client adopts every server idle as a turn end: the "Working…" shimmer vanishes
-and the in-flight tool card collapses to "no output" although the agent is
-still running the search, so the session reads as stopped.
-
-A plain-text turn's bare idle is a genuine turn end and must still clear the
-indicator (see ``test_working_indicator_idle_clears``); the discriminator here
-is the unresolved trailing tool call. This test FAILS while a bare idle
-mid-tool is adopted as a turn end and passes once the indicator survives it.
-"""
+"""Browser regression for a false native idle during a pending tool call."""
 
 from __future__ import annotations
 
@@ -27,15 +13,7 @@ _NARRATION = "let me look for universe repos around the file system"
 
 
 def _post_event(client: httpx.Client, session_id: str, event_type: str, data: dict) -> None:
-    """Publish one native-forwarder ``/events`` payload.
-
-    :param client: HTTP client bound to the spawned server's base URL.
-    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
-    :param event_type: Wire event type, e.g. ``"external_session_status"``.
-    :param data: The event's ``data`` payload.
-    :returns: None.
-    :raises AssertionError: If the server does not accept the event (202).
-    """
+    """Publish an event through the spawned server's native-forwarder route."""
     resp = client.post(
         f"/v1/sessions/{session_id}/events",
         json={"type": event_type, "data": data},
@@ -47,17 +25,7 @@ def test_working_indicator_survives_false_idle_during_tool_call(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A bare ``idle`` mid-tool must not make a running agent read as stopped.
-
-    Journey: the user prompts and the turn starts running ("Working…" lights);
-    the agent narrates and dispatches a long filesystem-search tool call that
-    is still in flight when the quiet pane makes the idle watcher publish a
-    bare ``idle``; the indicator must stay lit because the tool is unresolved.
-
-    :param page: Playwright page fixture.
-    :param seeded_session: ``(base_url, session_id)`` from the local server.
-    :returns: None.
-    """
+    """Keep Working visible when a bare idle arrives before a tool result."""
     base_url, session_id = seeded_session
     response_id = f"resp_universe_{uuid.uuid4().hex[:8]}"
     call_id = f"call_{uuid.uuid4().hex[:8]}"
@@ -95,8 +63,7 @@ def test_working_indicator_survives_false_idle_during_tool_call(
             "external_output_text_delta",
             {"message_id": "live_text_1", "index": 0, "delta": _NARRATION},
         )
-        # The function_call gets no function_call_output: the search tool is
-        # genuinely in flight when the bare idle lands below.
+        # No tool result has arrived when the bare idle lands below.
         _post_event(
             client,
             session_id,
@@ -115,8 +82,7 @@ def test_working_indicator_survives_false_idle_during_tool_call(
         expect(page.get_by_text(_NARRATION)).to_be_visible(timeout=15_000)
         expect(working).to_be_visible(timeout=15_000)
 
-        # The quiet pane makes the PTY-diff idle watcher misfire: a bare idle
-        # (no response_id) mid-turn.
+        # The idle watcher emits this bare status while the tool is still running.
         _post_event(client, session_id, "external_session_status", {"status": "idle"})
 
     # Let the bare-idle edge settle in the client store so the positive

@@ -72,3 +72,30 @@ def test_contract_can_hold_and_release_session_skills(
     assert response_info.value.json() == {
         "skills": [{"name": "review", "description": "Review the current change."}]
     }
+
+
+def test_contract_records_and_persists_session_patches(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    chat = chat_session_contract
+    page.goto(chat.url)
+
+    sessions = page.evaluate(
+        """async sessionId => {
+            const response = await fetch(`/v1/sessions/${sessionId}`, {
+                method: "PATCH",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ model_override: "opus", silent: true }),
+            });
+            const patched = await response.json();
+            const current = await fetch(`/v1/sessions/${sessionId}`).then(result => result.json());
+            return { patched, current };
+        }""",
+        chat.session_id,
+    )
+
+    assert chat.session_patches == [{"model_override": "opus", "silent": True}]
+    assert sessions["patched"]["model_override"] == "opus"
+    assert "silent" not in sessions["patched"]
+    assert sessions["current"]["model_override"] == "opus"

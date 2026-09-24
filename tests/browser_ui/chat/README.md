@@ -20,10 +20,12 @@ def test_chat(page, chat_session_contract):
 ```
 
 The mutable handle exposes `session_id`, `url`, `event_posts`,
-`upload_requests`, `skills`, and `skill_requests`. Use `set_skills(...)` to
-replace the session's `/v1/skills` response. To exercise loading UI, call
-`release = hold_skills()` before navigation, then call `release()` after the
-request appears in `skill_requests`.
+`upload_requests`, `skills`, `skill_requests`, and `session_patches`. Use
+`set_skills(...)` to replace the session's `/v1/skills` response. To exercise
+loading UI, call `release = hold_skills()` before navigation, then call
+`release()` after the request appears in `skill_requests`. Session PATCH bodies
+are recorded in `session_patches`, merged into the mocked session, and reflected
+by the PATCH response and later session GETs.
 
 Event POSTs default to a queued acknowledgement, keeping the local turn busy so
 another composer submission enters the client queue. Set `event_ack` to change

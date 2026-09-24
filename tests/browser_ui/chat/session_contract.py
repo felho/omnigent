@@ -208,7 +208,9 @@ class ChatSessionContract:
     upload_requests: list[dict[str, Any]] = field(default_factory=list)
     skills: list[dict[str, Any]] = field(default_factory=list)
     skill_requests: list[dict[str, Any]] = field(default_factory=list)
+    session_patches: list[dict[str, Any]] = field(default_factory=list)
     _items: list[dict[str, Any]] = field(default_factory=list)
+    _session_updates: dict[str, Any] = field(default_factory=dict)
     _status: str = "idle"
     _hold_skill_responses: bool = False
     _pending_skill_routes: list[Route] = field(default_factory=list)
@@ -282,7 +284,7 @@ class ChatSessionContract:
         self.emit(session_status_event(self.session_id, "idle", response_id=response_id))
 
     def _session(self) -> dict[str, Any]:
-        return {
+        session = {
             "id": self.session_id,
             "object": "conversation",
             "title": "Browser chat session",
@@ -299,6 +301,8 @@ class ChatSessionContract:
             "llm_model": self.selected_model,
             "model_options": self.models,
         }
+        session.update(self._session_updates)
+        return session
 
     def _agent(self) -> dict[str, Any]:
         return {
@@ -382,6 +386,30 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
     contract.json("/v1/sessions", lambda _request: list_payload([handle._session()]))
     session_api = f"/v1/sessions/{handle.session_id}"
     contract.json(session_api, lambda _request: handle._session())
+
+    def patch_session(route: Route) -> None:
+        if route.request.method != "PATCH":
+            route.fallback()
+            return
+        body = _request_record(route.request)["body"]
+        if not isinstance(body, dict):
+            route.fulfill(
+                status=400,
+                content_type="application/json",
+                body=json.dumps({"detail": "Session patch must be a JSON object"}),
+            )
+            return
+        handle.session_patches.append(body)
+        handle._session_updates.update(
+            {key: value for key, value in body.items() if key != "silent"}
+        )
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(handle._session()),
+        )
+
+    contract.route(matcher(session_api), patch_session)
     contract.json(
         f"{session_api}/items",
         lambda _request: list_payload(handle._items),

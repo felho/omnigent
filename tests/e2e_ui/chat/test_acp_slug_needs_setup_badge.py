@@ -130,19 +130,36 @@ async def _register_routes(page: Any, *, configured_harnesses: dict[str, Any]) -
 
     await page.route("**/v1/hosts", handle_hosts)
     await page.route("**/v1/agents", handle_agents)
-    await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+    await page.route(
+        re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+    )
 
 
 async def _open_landing(page: Any, base_url: str) -> None:
-    """Open the landing composer with a recent workspace."""
+    """Open the landing composer with the ACP agent and target host selected."""
     await page.add_init_script(
         f"""window.localStorage.setItem(
             "omnigent:recent-workspaces",
             JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
         );"""
     )
+    await page.add_init_script(
+        f'window.localStorage.setItem("omnigent:last-agent-id", {json.dumps(_ACP_AGENT_ID)});'
+    )
     await page.goto(f"{base_url}/")
     await page.get_by_test_id("new-chat-landing-input").wait_for(state="visible", timeout=30_000)
+    host_chip = page.get_by_test_id("new-chat-landing-host-chip")
+    await host_chip.click()
+    host_row = page.get_by_test_id(f"new-chat-landing-host-{_HOST_ID}")
+    await host_row.click(timeout=15_000)
+    await expect(page.get_by_test_id("new-chat-landing-host-menu")).to_have_count(0)
+    await host_chip.click()
+    await expect(host_row).to_have_attribute("data-active", "true")
+    await page.keyboard.press("Escape")
+    await expect(page.get_by_test_id("new-chat-landing-host-menu")).to_have_count(0)
+    await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_have_attribute(
+        "aria-label", re.compile(r"^Traex(?:,|$)", re.IGNORECASE)
+    )
 
 
 def test_configured_acp_slug_agent_is_not_badged_needs_setup(

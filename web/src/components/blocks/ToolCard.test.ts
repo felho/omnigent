@@ -97,10 +97,6 @@ describe("ToolCard rendering", () => {
   });
 
   it("mounts open when defaultOpen is set and reports toggles via onOpenChange", () => {
-    // WHY: BlockRenderer remounts cards during a streaming re-layout; a
-    // card the user expanded must come back open (defaultOpen) and its
-    // toggles must be observable (onOpenChange) so the renderer can track
-    // which cards are being read.
     const onOpenChange = vi.fn();
     const { container } = renderCard({
       name: "my_tool",
@@ -111,7 +107,6 @@ describe("ToolCard rendering", () => {
       defaultOpen: true,
       onOpenChange,
     });
-    // Mounted open: the Parameters panel is visible without a click.
     expect(screen.getAllByText("Parameters").length).toBeGreaterThan(0);
     const trigger = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!;
     fireEvent.click(trigger);

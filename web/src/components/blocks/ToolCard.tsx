@@ -166,11 +166,7 @@ interface ToolCardProps {
   startedAt?: number | null;
   /** Completed runtime in seconds. Undefined when historical data lacks timing. */
   duration?: number;
-  /**
-   * Mount the expandable panel open. `BlockRenderer` sets this from its
-   * record of cards the user expanded, so a card remounted by a streaming
-   * re-layout comes back open instead of silently collapsing mid-read.
-   */
+  /** Restore a user-expanded card's open state after remount. */
   defaultOpen?: boolean;
   /** Reports the user toggling the expandable panel. */
   onOpenChange?: (open: boolean) => void;

@@ -229,13 +229,7 @@ type ToolRunFragment =
       index: number;
     };
 
-/**
- * Tracks which tool cards the user explicitly expanded, keyed by the
- * item's stable render key. Folding exempts these rows (like in-progress
- * spinners), and a card the streaming re-layout re-parents mounts back
- * open — so a new step landing mid-read can't collapse or swallow the
- * card the user is reading.
- */
+/** Keeps user-opened cards visible and open across streaming re-layouts. */
 interface ToolOpenState {
   isOpen: (key: string) => boolean;
   setOpen: (key: string, open: boolean) => void;
@@ -262,9 +256,6 @@ export function BlockRenderer({
     showsWorking,
   });
 
-  // A ref, not state: a toggle needs no re-render (the Collapsible owns
-  // its visual state) — the set is only consulted when a later item
-  // re-partitions the run.
   const userOpenedTools = useRef<Set<string>>(new Set());
   const toolOpenState = useMemo<ToolOpenState>(
     () => ({
@@ -726,9 +717,7 @@ function formatWorkedFor(seconds: number): string {
  * For the live-streaming run, the trailing `STREAMING_TAIL` tools
  * (regardless of state) stay outside the group so the user can watch
  * the most recent activity; any other run folds entirely. In-progress
- * spinners, persistent routing plan cards, and cards the user has
- * expanded (they're reading them — see `ToolOpenState`) never fold, so
- * a new step landing can't swallow what's under the user's eyes.
+ * spinners, routing plans, and user-opened cards stay outside folds.
  */
 function partitionToolRun(
   run: RenderItem[],
@@ -762,12 +751,7 @@ function partitionToolRun(
   return fragments;
 }
 
-/**
- * True when the user expanded this tool card and is presumably reading it.
- * A `native_tool` without an itemId keys by position, which can differ between
- * the streaming and settled layouts — harmless: those cards sit inside the
- * already-closed fold.
- */
+/** Id-less native tools use positional keys, which may change after re-layout. */
 function isUserOpenedTool(
   item: RenderItem,
   index: number,

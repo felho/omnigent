@@ -464,3 +464,22 @@ def test_committed_submission_is_remembered_until_ttl(monkeypatch: pytest.Monkey
 
     clock["t"] = 1000.0 + pending_inputs._COMMITTED_TTL_S + 0.1
     assert pending_inputs.committed_item_id("conv_a", stable) is None
+
+
+def test_claim_forward_lets_exactly_one_caller_paste() -> None:
+    """
+    Two requests sharing one entry: the first claim wins, the second is refused.
+
+    A re-send that arrives while the original request is still preparing the
+    pane gets the same entry back from ``record``; without a single winner both
+    would paste the prompt. An unknown id claims trivially so a message with no
+    entry keeps forwarding as before.
+    """
+    pid = pending_inputs.record("conv_a", [_text_block("once")], stable_id="d" * 32)
+
+    assert pending_inputs.claim_forward("conv_a", pid) is True
+    assert pending_inputs.claim_forward("conv_a", pid) is False
+    assert pending_inputs.claim_forward("conv_a", "pending_missing") is True
+    # A rolled-back entry no longer blocks a later fresh delivery.
+    pending_inputs.resolve("conv_a", pid)
+    assert pending_inputs.claim_forward("conv_a", pid) is True

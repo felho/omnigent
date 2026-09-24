@@ -3307,7 +3307,7 @@ describe("bubblesEqual — React.memo comparator", () => {
   it("re-renders a pending user bubble when only its delivery state changes", () => {
     // The delivery footer (spinner, Retry · Cancel, "Couldn't send") is driven
     // by fields the store flips after the bubble was first rendered. Ignoring
-    // them here left a stalled send showing "Sending" with no controls.
+    // them here left a failed send showing "Sending" with no controls.
     const content: MessageContentBlock[] = [{ type: "input_text", text: "Hello" }];
     const pending = (delivery: PendingDelivery): Bubble => ({
       kind: "user",
@@ -3316,14 +3316,22 @@ describe("bubblesEqual — React.memo comparator", () => {
       delivery,
       content,
     });
-    const sending = { posted: false, stalled: false };
-    expect(bubblesEqual(pending(sending), pending({ posted: false, stalled: false }))).toBe(true);
-    expect(bubblesEqual(pending(sending), pending({ posted: false, stalled: true }))).toBe(false);
-    expect(bubblesEqual(pending(sending), pending({ posted: true, stalled: false }))).toBe(false);
+    const sending = { posted: false };
+    expect(bubblesEqual(pending(sending), pending({ posted: false }))).toBe(true);
+    expect(
+      bubblesEqual(pending(sending), pending({ posted: false, failed: { attempts: 1 } })),
+    ).toBe(false);
+    expect(bubblesEqual(pending(sending), pending({ posted: true }))).toBe(false);
     expect(
       bubblesEqual(
-        pending(sending),
-        pending({ posted: false, stalled: false, error: { message: "boom", code: "" } }),
+        pending({ posted: false, failed: { attempts: 1 } }),
+        pending({ posted: false, failed: { attempts: 2 } }),
+      ),
+    ).toBe(false);
+    expect(
+      bubblesEqual(
+        pending({ posted: false, failed: { attempts: 1 } }),
+        pending({ posted: false, failed: { reason: "boom", attempts: 1 } }),
       ),
     ).toBe(false);
   });

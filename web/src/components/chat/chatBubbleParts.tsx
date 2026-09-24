@@ -214,8 +214,7 @@ export function buildPendingBubbles(
         ? {
             delivery: {
               posted: p.posted === true,
-              stalled: p.stalled === true,
-              ...(p.sendError !== undefined ? { error: p.sendError } : {}),
+              ...(p.failed !== undefined ? { failed: p.failed } : {}),
             },
           }
         : {}),
@@ -684,57 +683,70 @@ function useCopyMessageLink(messageId: string | null): {
 }
 
 /** A send unconfirmed this long shows its spinner; most sends confirm sooner. */
-const SEND_SPINNER_DELAY_MS = 2_000;
+/** Unconfirmed for this long: show the spinner. */
+const SEND_SPINNER_DELAY_MS = 5_000;
+/** Unconfirmed for this long, and the automatic check re-send also failed: show "Failed". */
+const SEND_FAILED_AFTER_MS = 20_000;
+
+/** Flips to true once `sinceMs` have passed since `sentAtMs` (immediately when already past). */
+function useElapsed(sentAtMs: number, sinceMs: number): boolean {
+  const [elapsed, setElapsed] = useState(() => Date.now() - sentAtMs >= sinceMs);
+  useEffect(() => {
+    if (elapsed) return;
+    const timer = setTimeout(() => setElapsed(true), sentAtMs + sinceMs - Date.now());
+    return () => clearTimeout(timer);
+  }, [elapsed, sentAtMs, sinceMs]);
+  return elapsed;
+}
 
 /**
- * Delivery footer under an optimistic user bubble. Nothing shows for the
- * first two seconds; past that a spinner says the send is still unconfirmed.
- * Retry and Cancel appear only on evidence the send is not progressing on
- * its own — parked after the automatic retries, or refused by the server —
- * never on elapsed time alone, so a slow but healthy POST does not look
- * like a failure. A thrown fetch is never shown as one either: it says
- * nothing about whether the server took the message, and the store keeps
- * re-sending the same stable id until it gets an answer.
+ * Delivery state under an optimistic user bubble. Nothing for a send that
+ * confirms quickly; a spinner once it has been unconfirmed for a few seconds.
+ * A thrown fetch keeps the spinner: the store re-sends once to learn whether
+ * the message landed (the server dedupes on the stable id), and only when that
+ * check also failed and the message has been unconfirmed for a while does the
+ * footer read "Failed · Retry · Cancel". A server refusal reads "Failed" at
+ * once, with its reason.
  */
 function PendingDeliveryFooter({
   tempId,
   delivery,
+  sentAtMs,
 }: {
   tempId: string;
   delivery: PendingDelivery;
+  /** Client send time; a revived bubble without one counts as long past. */
+  sentAtMs: number;
 }) {
-  const accepted = delivery.posted && delivery.error === undefined;
-  const [slow, setSlow] = useState(false);
-  useEffect(() => {
-    if (accepted) return;
-    const timer = setTimeout(() => setSlow(true), SEND_SPINNER_DELAY_MS);
-    return () => clearTimeout(timer);
-  }, [accepted]);
+  const accepted = delivery.posted && delivery.failed === undefined;
+  const slow = useElapsed(sentAtMs, SEND_SPINNER_DELAY_MS);
+  const matured = useElapsed(sentAtMs, SEND_FAILED_AFTER_MS);
   if (accepted) return null;
-  const refused = delivery.error !== undefined;
-  const showControls = refused || delivery.stalled;
-  if (!slow && !showControls) return null;
+  const failed =
+    delivery.failed !== undefined &&
+    (delivery.failed.reason !== undefined || (delivery.failed.attempts >= 2 && matured));
+  if (!failed && !slow) return null;
   const actionClass =
     "rounded-sm font-medium text-foreground underline decoration-foreground/30 underline-offset-[3px] hover:decoration-foreground focus-visible:outline-2 focus-visible:outline-ring";
   return (
     <div
       className="flex flex-col items-end gap-0.5 pt-1 pr-1"
       data-testid="send-delivery"
-      data-state={refused ? "refused" : delivery.stalled ? "stalled" : "sending"}
+      data-state={failed ? "failed" : "sending"}
     >
       <div
         className={cn(
           "flex items-center gap-2 text-xs leading-none",
-          refused ? "text-destructive" : "text-muted-foreground",
+          failed ? "text-destructive" : "text-muted-foreground",
         )}
       >
-        {refused ? (
+        {failed ? (
           <CircleAlertIcon className="size-3.5 shrink-0" aria-hidden="true" />
         ) : (
           <Loader2Icon className="size-3.5 shrink-0 animate-spin" aria-hidden="true" />
         )}
-        <span>{refused ? "Couldn't send" : "Sending"}</span>
-        {showControls && (
+        <span>{failed ? "Failed" : "Sending"}</span>
+        {failed && (
           <>
             <span aria-hidden="true">·</span>
             <button
@@ -755,8 +767,8 @@ function PendingDeliveryFooter({
           </>
         )}
       </div>
-      {delivery.error !== undefined && (
-        <span className="text-xs text-muted-foreground">{delivery.error.message}</span>
+      {delivery.failed?.reason !== undefined && (
+        <span className="text-xs text-muted-foreground">{delivery.failed.reason}</span>
       )}
     </div>
   );
@@ -929,7 +941,11 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           </MessageContent>
         </div>
         {bubble.pending && bubble.delivery !== undefined && (
-          <PendingDeliveryFooter tempId={bubble.itemId} delivery={bubble.delivery} />
+          <PendingDeliveryFooter
+            tempId={bubble.itemId}
+            delivery={bubble.delivery}
+            sentAtMs={bubble.createdAtS !== undefined ? bubble.createdAtS * 1000 : 0}
+          />
         )}
         {/* 40%-visible on touch, hover/focus-reveal on desktop. */}
         <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">

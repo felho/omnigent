@@ -168,6 +168,9 @@ class _Entry:
     background_titles_enabled: bool = True
     # Lambda (not ``_now`` directly) so a monkeypatched ``_now`` is
     # resolved at construction time rather than bound at class def.
+    # Set by :func:`claim_forward` once a request owns the terminal paste for
+    # this entry; a concurrent re-send of the same submission then skips it.
+    forwarded: bool = False
     created_at: float = field(default_factory=lambda: _now())
 
 
@@ -285,6 +288,32 @@ def resolve(conversation_id: str, pending_id: str) -> None:
         entries.pop(pending_id, None)
         if not entries:
             _pending.pop(conversation_id, None)
+
+
+def claim_forward(conversation_id: str, pending_id: str) -> bool:
+    """
+    Claim the terminal forward for a pending entry.
+
+    Two requests carrying the same ``stable_id`` can both pass the duplicate
+    pre-check while neither has recorded yet (the client re-sent while the
+    first request was still preparing the pane). Both then get the same entry
+    from :func:`record`; exactly one caller wins here and pastes the prompt,
+    the other answers with the shared pending id and pastes nothing.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param pending_id: The id returned by :func:`record`.
+    :returns: ``True`` when this caller should forward: the entry was not yet
+        claimed, or it is gone (nothing to dedupe against). ``False`` when a
+        concurrent request already owns the forward.
+    """
+    with _lock:
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        if entry is None:
+            return True
+        if entry.forwarded:
+            return False
+        entry.forwarded = True
+        return True
 
 
 def pending_id_for(conversation_id: str, stable_id: str) -> str | None:

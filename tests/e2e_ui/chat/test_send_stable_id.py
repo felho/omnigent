@@ -94,9 +94,10 @@ def test_lost_first_post_is_resent_with_the_same_stable_id(
     browser reports as a thrown fetch ("Failed to fetch"). The client must:
 
     1. Keep the message in the transcript as a pending bubble.
-    2. Re-POST on its own with the *same* ``stable_id``, so the server can
-       dedupe if the first request did land.
-    3. Show no error pill and leave the composer empty.
+    2. Re-POST once on its own with the *same* ``stable_id`` to learn whether
+       the first request landed (the server dedupes on it).
+    3. Never show it as failed when that check succeeds: no error pill, no
+       "Failed" footer, and the composer is left empty.
     """
     base_url, session_id = seeded_session
     page.goto(f"{base_url}/c/{session_id}")
@@ -123,7 +124,7 @@ def test_lost_first_post_is_resent_with_the_same_stable_id(
     )
     expect(bubble).to_be_visible(timeout=10_000)
 
-    # The re-send is automatic and immediate; wait for it to reach the wire.
+    # The check re-send is automatic, about a second later; wait for the wire.
     for _ in range(50):
         if len(bodies) >= 2:
             break
@@ -132,9 +133,11 @@ def test_lost_first_post_is_resent_with_the_same_stable_id(
     stable_ids = {json.loads(body)["data"]["stable_id"] for body in bodies}
     assert len(stable_ids) == 1, f"re-send changed the stable_id: {stable_ids}"
 
-    # Never surfaced as a failure: no error pill, the text stays in the
-    # transcript (once, not duplicated), and the composer was left alone.
+    # Never surfaced as a failure: no error pill, no "Failed" footer, the text
+    # stays in the transcript (once, not duplicated), and the composer was
+    # left alone.
     expect(page.locator('[data-testid="error-pill"]')).to_have_count(0)
+    expect(page.locator('[data-testid="send-delivery"][data-state="failed"]')).to_have_count(0)
     expect(bubble).to_have_count(1)
     expect(composer).to_have_value("")
 
@@ -145,11 +148,11 @@ def test_parked_send_survives_a_reload(
 ) -> None:
     """A send that could not reach the server comes back after a reload.
 
-    Every ``POST /events`` is aborted at the network layer until the page has
-    been reloaded, so the send parks ("Sending · Retry · Cancel"). After the
-    reload the message must still be in the transcript, and once the network
-    is back it must be re-sent with the *same* ``stable_id`` — not lost, and
-    not duplicated.
+    Every ``POST /events`` is aborted at the network layer until the network
+    is "back", so the send and its automatic check both fail and, after 20 s,
+    the bubble reads "Failed · Retry · Cancel". After a reload the message
+    must still be in the transcript, and once the network is back it must be
+    re-sent with the *same* ``stable_id`` — not lost, and not duplicated.
     """
     base_url, session_id = seeded_session
     page.goto(f"{base_url}/c/{session_id}")
@@ -178,14 +181,17 @@ def test_parked_send_survives_a_reload(
         has_text=_RELOAD_TEXT
     )
     expect(bubble).to_be_visible(timeout=10_000)
-    expect(page.locator('[data-testid="send-delivery"][data-state="stalled"]')).to_be_visible(
-        timeout=15_000
+    expect(page.locator('[data-testid="send-delivery"][data-state="failed"]')).to_be_visible(
+        timeout=30_000
     )
 
     page.reload()
-    # Still here after the reload, still parked (the network is still down).
+    # Still here after the reload, still failed (the network is still down):
+    # the revived send is re-sent once, and that attempt is aborted too.
     expect(bubble).to_be_visible(timeout=15_000)
-    expect(page.locator('[data-testid="send-delivery"]')).to_be_visible(timeout=15_000)
+    expect(page.locator('[data-testid="send-delivery"][data-state="failed"]')).to_be_visible(
+        timeout=15_000
+    )
 
     # Network back: the revived send goes through with the original id.
     state["block"] = False

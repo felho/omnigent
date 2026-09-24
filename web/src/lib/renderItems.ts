@@ -159,10 +159,10 @@ export type RenderItem =
 export interface PendingDelivery {
   /** The server accepted the POST; the bubble now waits for its consumed event. */
   posted: boolean;
-  /** The send's own short retries all threw; the background loop owns it now. */
-  stalled: boolean;
-  /** The server refused the send (a 4xx, or the runner-unavailable 503). */
-  error?: { message: string; code: string };
+  /** The send failed; `reason` is the server's message when it refused it,
+   *  `attempts` how many deliveries have failed (a thrown fetch is checked
+   *  once automatically before the bubble reads "Failed"). */
+  failed?: { reason?: string; attempts: number };
 }
 
 /** A bubble cluster. The page maps over these. */
@@ -1839,12 +1839,12 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       a.createdBy !== b.createdBy ||
       a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||
-      // The delivery footer is driven by these; a stalled or refused send
+      // The delivery footer is driven by these; a failed send
       // must re-render even though the message content is unchanged.
       a.delivery?.posted !== b.delivery?.posted ||
-      a.delivery?.stalled !== b.delivery?.stalled ||
-      a.delivery?.error?.message !== b.delivery?.error?.message ||
-      a.delivery?.error?.code !== b.delivery?.error?.code ||
+      (a.delivery?.failed === undefined) !== (b.delivery?.failed === undefined) ||
+      a.delivery?.failed?.reason !== b.delivery?.failed?.reason ||
+      a.delivery?.failed?.attempts !== b.delivery?.failed?.attempts ||
       a.content.length !== b.content.length
     )
       return false;

@@ -12098,3 +12098,81 @@ async def test_native_duplicate_message_post_does_not_repaste_the_prompt(
             assert pastes() == 1
         finally:
             pending_inputs.reset_for_tests()
+
+
+async def test_native_concurrent_duplicate_posts_paste_once(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Two overlapping POSTs with one stable_id paste the prompt exactly once.
+
+    The client re-sends while the first request is still preparing the pane,
+    so both pass the duplicate pre-check before either has recorded. Both
+    must answer 202 with the same pending id and the pane must receive the
+    prompt once.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+
+    runner_requests: list[httpx.Request] = []
+
+    def runner_handler(request: httpx.Request) -> httpx.Response:
+        runner_requests.append(request)
+        return httpx.Response(202, json={})
+
+    async def slow_ensure(*_args: object, **_kwargs: object) -> _NativeTerminalEnsureOutcome:
+        # Long enough for both requests to be inside the pane-ready wait at once.
+        await asyncio.sleep(0.05)
+        return _NativeTerminalEnsureOutcome(error=None)
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._ensure_native_terminal_ready",
+        slow_ensure,
+    )
+    monkeypatch.setattr(
+        sessions_module, "_ensure_runner_session_initialized", AsyncMock(return_value=True)
+    )
+    message = {
+        "type": "message",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "paste me once"}],
+            "stable_id": "c" * 32,
+        },
+    }
+    pending_inputs.reset_for_tests()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner_handler), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(
+            "omnigent.server.routes._sessions.orchestration._get_runner_client",
+            AsyncMock(return_value=runner),
+        )
+        agent = await create_test_agent(client, name="claude-native-ui")
+        created = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "labels": {"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"},
+            },
+        )
+        assert created.status_code == 201, created.text
+        session_id = created.json()["id"]
+        events_url = f"/v1/sessions/{session_id}/events"
+        try:
+            first, second = await asyncio.gather(
+                client.post(events_url, json=message),
+                client.post(events_url, json=message),
+            )
+            assert first.status_code == 202, first.text
+            assert second.status_code == 202, second.text
+            assert first.json() == second.json()
+            assert "pending_id" in first.json()
+            pastes = [
+                r for r in runner_requests if r.method == "POST" and r.url.path == events_url
+            ]
+            assert len(pastes) == 1
+        finally:
+            pending_inputs.reset_for_tests()

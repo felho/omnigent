@@ -6506,6 +6506,11 @@ async def _dispatch_session_event_to_runner_impl(
         # dropping the first message). model_override alone is applied only
         # at spawn, so the in-band switch is what makes routing take on an
         # already-running pane.
+        # A concurrent re-send of this submission (same stable_id; the client
+        # gave up on the first request while the pane was still being
+        # prepared) shares the entry recorded above; only one may paste.
+        if pending_id is not None and not pending_inputs.claim_forward(session_id, pending_id):
+            return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
         forwarded = False
         try:
             await _forward_native_terminal_message(

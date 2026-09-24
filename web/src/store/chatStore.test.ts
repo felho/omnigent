@@ -2860,7 +2860,7 @@ describe("chatStore — send (first-send ordering)", () => {
     const state = useChatStore.getState();
     expect(state.pendingUserMessages).toHaveLength(1);
     expect(state.pendingUserMessages[0]!.posted).toBeUndefined();
-    expect(state.pendingUserMessages[0]!.sendError).toBeDefined();
+    expect(state.pendingUserMessages[0]!.failed).toBeDefined();
     expect(state.failedSendDraft).toBeNull();
     expect(state.status).toBe("idle");
   });
@@ -2899,9 +2899,9 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(state.pendingUserMessages).toHaveLength(1);
     // Friendly, retryable copy — NOT the server's terse "No runner bound for
     // session" — and no raw code.
-    expect(state.pendingUserMessages[0]!.sendError).toEqual({
-      message: "The runner didn't come online in time. Please try again.",
-      code: "",
+    expect(state.pendingUserMessages[0]!.failed).toEqual({
+      reason: "The runner didn't come online in time. Please try again.",
+      attempts: 1,
     });
     expect(state.blocks.filter((b) => b.type === "error")).toHaveLength(0);
   });
@@ -2930,9 +2930,9 @@ describe("chatStore — send (first-send ordering)", () => {
     await useChatStore.getState().send("hi", "agent_xyz");
 
     const state = useChatStore.getState();
-    expect(state.pendingUserMessages[0]!.sendError).toEqual({
-      message: "boom on the server",
-      code: "internal_error",
+    expect(state.pendingUserMessages[0]!.failed).toEqual({
+      reason: "boom on the server",
+      attempts: 1,
     });
     expect(state.blocks.filter((b) => b.type === "error")).toHaveLength(0);
   });
@@ -3196,10 +3196,9 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     // Without the fix the entry stays "streaming" forever with no latch; the
     // fix arms the latch on the hydrating send and runs the failure-settle.
     expect(real.status).toBe("idle");
-    // The failure is surfaced on the retained bubble, not swallowed.
-    expect(real.pendingUserMessages).toHaveLength(1);
-    expect(real.pendingUserMessages[0]!.sendError).toMatchObject({ message: "boom" });
-    expect(real.blocks.filter((b) => b.type === "error")).toHaveLength(0);
+    expect(real.pendingUserMessages).toEqual([]);
+    // The failure is surfaced, not swallowed.
+    expect(real.blocks.filter((b) => b.type === "error")).toHaveLength(1);
   });
 
   it("B1: a policy-denied first message settles to idle", async () => {
@@ -4224,7 +4223,7 @@ describe("chatStore — send while streaming (queueing)", () => {
     // not yet accepted by the server.
     expect(state.pendingUserMessages).toHaveLength(1);
     expect(state.pendingUserMessages[0]!.posted).toBeUndefined();
-    expect(state.pendingUserMessages[0]!.sendError).toBeDefined();
+    expect(state.pendingUserMessages[0]!.failed).toBeDefined();
     // Active response state is unchanged — failures while queueing
     // must not poison the still-streaming prior response's lifecycle.
     expect(state.status).toBe("streaming");
@@ -4452,7 +4451,7 @@ describe("chatStore — send while streaming (queueing)", () => {
     expect(state.blocks.filter((b) => b.type === "error")).toHaveLength(0);
     // The bubble stays in the transcript with the reason and a Retry.
     expect(state.pendingUserMessages).toHaveLength(1);
-    expect(state.pendingUserMessages[0]!.sendError).toMatchObject({ message: "network down" });
+    expect(state.pendingUserMessages[0]!.failed).toEqual({ reason: "network down", attempts: 1 });
     // The in-flight turn keeps its lifecycle: not failed, not settled.
     expect(state.activeResponse).toEqual({
       responseId: "resp_in_flight",
@@ -5210,7 +5209,7 @@ describe("chatStore — send (file attachments)", () => {
     await useChatStore.getState().send("look at this", "agent_xyz", [file]);
     expect(uploads).toBe(1);
     const refused = useChatStore.getState().pendingUserMessages[0]!;
-    expect(refused.sendError).toBeDefined();
+    expect(refused.failed).toBeDefined();
 
     // Retry re-delivers the same bubble → cached upload is reused, and the
     // bubble is now accepted.
@@ -5220,7 +5219,7 @@ describe("chatStore — send (file attachments)", () => {
     const state = useChatStore.getState();
     expect(state.pendingUserMessages).toHaveLength(1);
     expect(state.pendingUserMessages[0]).toMatchObject({ tempId: refused.tempId, posted: true });
-    expect(state.pendingUserMessages[0]!.sendError).toBeUndefined();
+    expect(state.pendingUserMessages[0]!.failed).toBeUndefined();
   });
 
   it("keeps the message in the transcript when the upload is rejected", async () => {
@@ -5251,7 +5250,7 @@ describe("chatStore — send (file attachments)", () => {
 
     const state = useChatStore.getState();
     expect(state.pendingUserMessages).toHaveLength(1);
-    expect(state.pendingUserMessages[0]!.sendError?.message).toContain(
+    expect(state.pendingUserMessages[0]!.failed?.reason).toContain(
       "Unsupported attachment type 'application/zip'",
     );
     expect(state.failedSendDraft).toBeNull();
@@ -5289,11 +5288,11 @@ describe("chatStore — send (file attachments)", () => {
     const state = useChatStore.getState();
     expect(state.failedSendDraft).toBeNull();
     expect(state.pendingUserMessages).toHaveLength(1);
-    expect(state.pendingUserMessages[0]!.sendError).toBeDefined();
+    expect(state.pendingUserMessages[0]!.failed).toBeDefined();
   });
 });
 
-describe("chatStore — send (lost response re-send)", () => {
+describe("chatStore — send (failed send)", () => {
   // Every POST body for conv_existing, in order; the handler fails the first
   // `failures` of them the way a dropped connection does (thrown TypeError).
   function installFlakyPost(failures: number, response: () => Response): unknown[] {
@@ -5317,7 +5316,15 @@ describe("chatStore — send (lost response re-send)", () => {
   const stableIdsOf = (bodies: unknown[]): Set<string> =>
     new Set(bodies.map((b) => (b as { data: { stable_id: string } }).data.stable_id));
 
+  const committed = (itemId: string, text: string): UserMessageBlock =>
+    ({
+      type: "user_message",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId },
+      content: [{ type: "input_text", text }],
+    }) as UserMessageBlock;
+
   beforeEach(() => {
+    vi.useFakeTimers();
     sessionStorage.clear();
     useChatStore.setState({
       conversationId: "conv_existing",
@@ -5330,142 +5337,167 @@ describe("chatStore — send (lost response re-send)", () => {
     });
   });
 
-  it("re-sends a thrown fetch at once with the same stable_id and never shows it as a failure", async () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("keeps a thrown fetch as a pending bubble and re-sends once to check whether it landed", async () => {
+    const bodies = installFlakyPost(Infinity, () => mockResponse({ queued: true }));
+
+    await useChatStore.getState().send("are you there?", "agent_xyz");
+
+    let state = useChatStore.getState();
+    // One attempt so far. The bubble stays; nothing is rolled back or restored.
+    expect(bodies).toHaveLength(1);
+    expect(state.pendingUserMessages[0]).toMatchObject({ failed: { attempts: 1 } });
+    expect(state.pendingUserMessages[0]!.posted).toBeUndefined();
+    expect(state.blocks.filter((b) => b.type === "error")).toHaveLength(0);
+    expect(state.failedSendDraft).toBeNull();
+    expect(state.status).toBe("idle");
+
+    // The automatic check: one more POST with the same stable id, then no more.
+    await vi.advanceTimersByTimeAsync(1_000);
+    state = useChatStore.getState();
+    expect(bodies).toHaveLength(2);
+    expect(stableIdsOf(bodies).size).toBe(1);
+    expect(state.pendingUserMessages[0]).toMatchObject({ failed: { attempts: 2 } });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(bodies).toHaveLength(2);
+  });
+
+  it("clears the bubble when the check learns the message had landed", async () => {
+    // The first attempt landed and only its response was lost: the stream
+    // already delivered the committed copy, so the dedup 2xx drops the bubble.
+    useChatStore.setState({ blocks: [committed("msg_landed", "are you there?")] });
     const bodies = installFlakyPost(1, () => mockResponse({ queued: true, item_id: "msg_landed" }));
 
     await useChatStore.getState().send("are you there?", "agent_xyz");
+    expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1_000);
 
     const state = useChatStore.getState();
     expect(bodies).toHaveLength(2);
-    expect(stableIdsOf(bodies).size).toBe(1);
-    expect(state.pendingUserMessages).toHaveLength(1);
-    expect(state.pendingUserMessages[0]).toMatchObject({ posted: true, stalled: false });
-    expect(state.pendingUserMessages[0]!.sendError).toBeUndefined();
-    expect(state.blocks.filter((b) => b.type === "error")).toHaveLength(0);
-    expect(state.failedSendDraft).toBeNull();
-    expect(state.status).toBe("streaming");
-  });
-
-  it("drops the bubble when the re-send is answered with an item already in the transcript", async () => {
-    // The first attempt landed and only its response was lost: the stream
-    // already delivered the committed copy, so the dedup 2xx must not leave a
-    // duplicate optimistic bubble behind.
-    useChatStore.setState({
-      blocks: [
-        {
-          type: "user_message",
-          ctx: {
-            agent: null,
-            depth: 0,
-            turn: 0,
-            timestamp: 0,
-            responseId: "",
-            itemId: "msg_landed",
-          },
-          content: [{ type: "input_text", text: "are you there?" }],
-        } as UserMessageBlock,
-      ],
-    });
-    installFlakyPost(1, () => mockResponse({ queued: true, item_id: "msg_landed" }));
-
-    await useChatStore.getState().send("are you there?", "agent_xyz");
-
-    const state = useChatStore.getState();
     expect(state.pendingUserMessages).toEqual([]);
     expect(state.blocks.filter((b) => b.type === "user_message")).toHaveLength(1);
+    expect(readPendingSends("conv_existing")).toEqual([]);
   });
 
-  it("parks a send whose retries all throw, then Retry re-sends it and Cancel drops it", async () => {
-    vi.useFakeTimers();
-    try {
-      const bodies = installFlakyPost(Infinity, () => mockResponse({ queued: true }));
+  it("Retry re-sends the same stable_id and re-arms the turn; Cancel drops the bubble", async () => {
+    installFlakyPost(Infinity, () => mockResponse({ queued: true }));
+    await useChatStore.getState().send("still there?", "agent_xyz");
+    await vi.advanceTimersByTimeAsync(1_000);
+    const bubble = useChatStore.getState().pendingUserMessages[0]!;
+    expect(bubble.failed).toEqual({ attempts: 2 });
+    // Remembered for this tab so a reload can revive it.
+    expect(readPendingSends("conv_existing")).toEqual([
+      expect.objectContaining({ stableId: bubble.stableId }),
+    ]);
 
-      const sending = useChatStore.getState().send("still there?", "agent_xyz");
-      // Immediate retry, then 1 s, 2 s, 4 s: five attempts before parking.
-      await vi.advanceTimersByTimeAsync(8_000);
-      await sending;
+    const bodies = installFlakyPost(0, () =>
+      mockResponse({ queued: true, pending_id: "pending_1" }),
+    );
+    await useChatStore.getState().retryPendingSend(bubble.tempId);
+    const state = useChatStore.getState();
+    expect(stableIdsOf(bodies)).toEqual(new Set([bubble.stableId]));
+    expect(state.pendingUserMessages[0]).toMatchObject({ tempId: bubble.tempId, posted: true });
+    expect(state.pendingUserMessages[0]!.failed).toBeUndefined();
+    expect(state.status).toBe("streaming");
+    expect(readPendingSends("conv_existing")).toEqual([]);
 
-      let state = useChatStore.getState();
-      expect(bodies).toHaveLength(5);
-      expect(stableIdsOf(bodies).size).toBe(1);
-      const bubble = state.pendingUserMessages[0]!;
-      expect(bubble).toMatchObject({ stalled: true });
-      expect(bubble.posted).toBeUndefined();
-      expect(bubble.sendError).toBeUndefined();
-      // Parked: no working shimmer, no error block, composer untouched.
-      expect(state.status).toBe("idle");
-      expect(state.blocks.filter((b) => b.type === "error")).toHaveLength(0);
-      expect(state.failedSendDraft).toBeNull();
-
-      // The background loop keeps trying while the tab is open.
-      await vi.advanceTimersByTimeAsync(15_000);
-      expect(bodies).toHaveLength(6);
-
-      // Retry from the footer re-sends the same id; once accepted the bubble
-      // is posted and the turn shimmer is re-armed.
-      installFlakyPost(0, () => mockResponse({ queued: true, pending_id: "pending_1" }));
-      await useChatStore.getState().retryPendingSend(bubble.tempId);
-      state = useChatStore.getState();
-      expect(state.pendingUserMessages[0]).toMatchObject({
-        tempId: bubble.tempId,
-        posted: true,
-        stalled: false,
-      });
-      expect(state.status).toBe("streaming");
-
-      // A second parked message can be cancelled: bubble gone, loop stopped.
-      const cancelBodies = installFlakyPost(Infinity, () => mockResponse({ queued: true }));
-      const second = useChatStore.getState().send("never mind", "agent_xyz");
-      await vi.advanceTimersByTimeAsync(8_000);
-      await second;
-      const parked = useChatStore.getState().pendingUserMessages.find((p) => p.stalled)!;
-      expect(parked).toBeDefined();
-      const attemptsBeforeCancel = cancelBodies.length;
-      useChatStore.getState().cancelPendingSend(parked.tempId);
-      expect(
-        useChatStore.getState().pendingUserMessages.some((p) => p.tempId === parked.tempId),
-      ).toBe(false);
-      await vi.advanceTimersByTimeAsync(60_000);
-      expect(cancelBodies).toHaveLength(attemptsBeforeCancel);
-    } finally {
-      vi.useRealTimers();
-    }
+    // Cancel drops a failed bubble, forgets it, and stops its pending check.
+    const cancelBodies = installFlakyPost(Infinity, () => mockResponse({ queued: true }));
+    await useChatStore.getState().send("never mind", "agent_xyz");
+    const doomed = useChatStore.getState().pendingUserMessages.find((p) => p.failed !== undefined)!;
+    useChatStore.getState().cancelPendingSend(doomed.tempId);
+    expect(
+      useChatStore.getState().pendingUserMessages.some((p) => p.tempId === doomed.tempId),
+    ).toBe(false);
+    expect(readPendingSends("conv_existing")).toEqual([]);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(cancelBodies).toHaveLength(1);
   });
 
-  it("keeps a parked send across a reload and re-sends it with the same stable_id", async () => {
-    vi.useFakeTimers();
-    try {
-      installFlakyPost(Infinity, () => mockResponse({ queued: true }));
-      const sending = useChatStore.getState().send("survive a reload", "agent_xyz");
-      await vi.advanceTimersByTimeAsync(8_000);
-      await sending;
-      const parked = useChatStore.getState().pendingUserMessages[0]!;
-      expect(parked.stalled).toBe(true);
-      // Parked → remembered for this tab, keyed by the conversation.
-      expect(readPendingSends("conv_existing")).toEqual([
-        expect.objectContaining({ stableId: parked.stableId, content: parked.content }),
-      ]);
+  it("re-sends failed messages once when the browser comes back online", async () => {
+    const bodies = installFlakyPost(2, () => mockResponse({ queued: true, item_id: "msg_online" }));
+    await useChatStore.getState().send("back soon", "agent_xyz");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(bodies).toHaveLength(2);
+    expect(useChatStore.getState().pendingUserMessages[0]!.failed).toEqual({ attempts: 2 });
 
-      // "Reload": tab memory is gone, the network is back, the cold load revives it.
-      useChatStore.setState({ pendingUserMessages: [], status: "idle" });
-      const bodies = installFlakyPost(0, () =>
-        mockResponse({ queued: true, item_id: "msg_revived" }),
-      );
-      rehydratePersistedSends("conv_existing");
-      const revived = useChatStore.getState().pendingUserMessages[0]!;
-      expect(revived).toMatchObject({ stableId: parked.stableId, stalled: true });
-      expect(revived.tempId).not.toBe(parked.tempId);
-      await vi.advanceTimersByTimeAsync(0);
+    window.dispatchEvent(new Event("online"));
+    await vi.advanceTimersByTimeAsync(0);
 
-      const state = useChatStore.getState();
-      expect(bodies).toHaveLength(1);
-      expect(stableIdsOf(bodies)).toEqual(new Set([parked.stableId]));
-      expect(state.pendingUserMessages[0]).toMatchObject({ tempId: revived.tempId, posted: true });
-      expect(state.status).toBe("streaming");
-      expect(readPendingSends("conv_existing")).toEqual([]);
-    } finally {
-      vi.useRealTimers();
-    }
+    expect(bodies).toHaveLength(3);
+    expect(stableIdsOf(bodies).size).toBe(1);
+    expect(useChatStore.getState().pendingUserMessages[0]).toMatchObject({ posted: true });
+  });
+
+  it("keeps a failed send across a reload and re-sends it once on the cold load", async () => {
+    installFlakyPost(Infinity, () => mockResponse({ queued: true }));
+    await useChatStore.getState().send("survive a reload", "agent_xyz");
+    await vi.advanceTimersByTimeAsync(1_000);
+    const failed = useChatStore.getState().pendingUserMessages[0]!;
+    expect(readPendingSends("conv_existing")).toEqual([
+      expect.objectContaining({ stableId: failed.stableId, content: failed.content }),
+    ]);
+
+    // "Reload": tab memory is gone, the network is back, the cold load revives it.
+    useChatStore.setState({ pendingUserMessages: [], status: "idle" });
+    const bodies = installFlakyPost(0, () =>
+      mockResponse({ queued: true, item_id: "msg_revived" }),
+    );
+    rehydratePersistedSends("conv_existing");
+    const revived = useChatStore.getState().pendingUserMessages[0]!;
+    expect(revived).toMatchObject({ stableId: failed.stableId, failed: { attempts: 1 } });
+    expect(revived.tempId).not.toBe(failed.tempId);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const state = useChatStore.getState();
+    expect(bodies).toHaveLength(1);
+    expect(stableIdsOf(bodies)).toEqual(new Set([failed.stableId]));
+    expect(state.pendingUserMessages[0]).toMatchObject({ tempId: revived.tempId, posted: true });
+    expect(state.status).toBe("streaming");
+    expect(readPendingSends("conv_existing")).toEqual([]);
+  });
+
+  it("keeps the bubble when the stream re-bind before the POST fails, and Retry re-binds and posts", async () => {
+    // Going offline drops the stream; the next send re-binds it before it can
+    // POST. That failure happens before any request body exists, and it must
+    // still leave a failed bubble rather than an error pill and a restored draft.
+    let offline = true;
+    const bodies: unknown[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (offline && url.includes("/v1/sessions/conv_existing")) {
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }
+      if (url.endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+        bodies.push(JSON.parse(String(init.body)));
+        return Promise.resolve(mockResponse({ queued: true, item_id: "msg_rebound" }));
+      }
+      return defaultFetchHandler(input, init);
+    });
+    useChatStore.setState({ abortController: null });
+
+    await useChatStore.getState().send("after a drop", "agent_xyz");
+
+    let state = useChatStore.getState();
+    expect(bodies).toHaveLength(0);
+    expect(state.pendingUserMessages[0]).toMatchObject({ failed: { attempts: 1 } });
+    expect(state.blocks.filter((b) => b.type === "error")).toHaveLength(0);
+    expect(state.failedSendDraft).toBeNull();
+    // The automatic check fails the same way.
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(useChatStore.getState().pendingUserMessages[0]!.failed).toEqual({ attempts: 2 });
+
+    offline = false;
+    await useChatStore
+      .getState()
+      .retryPendingSend(useChatStore.getState().pendingUserMessages[0]!.tempId);
+    state = useChatStore.getState();
+    expect(bodies).toHaveLength(1);
+    expect(state.pendingUserMessages[0]).toMatchObject({ posted: true });
+    expect(state.pendingUserMessages[0]!.failed).toBeUndefined();
   });
 
   it("does not revive a remembered send the server already shows", () => {
@@ -5483,17 +5515,56 @@ describe("chatStore — send (lost response re-send)", () => {
     persistPendingSend("conv_existing", { stableId: "e".repeat(32), content });
     useChatStore.setState({
       pendingUserMessages: [],
-      blocks: [
-        {
-          type: "user_message",
-          ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: "msg_c" },
-          content,
-        } as UserMessageBlock,
-      ],
+      blocks: [committed("msg_c", "already there")],
     });
     rehydratePersistedSends("conv_existing");
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
     expect(readPendingSends("conv_existing")).toEqual([]);
+  });
+
+  it("acknowledges receipts against the live queue first and a failed bubble only by exact match", () => {
+    // A genuinely failed first message must not swallow the receipt for a
+    // later message that went through, and a receipt for the failed message
+    // itself (its response was lost) must still clear it.
+    useChatStore.setState({
+      pendingUserMessages: [
+        {
+          tempId: "pend_a",
+          stableId: "a".repeat(32),
+          content: [{ type: "input_text", text: "first" }],
+          failed: { attempts: 2 },
+        },
+        { tempId: "pend_b", content: [{ type: "input_text", text: "second" }], posted: true },
+      ],
+    });
+
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "msg_b",
+      itemType: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "second" }] },
+    });
+    let state = useChatStore.getState();
+    expect(state.pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_a"]);
+    expect(
+      state.blocks
+        .filter((b): b is UserMessageBlock => b.type === "user_message")
+        .map((b) => b.ctx.itemId),
+    ).toEqual(["msg_b"]);
+
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "msg_a",
+      itemType: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "first" }] },
+    });
+    state = useChatStore.getState();
+    expect(state.pendingUserMessages).toEqual([]);
+    expect(
+      state.blocks
+        .filter((b): b is UserMessageBlock => b.type === "user_message")
+        .map((b) => b.ctx.itemId),
+    ).toEqual(["msg_b", "msg_a"]);
   });
 });
 

@@ -471,10 +471,15 @@ async def test_pi_worker_inherits_claude_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A claude id IS inherited onto a pi worker: pi routes a validated id to the
-    provider its launch configured (see ``_pi_provider_for_model``), so the
-    dispatch gate does not second-guess servability. Normalization localizes
-    the bare id for the child's resolved provider.
+    A claude id IS inherited onto a pi worker — a deliberate scope decision,
+    not a claim that every pi configuration can serve it. Pi routes claude
+    ids to its Databricks anthropic surface
+    (``{workspace}/serving-endpoints/anthropic``; see
+    ``_pi_provider_for_model``), and the configuration without that surface
+    (a generic OpenAI-compatible gateway with no Databricks credentials)
+    cannot launch pi at all, so servability there is launch's fail-loud
+    concern rather than this dispatch gate's. Normalization localizes the
+    bare id for the child's resolved provider.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """

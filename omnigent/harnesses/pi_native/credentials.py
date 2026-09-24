@@ -23,7 +23,6 @@ import json
 import logging
 import os
 import re
-import shlex
 import subprocess
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -787,15 +786,19 @@ def _run_auth_command(auth_command: str, *, timeout: float = 15.0) -> str | None
     one-shot model-catalog API call. Returns ``None`` on any failure so
     callers can fall back gracefully.
 
+    Runs through the shell, as Pi runs a ``!command`` apiKey, so pipelines,
+    quoting and ``~`` behave here exactly as they do at request time.
+
     :param auth_command: Shell command string, e.g.
-        ``"jq -r .access_token /path/token.json"``.
+        ``"jq -r .access_token ~/token.json"``.
     :param timeout: Maximum seconds to wait for the command.
     :returns: Stripped stdout (the token), or ``None`` when the command
         fails, times out, or produces empty output.
     """
     try:
         result = subprocess.run(
-            shlex.split(auth_command),
+            auth_command,
+            shell=True,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -1577,12 +1580,21 @@ def _inline_family_pi_provider(
         # deliberate shortlist, so both keep the single-family config below.
         declared_surface = _databricks_workspace_gateway_surface(family.base_url)
         if declared_surface is not None and not preserve_model_ids and not curated_models:
+            # The configured default keeps its declared surface and limits when
+            # it is picked explicitly too (the picker offers it by that surface).
+            default_tier = entry.family_default_model(family_name)
+            configured_default = (
+                re.sub(r"\[.*?\]$", "", family.resolve_model_tier(default_tier))
+                if default_tier
+                else None
+            )
+            is_configured_default = model is None or resolved_model == configured_default
             enumerated = _databricks_gateway_pi_provider(
                 gateway_base_url=family.base_url,
                 model=resolved_model,
                 auth_command=family.auth_command,
                 static_api_key=family.api_key,
-                declared_surface=declared_surface if model is None else None,
+                declared_surface=declared_surface if is_configured_default else None,
                 configured_context_window=family.context_window,
                 configured_max_output_tokens=family.max_output_tokens,
             )

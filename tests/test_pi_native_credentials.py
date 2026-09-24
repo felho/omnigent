@@ -446,6 +446,42 @@ def test_inline_databricks_gateway_keeps_configured_limits_on_default(
     assert entry["maxTokens"] == 8192
 
 
+def test_inline_databricks_gateway_picking_omitted_default_keeps_its_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selecting the configured default from the picker launches on its declared surface.
+
+    With a partial listing the picker offers the omitted default under
+    ``omnigent-openai``; resolving that explicit selection must register it there
+    too, not on a surface guessed from its name.
+    """
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: ([{"id": "system.ai.claude-opus-5"}], [], [], []),
+    )
+    config = _databricks_openai_gateway_config()
+
+    options = creds.pi_native_model_options(config_loader=lambda: config)
+    option = next(o for o in options if o["id"] == "omnigent-openai/system.ai.gpt-5")
+
+    provider = creds.resolve_pi_native_provider(
+        model=option["model"], config_loader=lambda: config
+    )
+
+    assert provider is not None
+    assert provider.model == "system.ai.gpt-5"
+    rendered = provider.to_models_config()["providers"]
+    assert "omnigent-mlflow" not in rendered
+    assert [m["id"] for m in rendered["omnigent-openai"]["models"]] == ["system.ai.gpt-5"]
+
+
+def test_run_auth_command_uses_the_shell() -> None:
+    """An inline ``auth_command`` may use shell syntax; the listing token honors it."""
+    assert creds._run_auth_command("printf 'tok' | tr a-z A-Z") == "TOK"
+    assert creds._run_auth_command("exit 3") is None
+
+
 def test_inline_dedicated_gateway_host_stays_single_family(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

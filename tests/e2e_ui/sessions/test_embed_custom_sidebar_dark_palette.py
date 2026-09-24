@@ -105,7 +105,9 @@ _HOST_VITE_CONFIG = """\
 // walking up from this directory; "react-router" (a transitive dep of
 // react-router-dom, not hoisted by pnpm) is aliased to the copy
 // react-router-dom itself resolves, so the island and the host share one
-// router instance exactly like the monolith build.
+// router instance exactly like the monolith build. The "react-router/dom"
+// subpath is aliased to its resolved file first: the bare directory alias
+// bypasses the package's export map, where the subpath has no on-disk twin.
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -115,12 +117,13 @@ const webDir = path.resolve(here, "../..");
 const requireFromWeb = createRequire(path.join(webDir, "package.json"));
 const requireFromRrd = createRequire(requireFromWeb.resolve("react-router-dom/package.json"));
 const reactRouterDir = path.dirname(requireFromRrd.resolve("react-router/package.json"));
+const reactRouterDom = requireFromRrd.resolve("react-router/dom");
 
 export default {
   base: "/embed-host/",
   define: { "process.env.NODE_ENV": '"production"' },
   resolve: {
-    alias: { "react-router": reactRouterDir },
+    alias: { "react-router/dom": reactRouterDom, "react-router": reactRouterDir },
   },
   build: {
     outDir: "dist",

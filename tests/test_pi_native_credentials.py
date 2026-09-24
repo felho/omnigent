@@ -265,6 +265,152 @@ def test_inline_databricks_gateway_respects_curated_tiers(
     assert [m["id"] for m in provider.extra_models] == ["system.ai.gpt-5", "system.ai.gpt-5-mini"]
 
 
+def test_inline_databricks_gateway_enumerates_only_the_selected_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Family priority is unchanged: a working first family is never overridden.
+
+    With no override the Anthropic family leads, so a vendor-direct Anthropic
+    key wins and the OpenAI family's Databricks gateway is never listed. A GPT
+    override selects the OpenAI family, and only then is the gateway enumerated.
+    """
+    listings: list[str] = []
+
+    def _listing(host: str, token: str):
+        listings.append(host)
+        return ([{"id": "system.ai.claude-opus-5"}], [{"id": "system.ai.gpt-5"}], [], [])
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _listing)
+    config = {
+        "providers": {
+            "mixed": {
+                "kind": "gateway",
+                "default": "pi",
+                "anthropic": {
+                    "base_url": "https://api.anthropic.com",
+                    "api_key": "sk-ant",
+                    "models": {"default": "claude-opus-4-8"},
+                },
+                "openai": {
+                    "base_url": "https://wkspc.cloud.databricks.com/ai-gateway/codex/v1",
+                    "api_key": "gw-token",
+                    "wire_api": "responses",
+                    "models": {"default": "system.ai.gpt-5"},
+                },
+            }
+        }
+    }
+
+    default = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert default is not None
+    assert default.base_url == "https://api.anthropic.com"
+    assert not default.additional_providers
+    assert listings == []
+
+    override = creds.resolve_pi_native_provider(
+        model="system.ai.gpt-5", config_loader=lambda: config
+    )
+    assert override is not None
+    assert override.base_url == "https://wkspc.cloud.databricks.com/ai-gateway/anthropic"
+    assert override.model == "system.ai.gpt-5"
+    assert "omnigent-openai" in override.additional_providers
+    assert listings == ["https://wkspc.cloud.databricks.com"]
+
+
+def test_inline_databricks_gateway_leaves_unused_family_secret_unresolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later family's unset secret is not expanded when an earlier family wins."""
+    monkeypatch.delenv("OMNIGENT_TEST_UNSET_GATEWAY_KEY", raising=False)
+    config = {
+        "providers": {
+            "mixed": {
+                "kind": "gateway",
+                "default": "pi",
+                "anthropic": {
+                    "base_url": "https://api.anthropic.com",
+                    "api_key": "sk-ant",
+                    "models": {"default": "claude-opus-4-8"},
+                },
+                "openai": {
+                    "base_url": "https://wkspc.cloud.databricks.com/ai-gateway/codex/v1",
+                    "api_key": "$OMNIGENT_TEST_UNSET_GATEWAY_KEY",
+                    "models": {"default": "system.ai.gpt-5"},
+                },
+            }
+        }
+    }
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+
+    assert provider is not None
+    assert provider.base_url == "https://api.anthropic.com"
+    assert provider.api_key == "sk-ant"
+
+
+def test_inline_databricks_gateway_mlflow_url_derives_surfaces_from_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An MLflow-surface input still puts Claude on ``/ai-gateway/anthropic``."""
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: (
+            [{"id": "system.ai.claude-opus-5"}],
+            [],
+            [],
+            [{"id": "system.ai.gemini-3-flash"}],
+        ),
+    )
+    config = {
+        "providers": {
+            "oss-gateway": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": "https://wkspc.cloud.databricks.com/ai-gateway/mlflow/v1",
+                    "api_key": "gw-token",
+                    "wire_api": "chat",
+                    "models": {"default": "system.ai.gemini-3-flash"},
+                },
+            }
+        }
+    }
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+
+    assert provider is not None
+    assert provider.base_url == "https://wkspc.cloud.databricks.com/ai-gateway/anthropic"
+    assert provider.model == "system.ai.gemini-3-flash"
+    rendered = provider.to_models_config()["providers"]
+    assert rendered["omnigent-mlflow"]["baseUrl"] == (
+        "https://wkspc.cloud.databricks.com/ai-gateway/mlflow/v1"
+    )
+    assert [m["id"] for m in rendered["omnigent-mlflow"]["models"]] == ["system.ai.gemini-3-flash"]
+
+
+def test_inline_databricks_gateway_partial_listing_keeps_default_on_declared_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A default the listing omits stays on its configured surface, not a guessed one."""
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: ([{"id": "system.ai.claude-opus-5"}], [], [], []),
+    )
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_openai_gateway_config)
+
+    assert provider is not None
+    assert provider.model == "system.ai.gpt-5"
+    rendered = provider.to_models_config()["providers"]
+    assert "omnigent-mlflow" not in rendered
+    assert rendered["omnigent-openai"]["baseUrl"] == (
+        "https://wkspc.cloud.databricks.com/ai-gateway/codex/v1"
+    )
+    assert [m["id"] for m in rendered["omnigent-openai"]["models"]] == ["system.ai.gpt-5"]
+
+
 def test_inline_dedicated_gateway_host_stays_single_family(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

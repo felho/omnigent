@@ -10,7 +10,6 @@ from fastapi import (
     Request,
 )
 
-from omnigent.entities.conversation import ConversationItem, TeammateMessageData
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -44,54 +43,9 @@ from omnigent.server.routes._sessions.orchestration import (
 from omnigent.server.schemas import (
     ChildSessionList,
     PaginatedList,
-    TeammateList,
-    TeammateSummary,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
-
-# Bound the newest-first roster scan for long-running sessions.
-_TEAMMATE_ITEM_SCAN_LIMIT = 500
-_TEAMMATE_PREVIEW_LIMIT = 150
-
-
-def _teammate_preview(text: str) -> str | None:
-    """Collapse *text* to a single truncated preview line, or ``None``."""
-    collapsed = " ".join(text.split())
-    if not collapsed:
-        return None
-    if len(collapsed) <= _TEAMMATE_PREVIEW_LIMIT:
-        return collapsed
-    return collapsed[: _TEAMMATE_PREVIEW_LIMIT - 1].rstrip() + "…"
-
-
-def _teammate_summaries(
-    items: list[ConversationItem],
-    session_id: str,
-) -> list[TeammateSummary]:
-    """Fold newest-first teammate items into status and delivery previews."""
-    summaries: dict[str, TeammateSummary] = {}
-    for item in items:
-        data = item.data
-        if not isinstance(data, TeammateMessageData):
-            continue
-        entry = summaries.get(data.teammate_id)
-        if entry is None:
-            entry = TeammateSummary(
-                teammate_id=data.teammate_id,
-                parent_session_id=session_id,
-                status="idle" if data.kind == "idle" else "active",
-                last_activity_at=item.created_at,
-            )
-            summaries[data.teammate_id] = entry
-        if entry.color is None and data.color:
-            entry.color = data.color
-        if data.kind == "message":
-            if entry.last_message_preview is None:
-                entry.last_message_preview = _teammate_preview(data.text)
-            if entry.last_summary is None and data.summary:
-                entry.last_summary = data.summary
-    return list(summaries.values())
 
 
 def register_items_routes(
@@ -250,50 +204,3 @@ def register_items_routes(
             last_id=page.last_id,
             has_more=page.has_more,
         )
-
-    # ── GET /sessions/{session_id}/teammates ──────────────────────
-
-    @router.get(
-        "/sessions/{session_id}/teammates",
-        response_model=None,
-        responses={200: {"model": TeammateList}},
-    )
-    async def list_teammates(
-        request: Request,
-        session_id: str,
-    ) -> TeammateList:
-        """
-        List harness-internal teammates observed in a session.
-
-        Teammates (today: Claude Code agent teams) run inside the
-        harness process and are not Omnigent sessions, so they never
-        appear in ``child_sessions``. This endpoint folds the session's
-        ``teammate_message`` items — mirrored from the native transcript
-        by the bridge — into one display-only summary per teammate, so
-        the Agents rail can show them alongside real child sessions.
-
-        :param request: Inbound HTTP request; carries the caller
-            identity used to authorize READ on the session.
-        :param session_id: Session/conversation identifier,
-            e.g. ``"conv_abc123"``.
-        :returns: A :class:`TeammateList`; empty when the session has
-            no teammate activity.
-        :raises OmnigentError: 403 if the caller lacks READ on
-            ``session_id``; 404 if no session exists there.
-        """
-        user_id = _get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
-        )
-        if access.conversation is None:
-            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if conv is None:
-                raise _session_not_found()
-        page = await asyncio.to_thread(
-            conversation_store.list_items,
-            session_id,
-            limit=_TEAMMATE_ITEM_SCAN_LIMIT,
-            order="desc",
-            type="teammate_message",
-        )
-        return TeammateList(data=_teammate_summaries(page.data, session_id))

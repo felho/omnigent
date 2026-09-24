@@ -1,6 +1,5 @@
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import { MAX_TREE_DEPTH } from "@/hooks/useChildSessions";
-import type { TeammateInfo } from "@/hooks/useTeammates";
 import { nativeCodingAgentForSubagentWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { childStatus, type AgentActivity } from "./subagentStatus";
 
@@ -187,9 +186,6 @@ export function buildTree(
   };
 }
 
-// Teammates have no session id; graph nodes use a synthetic prefix.
-export const TEAMMATE_NODE_PREFIX = "teammate:";
-
 export function buildGraphLayout(
   rootId: string,
   rootLabel: string,
@@ -198,7 +194,6 @@ export function buildGraphLayout(
   rootPreview: string | null,
   childrenMap: Map<string, ChildSessionInfo[]>,
   activeId: string,
-  teammates: TeammateInfo[] = [],
 ): { nodes: LayoutNode[]; edges: LayoutEdge[] } {
   const tree = buildTree(
     rootId,
@@ -209,16 +204,5 @@ export function buildGraphLayout(
     childrenMap,
     0,
   );
-  // Teammates run inside the root harness and have no children.
-  for (const teammate of teammates) {
-    tree.children.push({
-      id: `${TEAMMATE_NODE_PREFIX}${teammate.teammate_id}`,
-      label: teammate.teammate_id,
-      activity: teammate.status === "idle" ? "idle" : "working",
-      statusLabel: teammate.status === "idle" ? "Idle" : "Working",
-      preview: teammate.last_summary ?? teammate.last_message_preview,
-      children: [],
-    });
-  }
   return layoutTree(tree, activeId);
 }

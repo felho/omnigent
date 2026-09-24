@@ -324,12 +324,11 @@ export function slashCommandEchoItemId(slashItemId: string): string {
   return `${slashItemId}:user`;
 }
 
-/** Teammate delivery; idle and spawn items update the rail without rendering. */
+/** Teammate prose delivery (Claude Code agent teams), rendered as a card. */
 export interface TeammateMessageBlock {
   type: "teammate_message";
   ctx: BlockContext;
   teammateId: string;
-  kind: "message" | "idle" | "spawn";
   text: string;
   summary: string | null;
   color: string | null;

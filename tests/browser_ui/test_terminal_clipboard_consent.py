@@ -295,10 +295,6 @@ def clipboard_browser(
         ),
         empty_list,
     )
-    browser_contract.json(
-        re.compile(rf"/v1/sessions/({'|'.join(map(re.escape, session_ids))})/teammates(?:\?.*)?$"),
-        empty_list,
-    )
     browser_contract.response(
         re.compile(
             rf"/v1/sessions/({'|'.join(map(re.escape, session_ids))})/read-state(?:\?.*)?$"

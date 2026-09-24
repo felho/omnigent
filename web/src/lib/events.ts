@@ -416,7 +416,6 @@ export interface TerminalCommandEvent {
 export interface TeammateMessageEvent {
   type: "teammate_message";
   teammateId: string;
-  kind: "message" | "idle" | "spawn";
   text: string;
   summary: string | null;
   color: string | null;

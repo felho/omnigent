@@ -742,21 +742,17 @@ class TeammateMessageData(BaseModel):
 
     A teammate is spawned inside the harness process (Claude Code's
     ``Agent`` tool with a ``name``) and is not an Omnigent session, so
-    its deliveries reach the parent transcript as ``<teammate-message>``
-    markup on the user channel. The bridge parses that markup into this
-    structured item so the web can render the prose readably, suppress
-    the machine-side idle ping, and list the teammate in the Agents
-    rail. Listed in :data:`NON_CONTENT_ITEM_TYPES` so the agent loop's
-    history filter skips it (native harnesses keep the original markup
-    in their own context).
+    its prose deliveries reach the parent transcript as
+    ``<teammate-message>`` markup on the user channel. The bridge parses
+    that markup into this structured item so the web can render the
+    delivery readably instead of leaking the raw wrapper (and the
+    machine-side idle-notification twin) into the chat as a user bubble.
+    Listed in :data:`NON_CONTENT_ITEM_TYPES` so the agent loop's history
+    filter skips it (native harnesses keep the original markup in their
+    own context).
 
     :param teammate_id: The teammate's name, e.g. ``"buddy"``.
-    :param kind: ``"message"`` for a prose delivery, ``"idle"`` for the
-        machine-side idle notification twin (rendered as no chat
-        bubble), ``"spawn"`` for the parent's spawn call (no delivery
-        text yet — makes a still-working teammate visible in the rail).
-    :param text: Prose body of the delivery; empty for ``idle`` /
-        ``spawn`` items without one.
+    :param text: Prose body of the delivery.
     :param summary: One-line ``summary`` attribute when the delivery
         carried one, else ``None``.
     :param color: Teammate accent color from the markup (e.g.
@@ -764,7 +760,6 @@ class TeammateMessageData(BaseModel):
     """
 
     teammate_id: str
-    kind: Literal["message", "idle", "spawn"] = "message"
     text: str = ""
     summary: str | None = None
     color: str | None = None

@@ -2061,7 +2061,6 @@ describe("buildBubbles — teammate_message items", () => {
         type: "teammate_message",
         ctx: ctx({ itemId: "tm_1", responseId: "resp_tm" }),
         teammateId: "buddy",
-        kind: "message",
         text: "All good here.",
         summary: "All good over here",
         color: "blue",
@@ -2076,32 +2075,6 @@ describe("buildBubbles — teammate_message items", () => {
     expect(teammate.text).toBe("All good here.");
     expect(teammate.summary).toBe("All good over here");
     expect(teammate.itemId).toBe("tm_1");
-  });
-
-  it("idle and spawn blocks render no item — the raw idle JSON was the bug", () => {
-    const blocks: AnyBlock[] = [
-      {
-        type: "teammate_message",
-        ctx: ctx({ itemId: "tm_idle", responseId: "resp_tm" }),
-        teammateId: "buddy",
-        kind: "idle",
-        text: "Waiting for your next message.",
-        summary: null,
-        color: null,
-      },
-      {
-        type: "teammate_message",
-        ctx: ctx({ itemId: "tm_spawn", responseId: "resp_tm" }),
-        teammateId: "scout",
-        kind: "spawn",
-        text: "",
-        summary: null,
-        color: null,
-      },
-    ];
-    const bubbles = buildBubbles(blocks, null);
-    const rendered = bubbles.flatMap((bubble) => (bubble.kind === "assistant" ? bubble.items : []));
-    expect(rendered).toHaveLength(0);
   });
 });
 

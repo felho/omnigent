@@ -156,11 +156,10 @@ export interface TerminalCommandItem extends BaseItem {
   stderr?: string;
 }
 
-/** Display-only teammate item; idle and spawn kinds feed the Agents rail. */
+/** Display-only teammate prose delivery (Claude Code agent teams). */
 export interface TeammateMessageItem extends BaseItem {
   type: "teammate_message";
   teammate_id: string;
-  kind?: "message" | "idle" | "spawn";
   text?: string;
   summary?: string;
   color?: string;

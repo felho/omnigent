@@ -1262,15 +1262,14 @@ def test_read_transcript_items_since_marks_task_notifications_meta(tmp_path: Pat
 
 def test_read_transcript_items_since_parses_teammate_deliveries(tmp_path: Path) -> None:
     """
-    Teammate deliveries become structured items, never raw user bubbles.
+    Teammate prose deliveries become structured items, never raw user bubbles.
 
     A single teammate turn writes one user record carrying CLI framing
     text around two ``<teammate-message>`` blocks: the prose half (with
     a ``summary`` attribute) and the machine-side ``idle_notification``
-    JSON twin. The bridge must emit one ``teammate_message`` item per
-    block — prose as ``kind="message"``, the twin as ``kind="idle"`` —
-    and drop the framing text, so neither the markup nor the JSON can
-    render verbatim in chat.
+    JSON twin. The bridge must emit exactly one ``teammate_message`` item
+    for the prose, drop both the framing text and the idle twin, so
+    neither the markup nor the JSON can render verbatim in chat.
     """
     delivery = (
         "Another Claude session sent a message:\n"
@@ -1303,22 +1302,52 @@ def test_read_transcript_items_since_parses_teammate_deliveries(tmp_path: Path) 
         agent_name="claude-native-ui",
     )
 
-    assert [item.item_type for item in items] == ["teammate_message", "teammate_message"]
+    assert [item.item_type for item in items] == ["teammate_message"]
     assert items[0].data == {
         "teammate_id": "buddy",
         "color": "blue",
         "summary": "All good over here",
-        "kind": "message",
         "text": "All good here. What else do you need?",
     }
-    assert items[1].data == {
-        "teammate_id": "buddy",
-        "color": "blue",
-        "kind": "idle",
-        "text": "Waiting for your next message.",
-    }
-    # Both halves of one delivery share the record's response id.
-    assert items[0].response_id == items[1].response_id
+
+
+def test_read_transcript_items_since_suppresses_idle_only_teammate_record(
+    tmp_path: Path,
+) -> None:
+    """
+    A teammate record carrying only the idle twin emits nothing.
+
+    A teammate can go idle without a prose message; that record is a
+    genuine teammate delivery (so it must not fall back to a raw user
+    bubble) but has no prose to show, so the bridge drops it entirely.
+    """
+    delivery = (
+        "Another Claude session sent a message:\n"
+        '<teammate-message teammate_id="buddy">\n'
+        '{"type":"idle_notification","from":"buddy","idleReason":"available"}\n'
+        "</teammate-message>\n"
+        "This came from another Claude session."
+    )
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "teammate-idle-1",
+                "message": {"role": "user", "content": delivery},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert items == []
 
 
 def test_read_transcript_items_since_keeps_malformed_teammate_markup_as_message(
@@ -1418,14 +1447,13 @@ def test_read_transcript_items_since_keeps_paste_markup_inside_delivery(tmp_path
     assert "quoted text" in str(items[0].data["text"])
 
 
-def test_read_transcript_items_since_marks_teammate_spawn(tmp_path: Path) -> None:
+def test_read_transcript_items_since_does_not_mark_teammate_spawn(tmp_path: Path) -> None:
     """
-    An Agent call carrying ``name`` also emits a ``kind="spawn"`` item.
+    A teammate spawn emits only its ``function_call``, no teammate item.
 
-    The spawn item is what makes a still-working teammate visible in the
-    Agents rail before its first delivery. A classic Task-tool sub-agent
-    call (``subagent_type``, no ``name``) must NOT emit one — those get
-    shadow child sessions through the sub-agent forwarder instead.
+    In-process teammates surface only through their prose deliveries; the
+    spawning ``Agent`` call (with ``name``) and a classic Task-tool
+    sub-agent call (``subagent_type``) both stay ordinary function calls.
     """
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text(
@@ -1485,14 +1513,7 @@ def test_read_transcript_items_since_marks_teammate_spawn(tmp_path: Path) -> Non
         agent_name="claude-native-ui",
     )
 
-    assert [item.item_type for item in items] == [
-        "function_call",
-        "teammate_message",
-        "function_call",
-    ]
-    assert items[1].data == {"teammate_id": "buddy", "kind": "spawn"}
-    # The spawn marker clusters with its own tool call's turn.
-    assert items[1].response_id == items[0].response_id
+    assert [item.item_type for item in items] == ["function_call", "function_call"]
 
 
 def test_read_transcript_items_since_flags_compact_summary(tmp_path: Path) -> None:

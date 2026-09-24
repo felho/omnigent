@@ -1585,17 +1585,14 @@ function buildAssistantItems(
     }
 
     if (b.type === "teammate_message") {
-      // Idle and spawn items update the rail without becoming chat bubbles.
-      if (b.kind === "message") {
-        items.push({
-          kind: "teammate_message",
-          itemId: b.ctx.itemId,
-          teammateId: b.teammateId,
-          text: b.text,
-          summary: b.summary,
-          color: b.color,
-        });
-      }
+      items.push({
+        kind: "teammate_message",
+        itemId: b.ctx.itemId,
+        teammateId: b.teammateId,
+        text: b.text,
+        summary: b.summary,
+        color: b.color,
+      });
       i += 1;
       continue;
     }

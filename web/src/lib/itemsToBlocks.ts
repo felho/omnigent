@@ -477,13 +477,10 @@ function routingDecisionToBlock(item: RoutingDecisionItem): RoutingDecisionBlock
 }
 
 function teammateMessageToBlock(item: TeammateMessageItem): TeammateMessageBlock {
-  // Unknown kinds render as prose rather than vanishing.
-  const kind = item.kind === "idle" || item.kind === "spawn" ? item.kind : "message";
   return {
     type: "teammate_message",
     ctx: ctxFor(item),
     teammateId: item.teammate_id,
-    kind,
     text: typeof item.text === "string" ? item.text : "",
     summary: typeof item.summary === "string" && item.summary ? item.summary : null,
     color: typeof item.color === "string" && item.color ? item.color : null,

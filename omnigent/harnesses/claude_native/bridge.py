@@ -79,9 +79,6 @@ if TYPE_CHECKING:
 from omnigent.inner.hook_scripts.subagent_router import (
     AGENT_TOOL_MATCHER as CLAUDE_SUBAGENT_TOOL_MATCHER,
 )
-from omnigent.inner.hook_scripts.subagent_router import (
-    AGENT_TOOL_NAMES,
-)
 from omnigent.native import native_bridge_common
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
@@ -8060,10 +8057,20 @@ def _teammate_idle_result(body: str) -> str | None:
 
 
 def _teammate_message_payloads(content: str) -> list[_JsonObject] | None:
-    """Parse Claude teammate deliveries; preserve incomplete records as plain messages."""
+    """
+    Parse Claude teammate prose deliveries into ``teammate_message`` payloads.
+
+    Returns one payload per prose ``<teammate-message>`` block. The
+    machine-side ``idle_notification`` twin is dropped so it never renders
+    in chat, so an idle-only record yields an empty list (the caller
+    suppresses it). ``None`` is reserved for a record that isn't a
+    complete teammate delivery (markup drift / partial write), which the
+    caller keeps on the plain-message path.
+    """
     if not content.lstrip().startswith(_TEAMMATE_DELIVERY_PREFIX):
         return None
 
+    matched_block = False
     payloads: list[_JsonObject] = []
     pasted_ranges = [wrapper.span() for wrapper in _PASTED_CONTENT_RE.finditer(content)]
     for match in _TEAMMATE_MESSAGE_RE.finditer(content):
@@ -8073,35 +8080,21 @@ def _teammate_message_payloads(content: str) -> list[_JsonObject] | None:
         teammate_id = attrs.get("teammate_id", "").strip()
         if not teammate_id:
             continue
-        data: _JsonObject = {"teammate_id": teammate_id}
+        matched_block = True
+        body = match.group(2).strip()
+        # Drop the idle-notification twin; only prose deliveries are shown.
+        if _teammate_idle_result(body) is not None:
+            continue
+        data: _JsonObject = {"teammate_id": teammate_id, "text": body}
         color = attrs.get("color", "").strip()
         if color:
             data["color"] = color
         summary = attrs.get("summary", "").strip()
         if summary:
             data["summary"] = summary
-        body = match.group(2).strip()
-        idle_result = _teammate_idle_result(body)
-        if idle_result is not None:
-            data["kind"] = "idle"
-            data["text"] = idle_result
-        else:
-            data["kind"] = "message"
-            data["text"] = body
         payloads.append(data)
-    return payloads or None
-
-
-def _teammate_spawn_payload(tool_name: str, arguments: _JsonObject) -> _JsonObject | None:
-    """Detect named Agent/Task spawns; classic subagents use ``subagent_type``."""
-    if tool_name not in AGENT_TOOL_NAMES:
-        return None
-    if "subagent_type" in arguments:
-        return None
-    name = arguments.get("name")
-    if not isinstance(name, str) or not name.strip():
-        return None
-    return {"teammate_id": name.strip(), "kind": "spawn"}
+    # A matched-but-idle-only record returns [] (suppressed), not None.
+    return payloads if matched_block else None
 
 
 def _local_command_transcript_items_from_entry(
@@ -8620,16 +8613,6 @@ def _assistant_transcript_items_from_entry(
                     response_id=response_id,
                 )
             )
-            spawn_payload = _teammate_spawn_payload(name, arguments)
-            if spawn_payload is not None:
-                items.append(
-                    ClaudeTranscriptItem(
-                        source_id=_source_id(source_key, item_index, "teammate_message"),
-                        item_type="teammate_message",
-                        data=spawn_payload,
-                        response_id=response_id,
-                    )
-                )
     if waking and items:
         items.insert(0, _scheduled_wake_marker_item(source_key, response_id))
     return response_id if items else current_response_id, items

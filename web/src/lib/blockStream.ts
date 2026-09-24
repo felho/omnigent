@@ -703,7 +703,6 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         type: "teammate_message",
         ctx: ctx(state, event.itemId || null, event.responseId || null),
         teammateId: event.teammateId,
-        kind: event.kind,
         text: event.text,
         summary: event.summary,
         color: event.color,

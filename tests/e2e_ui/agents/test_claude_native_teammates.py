@@ -8,7 +8,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import re
 import shutil
 import signal
 import subprocess
@@ -28,7 +27,6 @@ from tests.e2e_ui.conftest import (
     _server_state,
     _temp_omnigent_mock_config,
     configure_mock_llm,
-    open_right_rail,
     reset_mock_llm,
     set_fallback_mock_llm,
 )
@@ -130,11 +128,12 @@ def test_teammate_transcript_reaches_browser_without_claude_cli(
     _cursor, _response_id, items = read_transcript_items_since(
         transcript_path, 0, agent_name="claude-native-ui"
     )
-    assert [item.data["kind"] for item in items if item.item_type == "teammate_message"] == [
-        "spawn",
-        "message",
-        "idle",
-    ]
+    # The spawn is an ordinary function_call; only the prose delivery
+    # becomes a teammate_message, and the idle twin is dropped.
+    teammate_items = [item for item in items if item.item_type == "teammate_message"]
+    assert len(teammate_items) == 1
+    assert teammate_items[0].data["text"] == "Readable teammate reply."
+    assert teammate_items[0].data.get("summary") == "All good"
 
     with httpx.Client(base_url=base_url, timeout=15.0) as client:
         for item in items:
@@ -143,20 +142,11 @@ def test_teammate_transcript_reaches_browser_without_claude_cli(
                 json=_external_conversation_item_event(item),
             )
             response.raise_for_status()
-    roster = httpx.get(f"{base_url}/v1/sessions/{session_id}/teammates", timeout=15.0)
-    roster.raise_for_status()
-    assert roster.json()["data"][0]["last_summary"] == "All good"
 
     page.goto(f"{base_url}/c/{session_id}")
     card = page.get_by_test_id("teammate-message-card")
     expect(card).to_contain_text("Readable teammate reply.")
     expect(page.locator("body")).not_to_contain_text("idle_notification")
-    open_right_rail(page)
-    rail = page.get_by_role("complementary", name="Workspace")
-    rail.get_by_role("tab", name=re.compile("^Agents")).click()
-    expect(rail.get_by_test_id("teammate-row")).to_contain_text("buddy")
-    rail.get_by_test_id("view-mode-graph").click()
-    expect(rail.locator(".react-flow__node", has_text="buddy")).to_be_visible()
 
 
 def _wait_runner_offline(base_url: str, runner_id: str, timeout_s: float = 30.0) -> None:
@@ -311,41 +301,6 @@ def _boot_and_spawn_teammate(page: Page, base_url: str, session_id: str, mock_ur
     expect(page.locator(_ASSISTANT, has_text=_IDLE_ACK).first).to_be_visible(
         timeout=_SPAWN_IDLE_TIMEOUT_MS
     )
-
-
-@pytest.mark.nightly
-@pytest.mark.timeout(600)
-@pytest.mark.skipif(shutil.which("claude") is None, reason="claude CLI not installed")
-@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux not installed")
-def test_running_teammate_visible_in_subagents_rail(
-    page: Page,
-    native_claude_teams_session: tuple[str, str],
-    mock_llm_server_url: str,
-) -> None:
-    """Show a spawned in-process teammate in the Agents rail."""
-    base_url, session_id = native_claude_teams_session
-    _boot_and_spawn_teammate(page, base_url, session_id, mock_llm_server_url)
-
-    open_right_rail(page)
-    rail = page.get_by_role("complementary", name="Workspace")
-    rail.get_by_role("tab", name=re.compile("^Agents")).click()
-    expect(rail.get_by_test_id("subagent-main-row")).to_be_visible(timeout=30_000)
-
-    teammate_entry = rail.get_by_text(re.compile(rf"{_TEAMMATE}|{_TEAMMATE_DESCRIPTION}"))
-    try:
-        expect(teammate_entry.first).to_be_visible(timeout=_BUG_ASSERT_TIMEOUT_MS)
-        return
-    except AssertionError:
-        pass
-    rail.get_by_test_id("view-mode-graph").click()
-    try:
-        expect(teammate_entry.first).to_be_visible(timeout=_BUG_ASSERT_TIMEOUT_MS)
-    except AssertionError:
-        pytest.fail(
-            f"running in-process teammate '{_TEAMMATE}' has no entry in the "
-            "Subagents rail (checked list and graph views) — the user cannot "
-            "see, select, or navigate to it"
-        )
 
 
 @pytest.mark.nightly

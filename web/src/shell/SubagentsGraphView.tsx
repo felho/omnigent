@@ -7,13 +7,11 @@ import { Badge } from "@/components/ui/badge";
 import { ZoomInIcon, ZoomOutIcon, Maximize2Icon } from "lucide-react";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
-import { useTeammates } from "@/hooks/useTeammates";
 import { cn } from "@/lib/utils";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import {
   buildGraphLayout,
   NODE_WIDTH,
-  TEAMMATE_NODE_PREFIX,
   type AgentActivity,
   type AgentNodeData,
 } from "./subagentGraphLayout";
@@ -166,7 +164,6 @@ interface SubagentsGraphViewProps {
 export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsGraphViewProps) {
   const { session } = useSession(rootSessionId);
   const { children: rootChildren } = useChildSessions(rootSessionId);
-  const { teammates } = useTeammates(rootSessionId);
 
   const [childrenMap, setChildrenMap] = useState<Map<string, ChildSessionInfo[]>>(() => new Map());
 
@@ -208,25 +205,14 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
         null,
         childrenMap,
         conversationId,
-        teammates,
       ),
-    [
-      rootSessionId,
-      rootLabel,
-      rootActivity,
-      rootStatusLabel,
-      childrenMap,
-      conversationId,
-      teammates,
-    ],
+    [rootSessionId, rootLabel, rootActivity, rootStatusLabel, childrenMap, conversationId],
   );
 
   const navigate = useNavigate();
   const location = useLocation();
   const handleNodeClick = useCallback(
     (_event: React.MouseEvent, node: Node<AgentNodeData>) => {
-      // Teammate nodes have no conversation page to open.
-      if (node.id.startsWith(TEAMMATE_NODE_PREFIX)) return;
       const params = new URLSearchParams(location.search);
       for (const key of ["file", "diff", "comment", "view", "message"]) params.delete(key);
       const search = params.toString();

@@ -1752,6 +1752,7 @@ class PiExecutor(Executor):
         bundle_dir: pathlib.Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
+        preserve_model_ids: bool = False,
     ) -> None:
         """Create a PiExecutor.
 
@@ -1760,6 +1761,7 @@ class PiExecutor(Executor):
             Pi subprocess is wrapped in the same sandbox other
             harnesses use.
         :param model: Override the model name, e.g. ``"gateway-model-id"``.
+        :param preserve_model_ids: Keep exact IDs from a saved inference profile.
         :param pi_path: Absolute path to a ``pi`` CLI binary.  When ``None``
             the executor searches ``PATH``.
         :param gateway: When ``True``, write a ``models.json`` pointing Pi
@@ -1820,6 +1822,7 @@ class PiExecutor(Executor):
         self._cwd = cwd
         self._os_env_spec = os_env
         self._model_override = model
+        self._preserve_model_ids = preserve_model_ids
         self._gateway = gateway
         self._databricks_profile = databricks_profile
         self._gateway_host_override = gateway_host.rstrip("/") if gateway_host else None
@@ -2048,7 +2051,7 @@ class PiExecutor(Executor):
             return model_id
         # Strip bracket suffixes (e.g. "[1m]") — context-window hints accepted
         # by the direct Anthropic API but not by the Databricks AI Gateway.
-        if model and self._gateway:
+        if model and self._gateway and not self._preserve_model_ids:
             model = re.sub(r"\[.*?\]$", "", model)
         return model
 

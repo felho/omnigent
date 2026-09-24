@@ -6,11 +6,12 @@ import json
 import queue
 import re
 import threading
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from playwright.sync_api import Page, Request, Route, WebSocketRoute
 
@@ -205,8 +206,12 @@ class ChatSessionContract:
     )
     event_posts: list[dict[str, Any]] = field(default_factory=list)
     upload_requests: list[dict[str, Any]] = field(default_factory=list)
+    skills: list[dict[str, Any]] = field(default_factory=list)
+    skill_requests: list[dict[str, Any]] = field(default_factory=list)
     _items: list[dict[str, Any]] = field(default_factory=list)
     _status: str = "idle"
+    _hold_skill_responses: bool = False
+    _pending_skill_routes: list[Route] = field(default_factory=list)
     event_ack: dict[str, Any] = field(
         default_factory=lambda: {"queued": True, "item_id": "browser-queued-item"}
     )
@@ -239,6 +244,29 @@ class ChatSessionContract:
         self.models = [dict(model) for model in models]
         self.selected_model = selected_model
 
+    def set_skills(self, skills: Sequence[Mapping[str, Any]]) -> None:
+        """Replace the skills returned for this session."""
+        self.skills = [dict(skill) for skill in skills]
+
+    def hold_skills(self) -> Callable[[], None]:
+        """Hold skills responses until the returned release callable runs."""
+        self._hold_skill_responses = True
+
+        def release() -> None:
+            self._hold_skill_responses = False
+            pending, self._pending_skill_routes = self._pending_skill_routes, []
+            for route in pending:
+                self._fulfill_skills(route)
+
+        return release
+
+    def _fulfill_skills(self, route: Route) -> None:
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"skills": self.skills}),
+        )
+
     def emit(self, event: Mapping[str, Any]) -> None:
         """Broadcast an SSE wire event and keep the session snapshot consistent."""
         if event.get("event") == "session.status":
@@ -261,6 +289,7 @@ class ChatSessionContract:
             "agent_id": self.agent_id,
             "agent_name": self.agent_id,
             "host_id": self.host_id,
+            "workspace": "/browser-workspace",
             "status": self._status,
             "created_at": 1_704_067_200,
             "updated_at": 1_704_067_200,
@@ -338,6 +367,7 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
             ]
         },
     )
+    contract.json(f"/v1/hosts/{handle.host_id}/worktrees", empty)
     contract.json("/v1/projects", empty)
     contract.json("/v1/projects/order", {"ordered_project_ids": None, "sort_mode": "alphabetical"})
     contract.json("/v1/extensions", empty)
@@ -379,6 +409,20 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
         model_catalog,
         lambda _request: {"models": handle.models, "routable_models": []},
     )
+
+    def skills(route: Route) -> None:
+        request = route.request
+        query = parse_qs(urlparse(request.url).query)
+        if request.method != "GET" or query.get("session_id") != [handle.session_id]:
+            route.fallback()
+            return
+        handle.skill_requests.append(_request_record(request))
+        if handle._hold_skill_responses:
+            handle._pending_skill_routes.append(route)
+            return
+        handle._fulfill_skills(route)
+
+    contract.route(matcher("/v1/skills"), skills)
 
     def post_event(route: Route) -> None:
         if route.request.method != "POST":

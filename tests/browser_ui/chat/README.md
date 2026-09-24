@@ -19,12 +19,17 @@ def test_chat(page, chat_session_contract):
     chat.emit_idle("turn-1")
 ```
 
-The mutable handle exposes `session_id`, `url`, `event_posts`, and
-`upload_requests`. Event POSTs default to a queued acknowledgement, keeping the
-local turn busy so another composer submission enters the client queue. Set
-`event_ack` to change that response. Uploads are recorded and rejected by
-default; set `reject_uploads = False` when a test intentionally exercises the
-successful upload path.
+The mutable handle exposes `session_id`, `url`, `event_posts`,
+`upload_requests`, `skills`, and `skill_requests`. Use `set_skills(...)` to
+replace the session's `/v1/skills` response. To exercise loading UI, call
+`release = hold_skills()` before navigation, then call `release()` after the
+request appears in `skill_requests`.
+
+Event POSTs default to a queued acknowledgement, keeping the local turn busy so
+another composer submission enters the client queue. Set `event_ack` to change
+that response. Uploads are recorded and rejected by default; set
+`reject_uploads = False` when a test intentionally exercises the successful
+upload path.
 
 Use the builders in `session_contract.py` for canonical list, transcript,
 model-option, and `session.status` payloads. `emit()` accepts their named SSE

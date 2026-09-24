@@ -41,3 +41,34 @@ def test_contract_drives_history_catalog_and_live_status(
     expect(working).to_be_visible(timeout=10_000)
     chat.emit_idle("fixture-turn")
     expect(working).to_be_hidden(timeout=10_000)
+
+
+def test_contract_can_hold_and_release_session_skills(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    chat = chat_session_contract
+    chat.set_skills([{"name": "review", "description": "Review the current change."}])
+    release = chat.hold_skills()
+
+    skills_url = f"{chat.base_url}/v1/skills?session_id={chat.session_id}"
+    with page.expect_request(skills_url):
+        page.goto(chat.url)
+
+    for _ in range(100):
+        if chat.skill_requests:
+            break
+        page.wait_for_timeout(10)
+    assert chat.skill_requests == [
+        {
+            "url": f"{chat.base_url}/v1/skills?session_id={chat.session_id}",
+            "method": "GET",
+            "body": None,
+        }
+    ]
+    with page.expect_response(skills_url) as response_info:
+        release()
+
+    assert response_info.value.json() == {
+        "skills": [{"name": "review", "description": "Review the current change."}]
+    }

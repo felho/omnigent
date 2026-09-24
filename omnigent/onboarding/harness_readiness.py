@@ -17,8 +17,9 @@ at runtime. The **launch gate** still never blocks them: the spec's
 ``executor.auth`` (with ``${ENV}`` expansion) is invisible here, so a
 hard gate would break launches that actually work. The **picker map**,
 however, checks the credential sources the daemon *can* see locally —
-configured provider entries, ambient env API keys, Claude Code's own
-login / managed settings, an ambient Databricks workspace — and reports
+locally resolvable provider entries (including ambient-detected local
+providers such as a reachable Ollama), ambient env API keys, Claude Code's
+own login / managed settings, an ambient Databricks workspace — and reports
 ``"needs-auth"`` when none is visible, so a credential-less host warns
 before the first turn dies instead of after. Unknown harnesses fail
 open on both axes.
@@ -68,6 +69,7 @@ from omnigent.onboarding.provider_config import (
     OPENAI_FAMILY,
     PI_SURFACE,
     SUBSCRIPTION_KIND,
+    ProviderEntry,
     default_provider_for_harness,
     load_config,
 )
@@ -352,8 +354,54 @@ _AUTH_AWARE_NATIVE_HARNESSES: dict[str, str] = {
 }
 
 
+def _provider_entry_locally_credentialed(provider: ProviderEntry, family: str | None) -> bool:
+    """Whether *provider* is a credential source that resolves on this host.
+
+    A provider entry only readies a harness when the secret it references
+    actually resolves locally: launch resolves the entry's family through
+    :meth:`~omnigent.onboarding.provider_config.ProviderEntry.family` (which
+    expands ``$VAR`` / ``api_key_ref`` via :func:`resolve_secret`) and fails
+    rather than skipping the provider, so an entry pointing at an unset
+    ``env:`` variable or a missing keychain secret is a first-turn auth
+    failure, not a credential. Kinds that carry no inline family config
+    (``databricks`` / ``cli-config``) resolve their credential elsewhere at
+    launch and keep counting as sources here. ``subscription`` kinds never
+    count (the CLI's own login is judged separately by
+    :func:`harness_cli_logged_in`). Local env/keychain resolution only — no
+    network I/O — and never raises.
+
+    :param provider: The selected
+        :class:`~omnigent.onboarding.provider_config.ProviderEntry`.
+    :param family: The family the harness consumes (``"anthropic"`` /
+        ``"openai"``), or ``None`` for an unmapped harness (``pi``), which
+        may consume either family.
+    :returns: ``True`` when the entry's credential resolves locally (or needs
+        no local resolution), else ``False``.
+    """
+    if provider.kind == SUBSCRIPTION_KIND:
+        return False
+    candidates = (family,) if family is not None else (ANTHROPIC_FAMILY, OPENAI_FAMILY)
+    inline = [name for name in candidates if name in provider.families]
+    if not inline:
+        # Nothing to resolve locally (``databricks`` / ``cli-config`` kinds,
+        # or a family served structurally rather than inline).
+        return True
+    for name in inline:
+        try:
+            provider.family(name)
+            return True
+        except Exception as exc:
+            # Class-only: resolver errors can embed secret refs or material.
+            _logger.debug(
+                "readiness: provider credential for %r did not resolve (%s)",
+                name,
+                type(exc).__name__,
+            )
+    return False
+
+
 def _family_provider_configured(harness: str) -> bool:
-    """Whether a non-subscription default provider ENTRY serves *harness*'s family.
+    """Whether a locally credentialed default provider ENTRY serves *harness*'s family.
 
     Reads the local ``providers:`` config the same way the ``omnigent setup``
     overview does (:func:`surface_default_provider` / :func:`default_provider_for_harness`,
@@ -363,57 +411,72 @@ def _family_provider_configured(harness: str) -> bool:
     so counting it would double-count the CLI-login path and mask a genuine
     "installed but no key" state.
 
-    This checks that a default provider *entry* exists — not that its secret
-    actually resolves. An entry whose ``api_key_ref`` points at an unset
-    ``env:``/``$VAR`` or a missing keychain secret still reads configured here
-    (matching the secret-blind ``omnigent setup`` overview), so a harness can
-    report ready while a launch would still fail auth; that surfaces as the
-    executor's first-turn error. The launch gate stays binary-only regardless,
-    and the signal only moves toward green (no configured harness regresses).
+    The entry counts only when its credential actually resolves locally
+    (:func:`_provider_entry_locally_credentialed`): launch resolves the
+    entry's secret the same way and fails rather than skipping the provider,
+    so a default whose ``api_key_ref`` points at an unset ``env:``/``$VAR``
+    or a missing keychain secret is a first-turn auth failure, not a
+    credential. The launch gate stays binary-only regardless.
 
-    Local, synchronous, side-effect free (config file reads only) and never
-    raises: any resolver/config error fails to ``False`` so a broken config
-    reports "needs-auth" rather than crashing the readiness refresh.
+    Local, synchronous, side-effect free (config file / env / keychain reads
+    only) and never raises: any resolver/config error fails to ``False`` so a
+    broken config reports "needs-auth" rather than crashing the readiness
+    refresh.
 
     :param harness: A canonical harness spelling, e.g. ``"claude-native"`` or
         ``"pi"``.
-    :returns: ``True`` when a non-subscription default provider entry is present
-        for the harness's family, else ``False``.
+    :returns: ``True`` when a locally credentialed non-subscription default
+        provider entry is present for the harness's family, else ``False``.
     """
     try:
         provider = default_provider_for_harness(load_config(), harness)
-    except Exception:
+        if provider is None:
+            return False
+        return _provider_entry_locally_credentialed(provider, _HARNESS_FAMILY.get(harness))
+    except Exception as exc:
         # Readiness must never raise; a broken/unreadable config fails to
         # "no credential" (yellow) rather than crashing the refresh.
-        _logger.debug("readiness: provider check failed for %r", harness, exc_info=True)
+        # Class-only: provider config errors may embed credential material.
+        _logger.debug("readiness: provider check failed for %r (%s)", harness, type(exc).__name__)
         return False
-    return provider is not None and provider.kind != SUBSCRIPTION_KIND
 
 
 def _family_fallback_provider_configured(harness: str) -> bool:
-    """Whether ANY non-subscription provider entry serves *harness*'s family.
+    """Whether ANY locally credentialed provider entry serves *harness*'s family.
 
     Mirrors the launch-time last resort: with no family default configured,
-    the runner's spawn-env resolution still credentials the head from the
-    first configured provider serving the family
+    the runner's spawn-env resolution still credentials the head from a
+    configured provider serving the family
     (:func:`~omnigent.onboarding.provider_config.first_available_provider`,
     consumed with ``for_launch=True`` in :mod:`omnigent.runtime.workflow`), so
     such an entry is a real credential source even though it is not the
-    default. ``subscription``-kind entries are skipped for the same reason as
-    in :func:`_family_provider_configured`. Local config reads only; never
-    raises.
+    default. Like runtime resolution, the config is read over the ambient
+    detection merge
+    (:func:`~omnigent.onboarding.detected.effective_config_with_detected`),
+    so automatically detected local providers — a reachable keyless Ollama —
+    count exactly as they do at launch. ``subscription``-kind entries are
+    skipped for the same reason as in :func:`_family_provider_configured`,
+    and an entry counts only when its credential resolves locally
+    (:func:`_provider_entry_locally_credentialed`). Local config/env reads
+    plus ambient detection's localhost-only probes; never raises.
 
     :param harness: A canonical SDK harness id, e.g. ``"claude-sdk"``.
-    :returns: ``True`` when a non-subscription provider entry serves the
-        harness's family.
+    :returns: ``True`` when a locally credentialed non-subscription provider
+        entry (configured or ambient-detected) serves the harness's family.
     """
     family = _HARNESS_FAMILY.get(harness)
     if family is None:
         return False
     try:
-        from omnigent.onboarding.provider_config import first_available_provider
+        from omnigent.onboarding.detected import effective_config_with_detected
+        from omnigent.onboarding.provider_config import load_providers, provider_families
 
-        provider = first_available_provider(load_config(), family)
+        config = effective_config_with_detected(load_config())
+        for entry in load_providers(config).values():
+            if family not in provider_families(entry):
+                continue
+            if _provider_entry_locally_credentialed(entry, family):
+                return True
     except Exception as exc:
         # Class-only: provider config errors may embed credential material.
         _logger.debug(
@@ -421,8 +484,7 @@ def _family_fallback_provider_configured(harness: str) -> bool:
             harness,
             type(exc).__name__,
         )
-        return False
-    return provider is not None and provider.kind != SUBSCRIPTION_KIND
+    return False
 
 
 def _claude_managed_gateway_configured() -> bool:
@@ -515,18 +577,23 @@ def _claude_code_login_configured() -> bool:
         return False
 
 
-def _databricks_config_override_has_profiles(path: str) -> bool:
-    """Whether a ``DATABRICKS_CONFIG_FILE`` override declares any profile.
+def _databricks_file_has_credentialed_profile(path: str) -> bool:
+    """Whether a Databricks config file declares a locally usable profile.
 
-    Mirrors
-    :func:`~omnigent.onboarding.databricks_config.list_databricks_profiles`
-    (which reads only the default ``~/.databrickscfg`` location): a profile
-    section, or a ``DEFAULT`` section that actually carries keys, counts. A
-    file that merely exists proves nothing. Local file read only; never
-    raises.
+    Checks the locally required configuration fields rather than section or
+    file existence: a profile counts only when it names a workspace ``host``
+    AND carries authentication material — a ``token`` PAT, an OAuth
+    ``client_id``/``client_secret`` pair, a legacy ``username``/``password``
+    pair, or an explicit ``auth_type`` naming a locally resolvable method
+    (``databricks-cli``, ``external-browser``, …). A file that merely exists,
+    or a section that carries neither a workspace nor authentication
+    (``[work]`` alone), proves nothing. Applied to both the default
+    ``~/.databrickscfg`` and a ``DATABRICKS_CONFIG_FILE`` override. Local
+    file read only; never raises.
 
-    :param path: The override path from ``DATABRICKS_CONFIG_FILE``.
-    :returns: ``True`` when the file parses and declares at least one profile.
+    :param path: The config file path to inspect.
+    :returns: ``True`` when the file parses and declares at least one profile
+        carrying a workspace host plus authentication material.
     """
     import configparser
 
@@ -535,13 +602,26 @@ def _databricks_config_override_has_profiles(path: str) -> bool:
             return False
         parser = configparser.ConfigParser()
         parser.read(path)
-        return bool(parser.sections() or parser.defaults())
+        section_names = list(parser.sections())
+        if parser.defaults():
+            section_names.append(parser.default_section)
+        for name in section_names:
+            section = parser[name]
+            if not section.get("host", "").strip():
+                continue
+            if section.get("token", "").strip():
+                return True
+            if section.get("client_id", "").strip() and section.get("client_secret", "").strip():
+                return True
+            if section.get("username", "").strip() and section.get("password", "").strip():
+                return True
+            if section.get("auth_type", "").strip():
+                return True
+        return False
     except Exception as exc:
         # Log only the exception class: configparser errors can embed the
         # offending file's contents, which may include credential material.
-        _logger.debug(
-            "readiness: databricks config override parse failed (%s)", type(exc).__name__
-        )
+        _logger.debug("readiness: databricks config parse failed (%s)", type(exc).__name__)
         return False
 
 
@@ -554,8 +634,10 @@ def _databricks_workspace_configured() -> bool:
     is **not** a credential: env-based readiness requires ``DATABRICKS_HOST``
     plus authentication material (a ``DATABRICKS_TOKEN`` PAT, or an OAuth
     service-principal ``DATABRICKS_CLIENT_ID``/``DATABRICKS_CLIENT_SECRET``
-    pair), and a config file counts only when it actually declares a profile.
-    Local file/env reads only; never raises.
+    pair), and a config file counts only when it declares a profile carrying
+    a workspace host plus authentication material
+    (:func:`_databricks_file_has_credentialed_profile`). Local file/env reads
+    only; never raises.
 
     :returns: ``True`` when an ambient Databricks credential source is
         resolvable.
@@ -569,32 +651,71 @@ def _databricks_workspace_configured() -> bool:
         ):
             return True
     config_override = os.environ.get("DATABRICKS_CONFIG_FILE", "").strip()
-    if config_override and _databricks_config_override_has_profiles(config_override):
+    if config_override and _databricks_file_has_credentialed_profile(config_override):
         return True
     try:
-        from omnigent.onboarding.databricks_config import list_databricks_profiles
+        from omnigent.onboarding.databricks_config import _DATABRICKSCFG_PATH
 
-        return bool(list_databricks_profiles())
-    except Exception:
-        _logger.debug("readiness: databricks profile check failed", exc_info=True)
+        return _databricks_file_has_credentialed_profile(str(_DATABRICKSCFG_PATH))
+    except Exception as exc:
+        # Class-only: the config path/parse error may embed credential material.
+        _logger.debug("readiness: databricks profile check failed (%s)", type(exc).__name__)
         return False
+
+
+def _adc_file_carries_credentials(path: Path) -> bool:
+    """Whether an ADC file actually carries credential material.
+
+    Checks the locally required fields rather than file existence — an ADC
+    file is only a credential when it declares its type's key material: a
+    ``refresh_token`` for ``authorized_user``, a ``private_key`` +
+    ``client_email`` for ``service_account``. Other declared types
+    (``external_account``, impersonation, …) carry type-specific material
+    this check does not model, so a declared type errs toward ready (a false
+    "ready" is the pre-warning status quo); an empty or type-less JSON body
+    (``{}``) proves nothing. Local file read only, no provider contact; never
+    raises.
+
+    :param path: The ADC JSON file path.
+    :returns: ``True`` when the file parses and declares credential material.
+    """
+    import json
+
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        # Class-only: an ADC file (or its parse error) may embed secrets.
+        _logger.debug("readiness: ADC file parse failed (%s)", type(exc).__name__)
+        return False
+    if not isinstance(data, dict):
+        return False
+    cred_type = str(data.get("type") or "").strip()
+    if not cred_type:
+        return False
+    if cred_type == "authorized_user":
+        return bool(data.get("refresh_token"))
+    if cred_type == "service_account":
+        return bool(data.get("private_key")) and bool(data.get("client_email"))
+    return True
 
 
 def _google_adc_configured() -> bool:
     """Whether GCP Application Default Credentials are visible.
 
     Antigravity's Vertex AI path authenticates via ADC; whether a spec opts
-    into Vertex is invisible here, so a present ADC file only ever moves the
-    signal toward ready (a false "ready" is the pre-warning status quo).
+    into Vertex is invisible here. The file counts only when it actually
+    carries credential material (:func:`_adc_file_carries_credentials`) — a
+    merely existing or empty ADC file supplies nothing a launch could
+    authenticate with.
 
-    :returns: ``True`` when an ADC credential file is present.
+    :returns: ``True`` when an ADC credential file with material is present.
     """
     try:
         cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
         if cred_path and os.path.exists(cred_path):
-            return True
+            return _adc_file_carries_credentials(Path(cred_path))
         adc = Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
-        return adc.exists()
+        return adc.exists() and _adc_file_carries_credentials(adc)
     except Exception:
         _logger.debug("readiness: ADC check failed", exc_info=True)
         return False

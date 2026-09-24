@@ -65,6 +65,18 @@ def _isolate_cli_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
         _ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (tmp_path / "managed-absent.json",)
     )
     monkeypatch.setattr(_dbc, "list_databricks_profiles", list)
+    # The default-path Databricks check reads ``_DATABRICKSCFG_PATH`` directly
+    # (field-aware), and that constant captured the real home at import time —
+    # point it at an absent tmp file so a developer's real ~/.databrickscfg
+    # can't flip these verdicts.
+    monkeypatch.setattr(_dbc, "_DATABRICKSCFG_PATH", tmp_path / "databrickscfg-absent")
+    # The provider fallback check merges ambient detections the way runtime
+    # resolution does (``effective_config_with_detected``); stub the live
+    # detector so a developer's real env keys / CLI logins / local Ollama
+    # can't flip these verdicts (tests inject detections explicitly).
+    import omnigent.onboarding.detected as _detected
+
+    monkeypatch.setattr(_detected, "detect_providers", list)
     # Copilot also accepts a ``gh auth login`` session as a token, so a developer's
     # real gh login would otherwise flip their verdict here too.
     import omnigent.onboarding.copilot_auth as _ca
@@ -289,6 +301,9 @@ def test_family_provider_configured_excludes_subscription(
     class _Provider:
         def __init__(self, kind: str) -> None:
             self.kind = kind
+            # No inline families: nothing to resolve locally, so the entry
+            # counts (or not) purely by kind here.
+            self.families: dict[str, object] = {}
 
     monkeypatch.setattr(
         "omnigent.onboarding.harness_readiness.default_provider_for_harness",
@@ -911,19 +926,23 @@ def test_sdk_harness_ready_via_databricks_workspace(
 
     The SDK executors mint a gateway bearer from ``~/.databrickscfg`` / the
     Databricks env for ``databricks-*`` models even with no provider entry, so
-    a host configured with a profile, ``DATABRICKS_HOST`` plus auth material,
-    or a profile-bearing ``DATABRICKS_CONFIG_FILE`` must not read
-    ``needs-auth``.
+    a host configured with a credentialed profile, ``DATABRICKS_HOST`` plus
+    auth material, or a credentialed-profile ``DATABRICKS_CONFIG_FILE`` must
+    not read ``needs-auth``.
     """
     import omnigent.onboarding.databricks_config as dbc
 
     _no_clis_installed(monkeypatch)
-    monkeypatch.setattr(dbc, "list_databricks_profiles", lambda: ["DEFAULT"])
+    default_cfg = tmp_path / "databrickscfg-default"
+    default_cfg.write_text(
+        "[DEFAULT]\nhost = https://example.cloud.databricks.com\ntoken = dapi-test\n"
+    )
+    monkeypatch.setattr(dbc, "_DATABRICKSCFG_PATH", default_cfg)
     result = configured_harness_map()
     assert result["claude-sdk"] is True
     assert result["openai-agents"] is True
+    monkeypatch.setattr(dbc, "_DATABRICKSCFG_PATH", tmp_path / "databrickscfg-absent")
 
-    monkeypatch.setattr(dbc, "list_databricks_profiles", list)
     monkeypatch.setenv("DATABRICKS_HOST", "https://example.cloud.databricks.com")
     monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-test-token")
     result = configured_harness_map()
@@ -1010,9 +1029,11 @@ def test_sdk_harness_ready_via_non_default_family_provider(
     family when no default is configured (``first_available_provider``,
     consumed with ``for_launch=True`` in the runtime), so readiness must not
     report ``needs-auth`` for a host whose only credential is a non-default
-    provider entry serving the harness's family.
+    provider entry serving the harness's family — provided its credential
+    reference actually resolves locally.
     """
     _no_clis_installed(monkeypatch)
+    monkeypatch.setenv("WORK_ANTHROPIC_KEY", "sk-work-test-key")
     (tmp_path / "config.yaml").write_text(
         yaml.safe_dump(
             {
@@ -1033,6 +1054,81 @@ def test_sdk_harness_ready_via_non_default_family_provider(
     # No provider serves the openai family here, so openai-agents must still
     # read needs-auth - the fallback is per-family, not a global pass.
     assert result["openai-agents"] == "needs-auth"
+
+
+@pytest.mark.parametrize(
+    ("family", "harness", "other_harness"),
+    [
+        ("anthropic", "claude-sdk", "openai-agents"),
+        ("openai", "openai-agents", "claude-sdk"),
+    ],
+)
+@pytest.mark.parametrize("default", [False, True])
+def test_sdk_provider_with_unresolved_credential_reference_is_not_a_credential(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    family: str,
+    harness: str,
+    other_harness: str,
+    default: bool,
+) -> None:
+    """An unresolved ``api_key_ref`` must not report the SDK harness ready.
+
+    Launch resolves the selected entry's secret through
+    ``ProviderEntry.family()`` / ``resolve_secret`` and fails rather than
+    skipping the provider, so an entry pointing at an unset ``env:`` variable
+    is a first-turn auth failure, not a credential — readiness must warn
+    instead of reporting ready. Covers both SDK harnesses, through both the
+    default-provider and first-available fallback selection paths.
+    """
+    _no_clis_installed(monkeypatch)
+    monkeypatch.delenv("MISSING_READINESS_TEST_KEY", raising=False)
+    monkeypatch.delenv("OMNIGENT_MISSING_READINESS_TEST_KEY", raising=False)
+    entry: dict[str, object] = {
+        "kind": "key",
+        family: {
+            "base_url": "https://api.example.com/v1",
+            "api_key_ref": "env:MISSING_READINESS_TEST_KEY",
+        },
+    }
+    if default:
+        entry["default"] = True
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"providers": {"work": entry}}))
+    result = configured_harness_map()
+    assert result[harness] == "needs-auth"
+    assert result[other_harness] == "needs-auth"
+
+
+def test_openai_agents_ready_via_detected_local_ollama(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reachable local Ollama counts as an openai-family credential source.
+
+    Runtime resolution merges ambient detections
+    (``effective_config_with_detected``) and can select a reachable, keyless
+    local Ollama as its OpenAI-family provider, so an Ollama-only host must
+    not warn ``needs-auth`` for openai-agents.
+    """
+    import omnigent.onboarding.detected as detected_mod
+    from omnigent.onboarding.ambient import DetectedProvider
+
+    _no_clis_installed(monkeypatch)
+    monkeypatch.setattr(
+        detected_mod,
+        "detect_providers",
+        lambda: [
+            DetectedProvider(
+                name="ollama",
+                kind="local",
+                family="openai",
+                source="http://localhost:11434",
+            )
+        ],
+    )
+    result = configured_harness_map()
+    assert result["openai-agents"] is True
+    # Ollama serves only the openai family; claude-sdk stays warned.
+    assert result["claude-sdk"] == "needs-auth"
 
 
 def test_malformed_databricks_config_contents_never_reach_logs(
@@ -1090,6 +1186,49 @@ def test_databricks_profileless_config_override_is_not_a_credential(
     assert result["openai-agents"] == "needs-auth"
 
 
+@pytest.mark.parametrize(
+    "contents",
+    [
+        # A bare section supplies neither a workspace nor authentication.
+        "[work]\n",
+        # A workspace host alone names where to authenticate, not how.
+        "[work]\nhost = https://example.cloud.databricks.com\n",
+        # Auth material without a workspace cannot mint a gateway bearer.
+        "[work]\ntoken = dapi-test\n",
+    ],
+)
+def test_databricks_uncredentialed_profile_is_not_a_credential(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    contents: str,
+) -> None:
+    """A Databricks profile without host + auth fields is not a credential.
+
+    Readiness checks the locally required configuration fields, not section
+    existence: a ``[work]`` section that carries no workspace host plus
+    authentication material (token / OAuth pair / auth_type) supplies nothing
+    an executor could mint a gateway bearer from, so the SDK harnesses must
+    still read ``needs-auth``. Applies to both the ``DATABRICKS_CONFIG_FILE``
+    override and the default ``~/.databrickscfg``.
+    """
+    import omnigent.onboarding.databricks_config as dbc
+
+    _no_clis_installed(monkeypatch)
+    config_file = tmp_path / "databrickscfg-uncredentialed"
+    config_file.write_text(contents)
+
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(config_file))
+    result = configured_harness_map()
+    assert result["claude-sdk"] == "needs-auth"
+    assert result["openai-agents"] == "needs-auth"
+
+    monkeypatch.delenv("DATABRICKS_CONFIG_FILE")
+    monkeypatch.setattr(dbc, "_DATABRICKSCFG_PATH", config_file)
+    result = configured_harness_map()
+    assert result["claude-sdk"] == "needs-auth"
+    assert result["openai-agents"] == "needs-auth"
+
+
 def test_antigravity_sdk_readiness_keys_off_gemini_credential(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1112,6 +1251,22 @@ def test_antigravity_sdk_readiness_keys_off_gemini_credential(
 
     monkeypatch.delenv("GEMINI_API_KEY")
     adc = tmp_path / "adc.json"
+    # An ADC file with no credential material (``{}``) proves nothing —
+    # existence alone must not flip readiness.
     adc.write_text("{}")
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(adc))
+    assert configured_harness_map()["antigravity"] == "needs-auth"
+
+    import json
+
+    adc.write_text(
+        json.dumps(
+            {
+                "type": "authorized_user",
+                "client_id": "test-client-id",
+                "client_secret": "test-client-secret",
+                "refresh_token": "test-refresh-token",
+            }
+        )
+    )
     assert configured_harness_map()["antigravity"] is True

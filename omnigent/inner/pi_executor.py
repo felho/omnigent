@@ -759,10 +759,6 @@ def _build_models_json(
         codex_gateway_url = openai_base_url
         mlflow_gateway_url = openai_base_url
     claude_base_url = (base_urls or {}).get("claude") or f"{h}/serving-endpoints/anthropic"
-    # A claude id only has a real Anthropic route on the Databricks workspace
-    # (the serving-endpoints/anthropic fallback) or when a provider configured
-    # a claude base URL; a generic openai-only provider has neither.
-    has_claude_route = not is_generic_provider or bool((base_urls or {}).get("claude"))
     _openai_responses_compat: _JsonObject = {
         "supportsDeveloperRole": False,
         "supportsStore": False,
@@ -867,7 +863,6 @@ def _build_models_json(
                 model,
                 wire_catalog.get(model.lower()),
                 generic_openai_wire_api=generic_openai_wire_api,
-                has_claude_route=has_claude_route,
             )
         ]
         if not any(entry.get("id") == model for entry in provider["models"]):
@@ -920,29 +915,11 @@ def _pi_provider_for_model(
     wire_apis: frozenset[ModelWireAPI] | None = None,
     *,
     generic_openai_wire_api: str | None = None,
-    has_claude_route: bool = True,
 ) -> str:
-    """Return the Pi provider name to use for a given Databricks model.
-
-    ``has_claude_route`` is whether an Anthropic Messages surface is actually
-    reachable — the Databricks workspace fallback, or a configured ``claude``
-    base URL. When it is not (a generic OpenAI-compatible provider that
-    configured only its ``openai`` family), a ``claude`` id routes through that
-    generic provider instead of the ``databricks-anthropic`` entry, whose URL
-    would fall back to a ``serving-endpoints/anthropic`` path the generic host
-    does not serve. A generic gateway that fronts Claude (OpenRouter, LiteLLM)
-    then serves it over its OpenAI wire; a pure-OpenAI gateway fails loud with
-    model-not-found rather than POSTing to a bogus URL.
-    """
+    """Return the Pi provider name to use for a given Databricks model."""
     lower = model.lower()
     if "claude" in lower:
-        if has_claude_route or generic_openai_wire_api is None:
-            return "databricks-anthropic"
-        return (
-            "databricks-openai"
-            if generic_openai_wire_api == RESPONSES_WIRE_API
-            else "databricks-completions"
-        )
+        return "databricks-anthropic"
     if generic_openai_wire_api is not None:
         if generic_openai_wire_api == RESPONSES_WIRE_API:
             return "databricks-openai"

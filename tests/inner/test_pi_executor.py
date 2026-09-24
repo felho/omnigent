@@ -405,49 +405,6 @@ class TestPiProviderForModel(unittest.TestCase):
             _pi_provider_for_model("databricks-claude-sonnet-4-6"), "databricks-anthropic"
         )
 
-    def test_claude_model_without_claude_route_uses_generic_provider(self):
-        # A generic OpenAI-compatible provider configured only its openai family
-        # (no claude base URL): a claude id must route through that provider
-        # rather than the databricks-anthropic entry, whose URL would fall back
-        # to a serving-endpoints/anthropic path the generic host does not serve.
-        self.assertEqual(
-            _pi_provider_for_model(
-                "claude-sonnet-4-6",
-                generic_openai_wire_api="chat",
-                has_claude_route=False,
-            ),
-            "databricks-completions",
-        )
-        self.assertEqual(
-            _pi_provider_for_model(
-                "claude-sonnet-4-6",
-                generic_openai_wire_api="responses",
-                has_claude_route=False,
-            ),
-            "databricks-openai",
-        )
-
-    def test_claude_model_keeps_anthropic_provider_when_route_present(self):
-        # A configured claude base URL (or the Databricks workspace fallback)
-        # keeps a claude id on the anthropic-messages provider even alongside a
-        # generic openai provider (e.g. a LiteLLM proxy fronting both families).
-        self.assertEqual(
-            _pi_provider_for_model(
-                "claude-sonnet-4-6",
-                generic_openai_wire_api="chat",
-                has_claude_route=True,
-            ),
-            "databricks-anthropic",
-        )
-
-    def test_claude_model_without_generic_provider_stays_anthropic(self):
-        # Defensive: no generic provider configured (the common Databricks and
-        # anthropic-key paths) always resolves the anthropic-messages provider.
-        self.assertEqual(
-            _pi_provider_for_model("claude-sonnet-4-6", has_claude_route=False),
-            "databricks-anthropic",
-        )
-
     def test_other_model(self):
         self.assertEqual(
             _pi_provider_for_model("databricks-meta-llama-3.3-70b-instruct"),
@@ -698,39 +655,6 @@ class TestBuildModelsJson(unittest.TestCase):
         responses = result["providers"]["databricks-openai"]
         self.assertEqual(responses["baseUrl"], "https://gateway.example.com/v1")
         self.assertIn("vendor/model-next", [entry["id"] for entry in responses["models"]])
-
-    def test_generic_openai_only_provider_routes_claude_through_generic(self):
-        # A generic provider with only an openai base URL (no claude one) must
-        # register an explicit claude id under the generic provider, not the
-        # anthropic-messages entry whose URL would fall back to the host's
-        # serving-endpoints/anthropic path the generic gateway does not serve.
-        result = _build_models_json(
-            "https://unused.example.com",
-            "tok",
-            {"openai": "https://openrouter.ai/api/v1"},
-            model="anthropic/claude-sonnet-4-6",
-        )
-        generic_ids = [
-            entry["id"] for entry in result["providers"]["databricks-completions"]["models"]
-        ]
-        self.assertIn("anthropic/claude-sonnet-4-6", generic_ids)
-        self.assertEqual(result["providers"]["databricks-anthropic"]["models"], [])
-
-    def test_generic_provider_with_claude_base_url_keeps_anthropic(self):
-        # When the provider also configures a claude base URL, an explicit
-        # claude id stays on the anthropic-messages provider pointed at it.
-        result = _build_models_json(
-            "https://unused.example.com",
-            "tok",
-            {
-                "openai": "https://gateway.example.com/v1",
-                "claude": "https://anthropic.example.com/v1",
-            },
-            model="claude-sonnet-4-6",
-        )
-        anthropic = result["providers"]["databricks-anthropic"]
-        self.assertEqual(anthropic["baseUrl"], "https://anthropic.example.com/v1")
-        self.assertIn("claude-sonnet-4-6", [entry["id"] for entry in anthropic["models"]])
 
     def test_dedicated_gateway_uses_catalog_wire_and_workspace_chat_url(self):
         result = _build_models_json(

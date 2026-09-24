@@ -20,10 +20,10 @@ Fail -> pass contract: on the buggy build the child is created with
 assertion fails. Once inheritance is servability-aware the child keeps its own
 default and the assertion passes.
 
-(``pi`` is deliberately not exercised here: it routes a validated id to the
-provider its launch configured -- ``_pi_provider_for_model`` sends a claude id
-through the configured generic provider when no Anthropic route exists -- so
-that routing is covered by the ``TestPiProviderForModel`` unit tests instead.)
+(``pi`` is deliberately not exercised here: on the gateway path it routes a
+claude id to its Databricks Anthropic surface (``/serving-endpoints/anthropic``
+on the workspace host its credentials resolve), so an inherited claude id is
+servable and must not be skipped -- unlike opencode's bare-id case.)
 
 The claude-native brain is swapped for openai-agents against a mock LLM (the
 standard mock-polly pattern from ``test_polly_e2e``); the opencode worker keeps

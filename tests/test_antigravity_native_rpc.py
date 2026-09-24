@@ -11,7 +11,10 @@ import json
 import os
 import struct
 import subprocess
+import threading
+from collections import OrderedDict
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -32,11 +35,22 @@ _LSOF_TWO_PORTS = (
 _CONVERSATION_ID = "90468e33-38c3-4e48-ae9f-03c843196227"
 
 
+@pytest.fixture(autouse=True)
+def isolated_rpc_owners(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(rpc, "_RPC_PORT_OWNERS", OrderedDict())
+
+
 @pytest.fixture
 def authenticated_agy(monkeypatch: pytest.MonkeyPatch) -> dict[int, Mock]:
     processes = {
-        101: Mock(cmdline=lambda: ["/bin/agy", "--csrf_token=first"], is_running=lambda: True),
-        102: Mock(cmdline=lambda: ["/bin/agy", "--csrf_token", "second"], is_running=lambda: True),
+        101: Mock(
+            pid=101, cmdline=lambda: ["/bin/agy", "--csrf_token=first"], is_running=lambda: True
+        ),
+        102: Mock(
+            pid=102,
+            cmdline=lambda: ["/bin/agy", "--csrf_token", "second"],
+            is_running=lambda: True,
+        ),
     }
     monkeypatch.setattr(rpc, "_list_agy_pids", lambda: list(processes))
     monkeypatch.setattr(rpc.psutil, "Process", lambda pid: processes[pid])
@@ -135,6 +149,178 @@ def test_launch_log_uses_process_namespace_pid(
     assert rpc._csrf_token_for_port(52548) == "first"
 
 
+@pytest.mark.parametrize("socket_attribution", [True, False])
+def test_repeated_rpcs_only_revalidate_their_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    authenticated_agy: dict[int, Mock],
+    socket_attribution: bool,
+) -> None:
+    scans = Mock(return_value=list(authenticated_agy))
+    ports = {101: [52548], 102: [52550]} if socket_attribution else {101: [], 102: []}
+    lookups = Mock(side_effect=lambda pid: ports[pid])
+    monkeypatch.setattr(rpc, "_list_agy_pids", scans)
+    monkeypatch.setattr(rpc, "_pid_listen_ports", lookups)
+    if not socket_attribution:
+        for pid, port in [(101, 52548), (102, 52550)]:
+            _write_launch_log(tmp_path / str(pid), pid, port, authenticated_agy[pid])
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert (
+            request.headers["x-codeium-csrf-token"]
+            == {52548: "first", 52550: "second"}[request.url.port]
+        )
+        return httpx.Response(200, json={"steps": []})
+
+    monkeypatch.setattr(rpc, "_HTTP_TRANSPORT", httpx.MockTransport(respond))
+    for port in [52548, 52550]:
+        rpc.get_trajectory_steps(port, _CONVERSATION_ID)
+    scans.reset_mock()
+    lookups.reset_mock()
+
+    ports_to_read = [52548, 52550] * 10
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        list(
+            executor.map(
+                lambda port: rpc.get_trajectory_steps(port, _CONVERSATION_ID), ports_to_read
+            )
+        )
+    scans.assert_not_called()
+    assert lookups.call_count == len(ports_to_read)
+
+
+@pytest.mark.parametrize("cached_owner", [False, True])
+def test_delayed_validation_does_not_replace_a_newer_owner(
+    monkeypatch: pytest.MonkeyPatch, authenticated_agy: dict[int, Mock], cached_owner: bool
+) -> None:
+    if cached_owner:
+        assert rpc._csrf_token_for_port(52548) == "first"
+    validated = threading.Barrier(2, timeout=5)
+    resume = threading.Event()
+    read_token = rpc._csrf_token_from_process
+
+    def pause_after_validation(port: int, process: rpc.psutil.Process) -> str | None:
+        token = read_token(port, process)
+        if token == "first":
+            validated.wait()
+            assert resume.wait(timeout=5)
+        return token
+
+    monkeypatch.setattr(rpc, "_csrf_token_from_process", pause_after_validation)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(rpc._csrf_token_for_port, 52548)
+        try:
+            validated.wait()
+            monkeypatch.setattr(
+                rpc, "_pid_listen_ports", lambda pid: {101: [52552], 102: [52548]}[pid]
+            )
+            assert rpc._csrf_token_for_port(52548) == "second"
+        finally:
+            resume.set()
+        assert pending.result(timeout=5) == "first"
+
+    scans = Mock(return_value=list(authenticated_agy))
+    monkeypatch.setattr(rpc, "_list_agy_pids", scans)
+    assert rpc._csrf_token_for_port(52548) == "second"
+    scans.assert_not_called()
+
+
+@pytest.mark.parametrize("refresh_oldest", [False, True])
+def test_rpc_owner_cache_evicts_least_recently_used_at_128_entries(
+    monkeypatch: pytest.MonkeyPatch, refresh_oldest: bool
+) -> None:
+    processes = {
+        pid: Mock(
+            pid=pid, cmdline=lambda: ["/bin/agy", "--csrf_token=test"], is_running=lambda: True
+        )
+        for pid in range(1000, 1129)
+    }
+    scans = Mock()
+    monkeypatch.setattr(rpc, "_list_agy_pids", scans)
+    monkeypatch.setattr(rpc.psutil, "Process", lambda pid: processes[pid])
+    monkeypatch.setattr(rpc, "_pid_listen_ports", lambda pid: [pid + 50000])
+    for pid in range(1000, 1128):
+        scans.return_value = [pid]
+        assert rpc._csrf_token_for_port(pid + 50000) == "test"
+
+    if refresh_oldest:
+        assert rpc._csrf_token_for_port(51000) == "test"
+    scans.return_value = [1128]
+    assert rpc._csrf_token_for_port(51128) == "test"
+
+    evicted = 51001 if refresh_oldest else 51000
+    assert len(rpc._RPC_PORT_OWNERS) == 128
+    assert set(rpc._RPC_PORT_OWNERS) == set(range(51000, 51129)) - {evicted}
+    scans.reset_mock()
+    assert rpc._csrf_token_for_port(51128) == "test"
+    scans.assert_not_called()
+    scans.return_value = [evicted - 50000]
+    assert rpc._csrf_token_for_port(evicted) == "test"
+    scans.assert_called_once_with()
+    assert len(rpc._RPC_PORT_OWNERS) == 128
+
+
+def test_cached_owner_revalidates_port_before_sending_token(
+    monkeypatch: pytest.MonkeyPatch, authenticated_agy: dict[int, Mock]
+) -> None:
+    assert rpc._csrf_token_for_port(52548) == "first"
+    monkeypatch.setattr(rpc, "_pid_listen_ports", lambda pid: {101: [52552], 102: [52548]}[pid])
+    assert rpc._rpc_headers(52548)["x-codeium-csrf-token"] == "second"
+    assert rpc._rpc_headers(52552)["x-codeium-csrf-token"] == "first"
+
+
+def test_cached_owner_does_not_reuse_token_after_pid_reuse(
+    authenticated_agy: dict[int, Mock],
+) -> None:
+    assert rpc._csrf_token_for_port(52548) == "first"
+    authenticated_agy[101].is_running = lambda: False
+    authenticated_agy[101] = Mock(
+        pid=101, cmdline=lambda: ["/bin/agy", "--csrf_token=replacement"], is_running=lambda: True
+    )
+    assert rpc._rpc_headers(52548)["x-codeium-csrf-token"] == "replacement"
+
+
+@pytest.mark.parametrize("change", ["exit", "unreadable", "different-executable", "no-token"])
+def test_cached_owner_stops_authenticating_when_no_longer_valid(
+    authenticated_agy: dict[int, Mock], change: str
+) -> None:
+    assert rpc._csrf_token_for_port(52548) == "first"
+    process = authenticated_agy[101]
+    if change == "exit":
+        process.is_running = lambda: False
+    elif change == "unreadable":
+        process.cmdline = Mock(side_effect=rpc.psutil.AccessDenied(101))
+    elif change == "different-executable":
+        process.cmdline = lambda: ["/bin/other", "--csrf_token=first"]
+    else:
+        process.cmdline = lambda: ["/bin/agy"]
+    assert "x-codeium-csrf-token" not in rpc._rpc_headers(52548)
+
+
+def test_cached_owner_reads_current_token(authenticated_agy: dict[int, Mock]) -> None:
+    assert rpc._csrf_token_for_port(52548) == "first"
+    authenticated_agy[101].cmdline = lambda: ["/bin/agy", "--csrf_token=rotated"]
+    assert rpc._rpc_headers(52548)["x-codeium-csrf-token"] == "rotated"
+
+
+def test_cached_owner_revalidates_private_log(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, authenticated_agy: dict[int, Mock]
+) -> None:
+    path = _write_launch_log(tmp_path / "private", 101, 52548, authenticated_agy[101])
+    monkeypatch.setattr(rpc, "_pid_listen_ports", lambda pid: [])
+    assert rpc._csrf_token_for_port(52548) == "first"
+    path.parent.chmod(0o755)
+    assert "x-codeium-csrf-token" not in rpc._rpc_headers(52548)
+
+
+def test_unknown_port_is_not_cached(
+    monkeypatch: pytest.MonkeyPatch, authenticated_agy: dict[int, Mock]
+) -> None:
+    assert rpc._csrf_token_for_port(52552) is None
+    monkeypatch.setattr(rpc, "_pid_listen_ports", lambda pid: {101: [52552], 102: [52550]}[pid])
+    assert rpc._rpc_headers(52552)["x-codeium-csrf-token"] == "first"
+
+
 @pytest.mark.parametrize("proxy", ["HTTPS_PROXY", "ALL_PROXY"])
 async def test_loopback_clients_ignore_environment_proxies(
     monkeypatch: pytest.MonkeyPatch, proxy: str
@@ -151,12 +337,22 @@ async def test_loopback_clients_ignore_environment_proxies(
         assert client._transport_for_url(url) is client._transport
 
 
-@pytest.mark.parametrize("error", [rpc.psutil.AccessDenied(101), rpc.psutil.NoSuchProcess(101)])
+@pytest.mark.parametrize(
+    "error",
+    [
+        rpc.psutil.AccessDenied(101),
+        rpc.psutil.NoSuchProcess(101),
+        OSError("cannot inspect --csrf_token=sensitive-token"),
+    ],
+)
 def test_unreadable_process_does_not_leak_another_token(
-    authenticated_agy: dict[int, Mock], error: Exception
+    authenticated_agy: dict[int, Mock], error: Exception, caplog: pytest.LogCaptureFixture
 ) -> None:
     authenticated_agy[101].cmdline = Mock(side_effect=error)
-    assert "x-codeium-csrf-token" not in rpc._rpc_headers(52548)
+    with caplog.at_level("DEBUG", logger=rpc.__name__):
+        assert "x-codeium-csrf-token" not in rpc._rpc_headers(52548)
+    assert f"pid=101 port=52548 error={type(error).__name__}" in caplog.text
+    assert "sensitive-token" not in caplog.text
 
 
 @pytest.mark.parametrize("args", [["/bin/agy"], ["/bin/other", "/bin/agy", "--csrf_token=wrong"]])

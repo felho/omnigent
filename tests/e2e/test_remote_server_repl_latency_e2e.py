@@ -88,7 +88,7 @@ def _strip_ansi(text: str) -> str:
 class _ConnCounter:
     """Incremental HTTP request-line counter for one proxied connection."""
 
-    def __init__(self, proxy: "LatencyProxy") -> None:
+    def __init__(self, proxy: LatencyProxy) -> None:
         self._proxy = proxy
         self._residual = b""
         self._offset = 0
@@ -452,11 +452,8 @@ def latency_measurements(
         delayed_proxy.stop()
 
     print(
-        "\nRemote-latency measurements (rtt=%.3fs): %s"
-        % (
-            _RTT_S,
-            json.dumps({"direct": direct.as_dict(), "delayed": delayed.as_dict()}, indent=2),
-        )
+        f"\nRemote-latency measurements (rtt={_RTT_S:.3f}s): "
+        f"{json.dumps({'direct': direct.as_dict(), 'delayed': delayed.as_dict()}, indent=2)}"
     )
     return {"direct": direct, "delayed": delayed}
 

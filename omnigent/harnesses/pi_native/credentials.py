@@ -782,6 +782,9 @@ def _databricks_openai_provider(
     }
 
 
+_AUTH_COMMAND_REAP_TIMEOUT_S = 2.0
+
+
 def _run_auth_command(auth_command: str, *, timeout: float = 15.0) -> str | None:
     """Run *auth_command* and return its stdout as a bearer token.
 
@@ -814,8 +817,10 @@ def _run_auth_command(auth_command: str, *, timeout: float = 15.0) -> str | None
         stdout, _ = process.communicate(timeout=timeout)
     except Exception:  # noqa: BLE001 — a stalled or undecodable helper is a failed mint
         kill_tree(process)
+        # Reap the shell, but never wait on a detached descendant that kept
+        # the pipe open; the mint has already failed.
         with suppress(Exception):
-            process.communicate()
+            process.communicate(timeout=_AUTH_COMMAND_REAP_TIMEOUT_S)
         return None
     if process.returncode != 0:
         return None

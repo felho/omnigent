@@ -1307,9 +1307,17 @@ let pendingSeq = 0;
 /**
  * Delay before the one automatic re-send that follows a thrown fetch. Its job
  * is to learn whether the message landed: the server dedupes on the stable id
- * and answers with the committed copy if it did.
+ * and answers with the committed copy if it did. It runs inside `send()`,
+ * which still holds the conversation's send chain, so a message sent
+ * meanwhile cannot overtake the one being checked.
  */
 const SEND_CHECK_DELAY_MS = 1_000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
 
 interface FailedSend {
   sessionId: string;
@@ -1318,8 +1326,6 @@ interface FailedSend {
   inFlight: boolean;
   /** Failed delivery attempts so far, mirrored onto the bubble. */
   attempts: number;
-  /** The pending automatic check re-send, if not fired yet. */
-  checkTimer: ReturnType<typeof setTimeout> | null;
   /** The send owned the turn latch (`status: "streaming"`), so a successful
    *  re-send re-arms it; a send alongside a live turn never touches it. */
   latchOnSuccess: boolean;
@@ -1479,7 +1485,6 @@ export function rehydratePersistedSends(conversationId: string): void {
       deliver: () => deliverRevivedSend(conversationId, tempId, record.content, record.stableId),
       inFlight: false,
       attempts: 1,
-      checkTimer: null,
       latchOnSuccess: true,
     });
   }
@@ -1495,7 +1500,7 @@ export function rehydratePersistedSends(conversationId: string): void {
  * transcript with Retry and Cancel, is remembered across a reload, and is
  * re-sent once when the stream reconnects or the browser comes back online.
  * `reason` is the server's message when it refused the send; a thrown fetch
- * has none.
+ * has none. `attempts` counts the deliveries that have failed so far.
  */
 function registerFailedSend(
   tempId: string,
@@ -1503,38 +1508,16 @@ function registerFailedSend(
   deliver: () => Promise<void>,
   latchOnSuccess: boolean,
   reason: string | undefined,
+  attempts: number,
 ): void {
-  setSendFailed(
-    sessionId,
-    tempId,
-    reason === undefined ? { attempts: 1 } : { reason, attempts: 1 },
-  );
+  setSendFailed(sessionId, tempId, reason === undefined ? { attempts } : { reason, attempts });
   persistFailedBubble(sessionId, tempId);
-  const entry: FailedSend = {
-    sessionId,
-    deliver,
-    inFlight: false,
-    attempts: 1,
-    checkTimer: null,
-    latchOnSuccess,
-  };
-  // A server refusal is definitive; only a thrown fetch gets the check.
-  if (reason === undefined) {
-    entry.checkTimer = setTimeout(() => {
-      entry.checkTimer = null;
-      void resendFailedSend(tempId);
-    }, SEND_CHECK_DELAY_MS);
-  }
-  failedSends.set(tempId, entry);
+  failedSends.set(tempId, { sessionId, deliver, inFlight: false, attempts, latchOnSuccess });
 }
 
 async function resendFailedSend(tempId: string): Promise<void> {
   const entry = failedSends.get(tempId);
   if (entry === undefined || entry.inFlight) return;
-  if (entry.checkTimer !== null) {
-    clearTimeout(entry.checkTimer);
-    entry.checkTimer = null;
-  }
   const bubble = setterForState(entry.sessionId)?.pendingUserMessages.find(
     (p) => p.tempId === tempId,
   );
@@ -1544,8 +1527,12 @@ async function resendFailedSend(tempId: string): Promise<void> {
     return;
   }
   entry.inFlight = true;
-  setSendFailed(entry.sessionId, tempId, undefined);
+  // Take the conversation's send chain so this re-send is ordered with fresh
+  // sends instead of racing one the user typed meanwhile.
+  const chain = enterSendChain(entry.sessionId);
   try {
+    await chain.waitForPrior();
+    setSendFailed(entry.sessionId, tempId, undefined);
     await entry.deliver();
     failedSends.delete(tempId);
     // Accepted: a bubble still here (not dropped as a duplicate of a committed
@@ -1573,6 +1560,8 @@ async function resendFailedSend(tempId: string): Promise<void> {
         ? { attempts: entry.attempts }
         : { reason: describeSendFailure(err).message, attempts: entry.attempts },
     );
+  } finally {
+    chain.releaseSend();
   }
 }
 
@@ -2532,6 +2521,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Native model startup failed or timed out while the draft was still held
     // locally: that path restores the draft itself, so the send is not retained.
     let modelGateFailed = false;
+    // Deliveries that have failed for this send: one, or two once the
+    // automatic check also failed.
+    let checkAttempts = 1;
     // An attachment failed to upload: the message is handed back to the
     // composer with its files, not retained as a bubble.
     let uploadFailed = false;
@@ -2685,7 +2677,45 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // status transitions that happen during the turn.
         queryClient?.invalidateQueries({ queryKey: ["conversations"] });
       };
-      await deliver();
+      try {
+        await deliver();
+      } catch (firstErr) {
+        // A thrown fetch says nothing about whether the server took the
+        // message. Ask once, a second later, with the same stable id: the
+        // server dedupes it and answers with the committed copy if it landed.
+        // This runs while the send still holds the chain, so a message typed
+        // meanwhile cannot overtake the one being checked.
+        // Nothing to check when the attachment never uploaded (no server copy),
+        // when the caller runs its own recovery (the queue flush), or when the
+        // session never bound (a navigate-first first send). A failed re-bind
+        // of a dropped stream on an existing conversation is checked like a
+        // failed POST: the re-attempt binds again.
+        const checkTarget = postedSessionId ?? submitConversationId;
+        if (
+          uploadFailed ||
+          modelGateFailed ||
+          opts?.onError !== undefined ||
+          !isTransportError(firstErr) ||
+          checkTarget === null ||
+          (postedSessionId === null && opts?.reusePendingTempId !== undefined)
+        ) {
+          throw firstErr;
+        }
+        const stillPending = (): boolean =>
+          setterForState(checkTarget)?.pendingUserMessages.some((p) => p.tempId === tempId) ??
+          false;
+        if (!stillPending()) throw firstErr;
+        setSendFailed(checkTarget, tempId, { attempts: 1 });
+        await sleep(SEND_CHECK_DELAY_MS);
+        if (!stillPending()) throw firstErr;
+        setSendFailed(checkTarget, tempId, undefined);
+        try {
+          await deliver();
+        } catch (checkErr) {
+          checkAttempts = 2;
+          throw checkErr;
+        }
+      }
     } catch (err) {
       if (initialDraft && !initialDispatched && !initialSendPending()) return;
       const { message, code } = describeSendFailure(err);
@@ -2746,6 +2776,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             deliver,
             !alreadyStreaming,
             isTransportError(err) ? undefined : message,
+            checkAttempts,
           );
         }
       } else {
@@ -2805,7 +2836,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   cancelPendingSend: (tempId) => {
     const entry = failedSends.get(tempId);
     const sessionId = entry?.sessionId ?? get().conversationId;
-    if (entry?.checkTimer) clearTimeout(entry.checkTimer);
     failedSends.delete(tempId);
     if (sessionId === null) return;
     forgetFailedBubble(sessionId, tempId);

@@ -379,8 +379,33 @@ def mark_dispatched(conversation_id: str, stable_id: str) -> None:
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
     :param stable_id: The client's 32-char hex submission id.
     """
+    now = _now()
     with _lock:
-        _dispatched.setdefault(conversation_id, {})[stable_id] = _now()
+        entries = _dispatched.setdefault(conversation_id, {})
+        entries.pop(stable_id, None)
+        entries[stable_id] = now
+        _evict_stale_dispatched_locked(conversation_id, now)
+
+
+def _evict_stale_dispatched_locked(conversation_id: str, now: float) -> None:
+    """
+    Drop dispatched submissions past the TTL or the per-conversation cap.
+
+    Runs on every write so ordinary successful sends, which are never queried
+    again, do not accumulate. Caller must hold :data:`_lock`.
+
+    :param conversation_id: Conversation/session id to sweep.
+    :param now: Current ``time.monotonic()`` value to compare against.
+    """
+    entries = _dispatched.get(conversation_id)
+    if entries is None:
+        return
+    for sid in [sid for sid, at in entries.items() if now - at > _COMMITTED_TTL_S]:
+        entries.pop(sid, None)
+    while len(entries) > _COMMITTED_MAX_PER_CONVERSATION:
+        entries.pop(next(iter(entries)))
+    if not entries:
+        _dispatched.pop(conversation_id, None)
 
 
 def dispatch_done(conversation_id: str, stable_id: str) -> bool:

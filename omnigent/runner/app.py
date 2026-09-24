@@ -23,7 +23,7 @@ import tempfile
 import time
 import urllib.parse
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, cast, overload
@@ -3119,6 +3119,12 @@ def create_runner_app(
 
     _session_histories = _session_histories_ref
     _last_server_item_id: dict[str, str] = {}
+    # Persisted item ids whose forwarded message already started (or
+    # buffered) a turn, per conversation. The server dedupes web re-sends,
+    # but its memory is process-local: after a server restart a re-send of a
+    # message this runner already ran arrives as a fresh forward. The runner
+    # outlives the server, so this is the durable half of that guarantee.
+    _started_item_ids: dict[str, deque[str]] = {}
     _session_event_queues = _session_event_queues_ref
     app.state.session_event_queues = _session_event_queues
     _session_inboxes = _session_inboxes_ref
@@ -9894,6 +9900,26 @@ def create_runner_app(
                 )
             message_body = dict(body)
             message_body["conversation_id"] = conversation_id
+
+            persisted_item_id = message_body.get("persisted_item_id")
+            if isinstance(persisted_item_id, str) and persisted_item_id:
+                started = _started_item_ids.setdefault(conversation_id, deque(maxlen=64))
+                if persisted_item_id in started:
+                    _logger.info(
+                        "post_session_events: message %s already started a turn for conv=%s; "
+                        "not running it again",
+                        persisted_item_id,
+                        conversation_id,
+                        extra={"session_id": conversation_id},
+                    )
+                    return JSONResponse(
+                        status_code=202,
+                        content={
+                            "status": "duplicate",
+                            "detail": "Message already started a turn; not running it again.",
+                        },
+                    )
+                started.append(persisted_item_id)
 
             if _is_native_harness(conversation_id):
                 resource_registry.note_session_turn_started(conversation_id)

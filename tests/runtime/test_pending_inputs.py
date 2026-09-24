@@ -503,3 +503,30 @@ def test_snapshot_carries_the_web_stable_id() -> None:
     snapshot = pending_inputs.snapshot_for("conv_a")
     assert [entry.get("stable_id") for entry in snapshot] == ["a" * 32, None]
     assert "stable_id" not in snapshot[1]
+
+
+def test_dispatched_memory_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Successful sends are swept on write: by age and by a per-conversation cap.
+
+    Ordinary sends are never queried again, so eviction cannot rely on reads.
+    """
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+
+    pending_inputs.mark_dispatched("conv_a", "a" * 32)
+    clock["t"] = 1000.0 + pending_inputs._COMMITTED_TTL_S + 1
+    pending_inputs.mark_dispatched("conv_a", "b" * 32)  # the write sweeps the stale one
+    assert pending_inputs.dispatch_done("conv_a", "a" * 32) is False
+    assert pending_inputs.dispatch_done("conv_a", "b" * 32) is True
+
+    for i in range(pending_inputs._COMMITTED_MAX_PER_CONVERSATION + 5):
+        pending_inputs.mark_dispatched("conv_cap", f"{i:032x}")
+    assert pending_inputs.dispatch_done("conv_cap", f"{0:032x}") is False
+    assert pending_inputs.dispatch_done("conv_cap", f"{5:032x}") is True
+    assert (
+        pending_inputs.dispatch_done(
+            "conv_cap", f"{pending_inputs._COMMITTED_MAX_PER_CONVERSATION + 4:032x}"
+        )
+        is True
+    )

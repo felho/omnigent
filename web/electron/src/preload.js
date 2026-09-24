@@ -454,6 +454,13 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
    *  persisted — resets to the OS default on relaunch.
    *  @param {"light"|"dark"|"system"} scheme */
   setColorScheme: (scheme) => ipcRenderer.send("omnigent:setup-set-color-scheme", scheme),
+  /** Subscribe to the wizard's effective theme ("dark"/"light") so the renderer
+   *  can sync its `.dark` class; fires on set and on OS changes. */
+  onColorScheme: (callback) => {
+    const listener = (_event, theme) => callback(theme);
+    ipcRenderer.on("omnigent:setup-theme", listener);
+    return () => ipcRenderer.removeListener("omnigent:setup-theme", listener);
+  },
   /** Recently-connected server URLs, most recent first. */
   getRecentServers: () => ipcRenderer.invoke("omnigent:get-recent-servers"),
   /** Drop one recent server from the saved list; resolves the remaining ones. */

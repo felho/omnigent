@@ -26,6 +26,7 @@ interface OmnigentSetup {
   setServerSelectorV2?: (enabled: boolean) => Promise<unknown>;
   getSetupCapabilities?: () => Promise<{ v2Forced?: boolean }>;
   setColorScheme?: (scheme: "light" | "dark" | "system") => void;
+  onColorScheme?: (cb: (theme: "light" | "dark") => void) => () => void;
   getCliStatus: () => Promise<{ installed?: boolean; installSupported?: boolean }>;
   startLocalServer: () => Promise<{ ok?: boolean; url?: string; error?: string }>;
   onLocalServerSetupLog?: (cb: (line: string) => void) => () => void;
@@ -98,17 +99,26 @@ function BridgeSetupApp() {
       setInstalled(status?.installed === true);
       setInstallSupported(status?.installSupported === true);
     });
-    // Older shells omit getSetupCapabilities → leave the item enabled.
-    bridge
-      .getSetupCapabilities?.()
-      .then((caps) => setV2Forced(caps?.v2Forced === true))
-      .catch(() => {});
-    Promise.allSettled([savedUrl, recents, managed, cli]).then(() => {
+    // Older shells omit getSetupCapabilities → leave the item enabled. Gate on
+    // it too, so the legacy item isn't shown enabled before v2Forced resolves.
+    const caps = bridge.getSetupCapabilities
+      ? bridge.getSetupCapabilities().then((c) => setV2Forced(c?.v2Forced === true))
+      : Promise.resolve();
+    Promise.allSettled([savedUrl, recents, managed, cli, caps]).then(() => {
       // A failed CLI probe means "not installed" rather than unknown.
       setInstalled((prev) => prev ?? false);
       setReady(true);
     });
   }, [failedUrl, isEphemeral]);
+
+  // Sync the wizard's `.dark` class with the shell's effective theme: the dark
+  // styles key off the class (index.css), not the OS media query. The shell
+  // pushes on scheme change and on OS changes (so "System" tracks live).
+  useEffect(() => {
+    return setupBridge()?.onColorScheme?.((theme) =>
+      document.documentElement.classList.toggle("dark", theme === "dark"),
+    );
+  }, []);
 
   const setup: ServerSelectorV2Setup = {
     initialUrl,

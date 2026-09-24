@@ -3406,11 +3406,29 @@ function registerIpc() {
   // Setup page → live color-scheme override (System/Light/Dark) for the wizard.
   // Separate sender gate from the SPA handler above: the setup page isn't a
   // pinned origin. Not persisted — resets to the OS default on relaunch.
+  // Tracks setup senders wired to nativeTheme "updated" so we register once.
+  const setupThemeSenders = new Set();
   ipcMain.on("omnigent:setup-set-color-scheme", (event, scheme) => {
     if (!isSetupPageSender(event)) return;
-    if (scheme === "light" || scheme === "dark" || scheme === "system") {
-      nativeTheme.themeSource = scheme;
+    if (scheme !== "light" && scheme !== "dark" && scheme !== "system") return;
+    nativeTheme.themeSource = scheme;
+    // The wizard's dark styles key off a `.dark` class (index.css), not the OS
+    // media query, so push the effective theme back for the renderer to apply.
+    // Track later OS changes too, so "System" restyles live (like the update
+    // overlay). Sender-scoped, and cleaned up when the page goes away.
+    const sender = event.sender;
+    const pushTheme = () =>
+      sender.send("omnigent:setup-theme", nativeTheme.shouldUseDarkColors ? "dark" : "light");
+    if (!setupThemeSenders.has(sender)) {
+      setupThemeSenders.add(sender);
+      const onUpdated = () => pushTheme();
+      nativeTheme.on("updated", onUpdated);
+      sender.once("destroyed", () => {
+        nativeTheme.removeListener("updated", onUpdated);
+        setupThemeSenders.delete(sender);
+      });
     }
+    pushTheme();
   });
 
   // SPA → start / stop / restart this machine's host daemon for the window's

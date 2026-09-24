@@ -12248,7 +12248,8 @@ async def test_native_duplicate_during_transcript_append_does_not_repaste(
 
     Draining the pending entry and appending the committed item are separated
     by an await. A duplicate POST in that window must still resolve to the
-    committed id (remembered before the await) instead of forwarding.
+    submission — by its pending id, since the append has not landed yet —
+    instead of forwarding.
     """
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes import sessions as sessions_module
@@ -12293,6 +12294,7 @@ async def test_native_duplicate_during_transcript_append_does_not_repaste(
         try:
             first = await client.post(events_url, json=message)
             assert first.status_code == 202, first.text
+            pending_id = first.json()["pending_id"]
             pastes_after_first = sum(
                 1 for r in runner_requests if r.method == "POST" and r.url.path == events_url
             )
@@ -12324,7 +12326,10 @@ async def test_native_duplicate_during_transcript_append_does_not_repaste(
             echoed, duplicate = await asyncio.gather(mirror, late_duplicate())
             assert echoed.status_code == 202, echoed.text
             assert duplicate.status_code == 202, duplicate.text
-            assert duplicate.json() == {"queued": True, "item_id": echoed.json()["item_id"]}
+            assert duplicate.json() == {"queued": True, "pending_id": pending_id}
+            # Once the append has landed, the same re-send resolves to the item.
+            settled = await client.post(events_url, json=message)
+            assert settled.json() == {"queued": True, "item_id": echoed.json()["item_id"]}
             pastes = sum(
                 1 for r in runner_requests if r.method == "POST" and r.url.path == events_url
             )
@@ -12593,31 +12598,328 @@ def test_same_web_submission_requires_exact_author_match() -> None:
 
     Same text under an existing id is a re-send only when it is the same user
     message by the same author. ``None == None`` still covers single-user mode.
+    A stored item that is not a user message can never be repeated.
     """
-    from omnigent.entities import ConversationItem, MessageData, NewConversationItem
-    from omnigent.server.routes._sessions.orchestration import _same_web_submission
+    from omnigent.entities import ConversationItem, MessageData
+    from omnigent.server.routes._sessions.orchestration import (
+        _same_web_submission,
+        _stored_web_submission,
+    )
+    from omnigent.server.schemas import SessionEventInput
 
     content = [{"type": "input_text", "text": "hi"}]
+    body = SessionEventInput(type="message", data={"role": "user", "content": content})
 
-    def stored(created_by: str | None) -> ConversationItem:
+    assert _same_web_submission(content, None, body, None) is True
+    assert _same_web_submission(content, "alice@example.com", body, "alice@example.com") is True
+    assert _same_web_submission(content, None, body, "alice@example.com") is False
+    assert _same_web_submission(content, "alice@example.com", body, None) is False
+    assert _same_web_submission(content, "alice@example.com", body, "bob@example.com") is False
+    assert _same_web_submission([{"type": "input_text", "text": "ho"}], None, body, None) is False
+
+    def stored(data: MessageData, created_by: str | None) -> ConversationItem:
         return ConversationItem(
             id="a" * 32,
             type="message",
             status="completed",
             response_id="resp_x",
             created_at=0,
-            data=MessageData(role="user", content=content),
+            data=data,
             created_by=created_by,
         )
 
-    item = NewConversationItem(
-        type="message", response_id="resp_y", data=MessageData(role="user", content=content)
+    assert _stored_web_submission(stored(MessageData(role="user", content=content), "x")) == (
+        content,
+        "x",
     )
-    assert _same_web_submission(stored(None), item, None) is True
-    assert _same_web_submission(stored("alice@example.com"), item, "alice@example.com") is True
-    assert _same_web_submission(stored(None), item, "alice@example.com") is False
-    assert _same_web_submission(stored("alice@example.com"), item, None) is False
-    assert _same_web_submission(stored("alice@example.com"), item, "bob@example.com") is False
+    reply = MessageData(role="assistant", agent="tester", content=content)
+    assert _stored_web_submission(stored(reply, None)) == (None, None)
+    assert _same_web_submission(*_stored_web_submission(stored(reply, None)), body, None) is False
+
+
+async def test_overlapping_conflicting_submission_is_rejected(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A different message reusing an in-flight stable_id is refused, not coalesced.
+
+    Coalescing hands a duplicate the first request's outcome. That is only
+    right for a genuine re-send; a new prompt under the same id must get a
+    400 at once, with only the original dispatched and nothing of the new
+    text in the transcript.
+    """
+    from omnigent.runtime import pending_inputs
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    forwards: list[httpx.Request] = []
+    gate = asyncio.Event()
+
+    async def runner_handler(request: httpx.Request) -> httpx.Response:
+        forwards.append(request)
+        await gate.wait()
+        return httpx.Response(202, json={"queued": True})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(runner_handler), base_url="http://runner"
+    )
+
+    async def get_runner_client(_session_id: str, _runner_router: object) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr("omnigent.server.routes.sessions._get_runner_client", get_runner_client)
+    stable_id = "8" * 32
+
+    def message(text: str) -> dict[str, object]:
+        return {
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+                "stable_id": stable_id,
+            },
+        }
+
+    events_url = f"/v1/sessions/{session['id']}/events"
+    pending_inputs.reset_for_tests()
+    try:
+        first_task = asyncio.create_task(client.post(events_url, json=message("the original")))
+        for _ in range(100):
+            if forwards:
+                break
+            await asyncio.sleep(0.01)
+        assert forwards, "the first forward never started"
+        conflicting = await asyncio.wait_for(
+            client.post(events_url, json=message("something else")), timeout=2
+        )
+        assert conflicting.status_code == 400, conflicting.text
+        assert not first_task.done()
+        gate.set()
+        first = await first_task
+        assert first.status_code == 202, first.text
+        assert len(forwards) == 1
+    finally:
+        await fake_runner.aclose()
+        pending_inputs.reset_for_tests()
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    texts = [
+        block["text"]
+        for item in items
+        if item["type"] == "message"
+        for block in item.get("content", [])
+        if "text" in block
+    ]
+    assert "the original" in texts
+    assert "something else" not in texts
+
+
+async def test_native_conflicting_submission_under_a_known_stable_id_is_rejected(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The native index answers only a genuine re-send; a different body gets 400.
+
+    Both while the first delivery's entry is live and after the forwarder has
+    mirrored it back, a new prompt reusing the stable_id is refused before
+    anything reaches the terminal, while the real re-send still resolves.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    runner_requests: list[httpx.Request] = []
+
+    def runner_handler(request: httpx.Request) -> httpx.Response:
+        runner_requests.append(request)
+        return httpx.Response(202, json={})
+
+    monkeypatch.setattr(
+        orchestration,
+        "_ensure_native_terminal_ready",
+        AsyncMock(return_value=_NativeTerminalEnsureOutcome(error=None)),
+    )
+    monkeypatch.setattr(
+        sessions_module, "_ensure_runner_session_initialized", AsyncMock(return_value=True)
+    )
+    stable_id = "b" * 32
+    content = [{"type": "input_text", "text": "the original"}]
+
+    def message(text_content: list[dict[str, str]]) -> dict[str, object]:
+        return {
+            "type": "message",
+            "data": {"role": "user", "content": text_content, "stable_id": stable_id},
+        }
+
+    conflicting = message([{"type": "input_text", "text": "something else"}])
+    pending_inputs.reset_for_tests()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner_handler), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(orchestration, "_get_runner_client", AsyncMock(return_value=runner))
+        agent = await create_test_agent(client, name="claude-native-ui")
+        created = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "labels": {"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"},
+            },
+        )
+        assert created.status_code == 201, created.text
+        session_id = created.json()["id"]
+        events_url = f"/v1/sessions/{session_id}/events"
+
+        def pastes() -> int:
+            return sum(
+                1 for r in runner_requests if r.method == "POST" and r.url.path == events_url
+            )
+
+        try:
+            first = await client.post(events_url, json=message(content))
+            assert first.status_code == 202, first.text
+            pending_id = first.json()["pending_id"]
+
+            # Live entry: the conflicting body is refused, the re-send resolves.
+            refused = await client.post(events_url, json=conflicting)
+            assert refused.status_code == 400, refused.text
+            again = await client.post(events_url, json=message(content))
+            assert again.json() == {"queued": True, "pending_id": pending_id}
+
+            echoed = await client.post(
+                events_url,
+                json={
+                    "type": "external_conversation_item",
+                    "data": {
+                        "item_type": "message",
+                        "item_data": {"role": "user", "content": content},
+                    },
+                },
+            )
+            assert echoed.status_code == 202, echoed.text
+
+            # Committed: same answer shape, same refusal.
+            refused = await client.post(events_url, json=conflicting)
+            assert refused.status_code == 400, refused.text
+            again = await client.post(events_url, json=message(content))
+            assert again.json() == {"queued": True, "item_id": echoed.json()["item_id"]}
+            assert pastes() == 1
+        finally:
+            pending_inputs.reset_for_tests()
+
+
+async def test_native_append_failure_keeps_the_submission_pending(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A mirrored message whose transcript append fails stays a pending submission.
+
+    Draining the entry and appending are separated by an await. A re-send in
+    that window is answered with the pending id, never with an item id that
+    may not land. When the append fails, the entry returns to the queue: the
+    snapshot still shows it, a re-send still resolves to it, and the
+    forwarder's retry commits it — without a second paste at any point.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    runner_requests: list[httpx.Request] = []
+
+    def runner_handler(request: httpx.Request) -> httpx.Response:
+        runner_requests.append(request)
+        return httpx.Response(202, json={})
+
+    monkeypatch.setattr(
+        orchestration,
+        "_ensure_native_terminal_ready",
+        AsyncMock(return_value=_NativeTerminalEnsureOutcome(error=None)),
+    )
+    monkeypatch.setattr(
+        sessions_module, "_ensure_runner_session_initialized", AsyncMock(return_value=True)
+    )
+    stable_id = "c" * 32
+    content = [{"type": "input_text", "text": "land eventually"}]
+    message = {
+        "type": "message",
+        "data": {"role": "user", "content": content, "stable_id": stable_id},
+    }
+    mirror = {
+        "type": "external_conversation_item",
+        "data": {"item_type": "message", "item_data": {"role": "user", "content": content}},
+    }
+    pending_inputs.reset_for_tests()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner_handler), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(orchestration, "_get_runner_client", AsyncMock(return_value=runner))
+        agent = await create_test_agent(client, name="claude-native-ui")
+        created = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "labels": {"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"},
+            },
+        )
+        assert created.status_code == 201, created.text
+        session_id = created.json()["id"]
+        events_url = f"/v1/sessions/{session_id}/events"
+
+        def pastes() -> int:
+            return sum(
+                1 for r in runner_requests if r.method == "POST" and r.url.path == events_url
+            )
+
+        try:
+            first = await client.post(events_url, json=message)
+            assert first.status_code == 202, first.text
+            pending_id = first.json()["pending_id"]
+
+            # The first append is slow and fails; later ones behave normally.
+            real_append = SqlAlchemyConversationStore.append
+            failures: list[str] = []
+
+            def failing_append(self: object, *args: object, **kwargs: object) -> object:
+                if not failures:
+                    failures.append("transcript store unavailable")
+                    time.sleep(0.2)
+                    raise RuntimeError(failures[0])
+                return real_append(self, *args, **kwargs)  # type: ignore[arg-type]
+
+            monkeypatch.setattr(SqlAlchemyConversationStore, "append", failing_append)
+
+            async def failing_mirror() -> int | None:
+                try:
+                    return (await client.post(events_url, json=mirror)).status_code
+                except RuntimeError:
+                    return None
+
+            async def duplicate_during_append() -> httpx.Response:
+                await asyncio.sleep(0.05)
+                return await client.post(events_url, json=message)
+
+            mirror_status, during = await asyncio.gather(
+                failing_mirror(), duplicate_during_append()
+            )
+            assert mirror_status is None or mirror_status >= 500
+            assert during.json() == {"queued": True, "pending_id": pending_id}
+
+            snapshot = (await client.get(f"/v1/sessions/{session_id}")).json()
+            assert [p["stable_id"] for p in snapshot["pending_inputs"]] == [stable_id]
+            after = await client.post(events_url, json=message)
+            assert after.json() == {"queued": True, "pending_id": pending_id}
+
+            retried = await client.post(events_url, json=mirror)  # the forwarder retries
+            assert retried.status_code == 202, retried.text
+            committed = await client.post(events_url, json=message)
+            assert committed.json() == {"queued": True, "item_id": retried.json()["item_id"]}
+            assert (await client.get(f"/v1/sessions/{session_id}")).json()["pending_inputs"] == []
+            assert pastes() == 1
+        finally:
+            pending_inputs.reset_for_tests()
 
 
 def test_consumed_event_carries_the_web_stable_id(monkeypatch: pytest.MonkeyPatch) -> None:

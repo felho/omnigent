@@ -63,10 +63,13 @@ evicted lazily on the next :func:`record` / :func:`snapshot_for` /
 :func:`resolve_oldest` for the same conversation.
 
 A web client that loses the POST response re-sends the same submission
-with the same ``stable_id``. :func:`pending_id_for` answers such a retry
-while the entry is still live, and :func:`remember_committed` /
-:func:`committed_item_id` answer it after the forwarder has drained the
-entry, so neither case pastes the prompt into the terminal a second time.
+with the same ``stable_id``. :func:`submission_for` answers such a retry
+with what the index knows — the live entry, the entry whose transcript
+append is in flight (:func:`begin_persist`), or the committed item
+(:func:`remember_committed`) — together with the content and author it
+was first posted under, so the route can refuse a different message that
+reuses the id instead of discarding it. No case pastes the prompt into
+the terminal a second time.
 """
 
 from __future__ import annotations
@@ -139,6 +142,40 @@ class MatchedDrain:
     skipped: list[DrainedInput]
 
 
+@dataclass(frozen=True)
+class RecordedSubmission:
+    """
+    What the index knows about one web submission, keyed by its ``stable_id``.
+
+    Returned by :func:`submission_for` so the route can answer a client
+    re-send with the first delivery's outcome once it has checked that the
+    re-send repeats this content and author.
+
+    :param content: The message content blocks exactly as first POSTed.
+    :param created_by: Authenticated identity of the original poster, e.g.
+        ``"alice@example.com"``; ``None`` when unknown.
+    :param pending_id: The entry's id while it is queued or being persisted,
+        e.g. ``"pending_a1b2c3"``; ``None`` once committed.
+    :param item_id: The committed item's id once the transcript append has
+        landed; ``None`` before that.
+    """
+
+    content: list[dict[str, Any]]
+    created_by: str | None
+    pending_id: str | None = None
+    item_id: str | None = None
+
+
+@dataclass
+class _Committed:
+    """A web submission whose mirrored item has been persisted."""
+
+    item_id: str
+    content: list[dict[str, Any]]
+    created_by: str | None
+    remembered_at: float
+
+
 @dataclass
 class _Entry:
     """
@@ -185,11 +222,21 @@ _lock = threading.Lock()
 # for as long as a submission can still be retried.
 _COMMITTED_TTL_S: float = 24 * 3600.0
 # Per-conversation cap on remembered submissions; the oldest is dropped first.
-_COMMITTED_MAX_PER_CONVERSATION = 256
+# Sized well above the web messages one conversation can see in a day, so
+# within the retry window eviction is by age, not by count.
+_COMMITTED_MAX_PER_CONVERSATION = 4096
 
-# Per-conversation mapping conversation_id → {stable_id: (item_id, remembered_at)}.
+# Per-conversation mapping conversation_id → {stable_id: _Committed}.
 # Insertion-ordered so the cap above evicts the oldest submission.
-_committed: WorkspaceScopedCache[str, dict[str, tuple[str, float]]] = WorkspaceScopedCache()
+_committed: WorkspaceScopedCache[str, dict[str, _Committed]] = WorkspaceScopedCache()
+
+# Drained web submissions whose transcript append is still in flight:
+# conversation_id → {stable_id: (entry, drained_at)}. A re-send in this window
+# is answered with the entry's pending id, never with an item id that may not
+# land; :func:`remember_committed` or :func:`restore` settles the entry.
+_persisting: WorkspaceScopedCache[str, dict[str, tuple[DrainedInput, float]]] = (
+    WorkspaceScopedCache()
+)
 
 # Web submissions the SDK path has successfully forwarded to the runner:
 # conversation_id → {stable_id: dispatched_at}. The item is persisted before
@@ -296,82 +343,125 @@ def resolve(conversation_id: str, pending_id: str) -> None:
             _pending.pop(conversation_id, None)
 
 
-def pending_id_for(conversation_id: str, stable_id: str) -> str | None:
+def submission_for(conversation_id: str, stable_id: str) -> RecordedSubmission | None:
     """
-    Return the live pending id recorded for ``stable_id``, or ``None``.
+    Return what the index knows about web submission ``stable_id``, or ``None``.
 
     A web client that lost the POST response re-sends with the same
-    ``stable_id``. While the first delivery's entry is still un-consumed,
-    the route answers the retry with that entry instead of forwarding the
-    prompt to the terminal again.
+    ``stable_id``. The route answers the re-send from here instead of
+    forwarding the prompt to the terminal again: with the committed item once
+    the forwarder's mirror has been persisted, otherwise with the pending id
+    of the live or being-persisted entry. The recorded content and author let
+    the route refuse a different message that reuses the id.
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
     :param stable_id: The client's 32-char hex submission id.
-    :returns: The matching entry's pending id, or ``None`` when no live
-        entry carries ``stable_id``.
-    """
-    with _lock:
-        _evict_stale_locked(conversation_id, _now())
-        for entry in _pending.get(conversation_id, {}).values():
-            if entry.stable_id == stable_id:
-                return entry.pending_id
-    return None
-
-
-def remember_committed(conversation_id: str, stable_id: str, item_id: str) -> None:
-    """
-    Remember that web submission ``stable_id`` was persisted as ``item_id``.
-
-    Called when the transcript forwarder's mirror of a web message drains its
-    pending entry. A later client retry of the same submission (its POST
-    response was lost) then resolves to the committed item instead of
-    dispatching the prompt a second time. Entries expire after
-    :data:`_COMMITTED_TTL_S`.
-
-    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
-    :param stable_id: The client's 32-char hex submission id.
-    :param item_id: Store-assigned id of the persisted user message.
+    :returns: The recorded submission, or ``None`` when the id is unknown to
+        this process or has expired.
     """
     now = _now()
     with _lock:
-        entries = _committed.setdefault(conversation_id, {})
-        entries.pop(stable_id, None)
-        entries[stable_id] = (item_id, now)
         _evict_stale_committed_locked(conversation_id, now)
+        committed = _committed.get(conversation_id, {}).get(stable_id)
+        if committed is not None:
+            return RecordedSubmission(
+                content=copy.deepcopy(committed.content),
+                created_by=committed.created_by,
+                item_id=committed.item_id,
+            )
+        _evict_stale_persisting_locked(conversation_id, now)
+        persisting = _persisting.get(conversation_id, {}).get(stable_id)
+        if persisting is not None:
+            entry, _drained_at = persisting
+            return RecordedSubmission(
+                content=copy.deepcopy(entry.content),
+                created_by=entry.created_by,
+                pending_id=entry.pending_id,
+            )
+        _evict_stale_locked(conversation_id, now)
+        for live in _pending.get(conversation_id, {}).values():
+            if live.stable_id == stable_id:
+                return RecordedSubmission(
+                    content=copy.deepcopy(live.content),
+                    created_by=live.created_by,
+                    pending_id=live.pending_id,
+                )
+    return None
 
 
-def committed_item_id(conversation_id: str, stable_id: str) -> str | None:
+def begin_persist(conversation_id: str, drained: DrainedInput) -> None:
     """
-    Return the committed item id remembered for ``stable_id``, or ``None``.
+    Mark a drained web submission as being persisted.
+
+    Called after :func:`resolve_oldest` / :func:`resolve_matching_text` hands
+    an entry to the transcript append. Until :func:`remember_committed` (the
+    append landed) or :func:`restore` (it did not) settles the entry, a
+    re-send of its ``stable_id`` resolves to the entry's pending id — never to
+    an item id that may not exist. No-op for an entry without a stable id.
+    Markers not settled within :data:`_TTL_S` are dropped.
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
-    :param stable_id: The client's 32-char hex submission id.
-    :returns: The persisted item id recorded by :func:`remember_committed`,
-        or ``None`` when the submission is unknown or has expired.
+    :param drained: The drained entry.
     """
+    if drained.stable_id is None:
+        return
     with _lock:
-        _evict_stale_committed_locked(conversation_id, _now())
-        entries = _committed.get(conversation_id)
-        if entries is None:
-            return None
-        found = entries.get(stable_id)
-        return None if found is None else found[0]
+        _persisting.setdefault(conversation_id, {})[drained.stable_id] = (drained, _now())
 
 
-def forget_committed(conversation_id: str, stable_id: str) -> None:
+def _forget_persisting_locked(conversation_id: str, stable_id: str | None) -> None:
+    """Settle a :func:`begin_persist` marker. Caller must hold :data:`_lock`."""
+    if stable_id is None:
+        return
+    entries = _persisting.get(conversation_id)
+    if entries is None:
+        return
+    entries.pop(stable_id, None)
+    if not entries:
+        _persisting.pop(conversation_id, None)
+
+
+def _evict_stale_persisting_locked(conversation_id: str, now: float) -> None:
+    """Drop persist markers older than :data:`_TTL_S`. Caller must hold :data:`_lock`."""
+    entries = _persisting.get(conversation_id)
+    if entries is None:
+        return
+    for sid in [sid for sid, (_, at) in entries.items() if now - at > _TTL_S]:
+        entries.pop(sid, None)
+    if not entries:
+        _persisting.pop(conversation_id, None)
+
+
+def remember_committed(conversation_id: str, drained: DrainedInput, item_id: str) -> None:
     """
-    Drop a remembered submission (its persist turned out to be a duplicate).
+    Remember that a drained web submission was persisted as ``item_id``.
+
+    Called once the transcript forwarder's mirror of a web message has been
+    appended. A later client re-send of the same submission (its POST
+    response was lost) then resolves to the committed item instead of
+    dispatching the prompt a second time; the content and author are kept so
+    the route can tell such a re-send from a different message reusing the
+    id. Settles the entry's :func:`begin_persist` marker. No-op for an entry
+    without a stable id. Entries expire after :data:`_COMMITTED_TTL_S`.
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
-    :param stable_id: The client's 32-char hex submission id.
+    :param drained: The drained entry the persisted item was built from.
+    :param item_id: Store-assigned id of the persisted user message.
     """
+    if drained.stable_id is None:
+        return
+    now = _now()
     with _lock:
-        entries = _committed.get(conversation_id)
-        if entries is None:
-            return
-        entries.pop(stable_id, None)
-        if not entries:
-            _committed.pop(conversation_id, None)
+        _forget_persisting_locked(conversation_id, drained.stable_id)
+        entries = _committed.setdefault(conversation_id, {})
+        entries.pop(drained.stable_id, None)
+        entries[drained.stable_id] = _Committed(
+            item_id=item_id,
+            content=copy.deepcopy(drained.content),
+            created_by=drained.created_by,
+            remembered_at=now,
+        )
+        _evict_stale_committed_locked(conversation_id, now)
 
 
 def mark_dispatched(conversation_id: str, stable_id: str) -> None:
@@ -449,7 +539,7 @@ def _evict_stale_committed_locked(conversation_id: str, now: float) -> None:
     entries = _committed.get(conversation_id)
     if entries is None:
         return
-    stale = [sid for sid, (_, at) in entries.items() if now - at > _COMMITTED_TTL_S]
+    stale = [sid for sid, c in entries.items() if now - c.remembered_at > _COMMITTED_TTL_S]
     for sid in stale:
         entries.pop(sid, None)
     while len(entries) > _COMMITTED_MAX_PER_CONVERSATION:
@@ -505,10 +595,12 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
     """
     Put a drained entry back at the FRONT of the pending queue.
 
-    Compensation for a drain whose persist turned out to be a duplicate
-    (an idempotent external-item append deduplicated the retry): the
-    entry belongs to the NEXT user message, and it was the oldest when
-    drained, so it returns to the head to keep FIFO intact.
+    Compensation for a drain whose persist did not land — the idempotent
+    external-item append deduplicated a forwarder retry, so the entry
+    belongs to the NEXT user message, or the append failed and the
+    forwarder will retry it. The entry was the oldest when drained, so it
+    returns to the head to keep FIFO intact. Settles the entry's
+    :func:`begin_persist` marker.
 
     :param conversation_id: Conversation/session id, e.g.
         ``"conv_abc123"``.
@@ -523,6 +615,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         background_titles_enabled=drained.background_titles_enabled,
     )
     with _lock:
+        _forget_persisting_locked(conversation_id, drained.stable_id)
         entries = _pending.get(conversation_id, {})
         _pending[conversation_id] = {drained.pending_id: entry, **entries}
 
@@ -675,5 +768,6 @@ def reset_for_tests() -> None:
     """
     with _lock:
         _pending.clear()
+        _persisting.clear()
         _committed.clear()
         _dispatched.clear()

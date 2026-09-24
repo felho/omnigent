@@ -17,6 +17,7 @@ import secrets
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 import httpx
@@ -2631,17 +2632,15 @@ async def _persist_external_conversation_item(
             # source_id from the forwarder takes precedence when both are set.
             if drained.stable_id is not None and item.stable_id is None:
                 item = item.model_copy(update={"stable_id": drained.stable_id})
-            # The entry is gone from the queue from here on, and the append
-            # below is awaited. The store uses ``item.stable_id`` as the item
-            # id, so the committed id is known now: remember it before the
-            # await, or a re-send arriving meanwhile finds neither a pending
-            # entry nor a committed id and pastes again.
-            if drained.stable_id is not None and item.stable_id is not None:
-                pending_inputs.remember_committed(session_id, drained.stable_id, item.stable_id)
+            # The entries are gone from the queue and the append below is
+            # awaited: a re-send arriving meanwhile must still find them.
+            for entry in (*skipped_kiro_pending, drained):
+                pending_inputs.begin_persist(session_id, entry)
         elif item.created_by is None and created_by is not None:
             # No pending entry — direct terminal input. Fall back to the
             # identity authenticated on the forwarder's own request.
             item = item.model_copy(update={"created_by": created_by})
+
     # Build the batch: skipped Kiro entries first (their positions must
     # precede the matched item to match broadcast order), then the anchor.
     # Each skipped entry gets a pair of items (user message + error) with
@@ -2649,39 +2648,46 @@ async def _persist_external_conversation_item(
     # under the append lock — no separate has_item probe needed. When the
     # anchor is already persisted (a forwarder retry), append returns every
     # item as deduplicated and the queue entries are restored below.
-    skipped_new_items = _build_skipped_kiro_items(session_id, skipped_kiro_pending)
-    batch = [*skipped_new_items, item]
-    pending_background_title = prepare_background_session_title(
-        coordinator=background_title_coordinator,
-        conversation=conv,
-        event=SessionEventInput(type=item.type, data=item.data.model_dump()),
-        enabled=enabled and (drained is None or drained.background_titles_enabled),
-    )
-    persisted_items = await asyncio.to_thread(conversation_store.append, session_id, batch)
+    def _restore_drained() -> None:
+        # Every entry consumed above is still un-consumed — restore in original
+        # queue order (skipped entries preceded the match; restore prepends, so
+        # reverse).
+        for entry in reversed([*skipped_kiro_pending, drained]):
+            if entry is not None:
+                pending_inputs.restore(session_id, entry)
+
+    try:
+        skipped_new_items = _build_skipped_kiro_items(session_id, skipped_kiro_pending)
+        batch = [*skipped_new_items, item]
+        pending_background_title = prepare_background_session_title(
+            coordinator=background_title_coordinator,
+            conversation=conv,
+            event=SessionEventInput(type=item.type, data=item.data.model_dump()),
+            enabled=enabled and (drained is None or drained.background_titles_enabled),
+        )
+        persisted_items = await asyncio.to_thread(conversation_store.append, session_id, batch)
+    except Exception:
+        # Nothing landed: the entries go back to the queue (a re-send finds
+        # them live, the snapshot shows them) for the forwarder's retry.
+        _restore_drained()
+        raise
     persisted = persisted_items[-1]
     if persisted.deduplicated:
         # A re-post of an already-committed item: nothing new to render or
         # title. Every pending entry consumed above belongs to a LATER user
-        # message — restore in original queue order (skipped entries preceded
-        # the match; restore prepends, so reverse).
-        for entry in reversed([*skipped_kiro_pending, drained]):
-            if entry is not None:
-                pending_inputs.restore(session_id, entry)
-        # The restored entry belongs to a later message; its id is not committed.
-        if drained is not None and drained.stable_id is not None:
-            pending_inputs.forget_committed(session_id, drained.stable_id)
+        # message.
+        _restore_drained()
         return persisted.id
     # Not a duplicate: a drained web submission is now committed, so a client
     # retry of its stable_id resolves to this item instead of a second paste.
-    if drained is not None and drained.stable_id is not None:
-        pending_inputs.remember_committed(session_id, drained.stable_id, persisted.id)
+    if drained is not None:
+        pending_inputs.remember_committed(session_id, drained, persisted.id)
     # Publish side effects for each skipped Kiro pair.
     # Items are [user0, error0, user1, error1, ...]; 2 per skipped entry.
     for i, skipped in enumerate(skipped_kiro_pending):
         persisted_user = persisted_items[i * 2]
         persisted_error = persisted_items[i * 2 + 1]
-        if skipped.stable_id is not None:
-            pending_inputs.remember_committed(session_id, skipped.stable_id, persisted_user.id)
+        pending_inputs.remember_committed(session_id, skipped, persisted_user.id)
         if not persisted_user.deduplicated:
             _publish_input_consumed(
                 session_id,
@@ -5524,11 +5530,8 @@ async def _forward_event_to_runner(
         # The id already names an item. It must be this very message; a
         # different item under a chosen id must not have this body forwarded
         # and recorded against it.
-        if not _same_web_submission(persisted_items[0], item, created_by):
-            raise OmnigentError(
-                "stable_id already identifies a different item in this session",
-                code=ErrorCode.INVALID_INPUT,
-            )
+        if not _same_web_submission(*_stored_web_submission(persisted_items[0]), body, created_by):
+            raise _stable_id_collision()
     if web_stable_id is not None and pending_inputs.dispatch_done(session_id, web_stable_id):
         # The item is persisted before it is forwarded, so "already stored" is
         # not "already delivered": only a re-send of a message the runner
@@ -6261,32 +6264,59 @@ def _list_status_with_starting(
 
 
 def _same_web_submission(
-    stored: ConversationItem, item: NewConversationItem, created_by: str | None
+    recorded_content: list[dict[str, Any]] | None,
+    recorded_author: str | None,
+    body: SessionEventInput,
+    created_by: str | None,
 ) -> bool:
     """
-    Whether a stored item is the submission a client-chosen ``stable_id`` names.
+    Whether the web submission recorded under a ``stable_id`` is the one ``body`` repeats.
 
-    A re-send carries the same type, role, content and author as the message
-    it repeats. Anything else under that id — an assistant message, another
-    author's message, different text — is a collision, and forwarding the new
-    body under the old id would run a prompt the transcript never records.
+    A re-send carries the content of the message it repeats and comes from
+    its author. Anything else under the id — different text, another author,
+    an item that is not a user message at all — is a collision: answering it
+    with the first submission's outcome would silently discard the new
+    prompt, and forwarding it under the old id would run a prompt the
+    transcript never records. Every duplicate path (an in-flight dispatch, a
+    remembered or stored item) applies this one check.
 
-    :param stored: The item already persisted under the id.
-    :param item: The submission being posted now.
+    :param recorded_content: Content blocks the submission was first posted
+        with; ``None`` when the recorded item is not a user message.
+    :param recorded_author: The original poster, or ``None`` when unknown.
+    :param body: The event being posted now.
     :param created_by: The posting actor, or ``None`` in single-user mode.
-    :returns: ``True`` when they describe the same user message.
+        Exact equality: an unattributed submission is not anyone's to re-send.
+    :returns: ``True`` when ``body`` repeats the recorded user message.
     """
-    if stored.type != "message" or item.type != "message":
-        return False
-    if not isinstance(stored.data, MessageData) or not isinstance(item.data, MessageData):
-        return False
-    if stored.data.role != "user" or item.data.role != "user":
-        return False
-    if stored.data.content != item.data.content:
-        return False
-    # Exact author equality: an unattributed stored item is not anyone's to
-    # re-send, and an authenticated re-send must come from the original author.
-    return stored.created_by == created_by
+    return recorded_content == body.data.get("content") and recorded_author == created_by
+
+
+def _stored_web_submission(
+    stored: ConversationItem,
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """
+    Return the ``(content, author)`` a stored user message was submitted with.
+
+    :param stored: The item persisted under the client's ``stable_id``.
+    :returns: The content blocks and author, for :func:`_same_web_submission`.
+        Content is ``None`` for anything but a user message (an assistant
+        reply, a tool call), which no re-send can repeat.
+    """
+    if (
+        stored.type == "message"
+        and isinstance(stored.data, MessageData)
+        and stored.data.role == "user"
+    ):
+        return stored.data.content, stored.created_by
+    return None, stored.created_by
+
+
+def _stable_id_collision() -> OmnigentError:
+    """The refusal for a POST whose ``stable_id`` names a different submission."""
+    return OmnigentError(
+        "stable_id already identifies a different item in this session",
+        code=ErrorCode.INVALID_INPUT,
+    )
 
 
 def _web_stable_id(body: SessionEventInput) -> str | None:
@@ -6362,10 +6392,24 @@ async def _forward_codex_side_chat_turn(
     return _SessionEventDispatchResult(item_id=None, pending_id=None)
 
 
+@dataclass
+class _WebDispatch:
+    """
+    One web submission's dispatch in flight, with the identity it was posted under.
+
+    :param outcome: Resolves to the first request's result, or its error.
+    :param content: The content blocks of the first request, e.g.
+        ``[{"type": "input_text", "text": "hi"}]``.
+    :param created_by: The first request's poster, or ``None`` in single-user mode.
+    """
+
+    outcome: asyncio.Future[_SessionEventDispatchResult]
+    content: list[dict[str, Any]] | None
+    created_by: str | None
+
+
 # Web message dispatches in flight, keyed by (session_id, stable_id).
-_web_dispatches: WorkspaceScopedCache[tuple[str, str], asyncio.Future[Any]] = (
-    WorkspaceScopedCache()
-)
+_web_dispatches: WorkspaceScopedCache[tuple[str, str], _WebDispatch] = WorkspaceScopedCache()
 
 
 async def _dispatch_session_event_to_runner_impl(
@@ -6394,7 +6438,9 @@ async def _dispatch_session_event_to_runner_impl(
     again, and it must not be answered before the first delivery's outcome is
     known either: it awaits that outcome and returns (or raises) the same
     result, so a client never learns "queued" for a message whose only
-    dispatch then failed. Events without a web stable id dispatch directly.
+    dispatch then failed. A different message reusing the in-flight id is
+    refused rather than answered with the first one's outcome. Events without
+    a web stable id dispatch directly.
     """
     web_stable_id = _web_stable_id(body) if body.type == "message" else None
     kwargs: dict[str, Any] = {
@@ -6416,6 +6462,8 @@ async def _dispatch_session_event_to_runner_impl(
     key = (session_id, web_stable_id)
     in_flight = _web_dispatches.get(key)
     if in_flight is not None:
+        if not _same_web_submission(in_flight.content, in_flight.created_by, body, created_by):
+            raise _stable_id_collision()
         _logger.info(
             "Duplicate message POST for session=%s stable_id=%s while the first is in flight; "
             "awaiting its outcome",
@@ -6424,11 +6472,13 @@ async def _dispatch_session_event_to_runner_impl(
             extra={"session_id": session_id},
         )
         # Shielded so a waiter that goes away cannot cancel the shared future.
-        return await asyncio.shield(in_flight)
+        return await asyncio.shield(in_flight.outcome)
     future: asyncio.Future[_SessionEventDispatchResult] = (
         asyncio.get_running_loop().create_future()
     )
-    _web_dispatches[key] = future
+    _web_dispatches[key] = _WebDispatch(
+        outcome=future, content=body.data.get("content"), created_by=created_by
+    )
     try:
         result = await _dispatch_session_event_to_runner_uncoalesced(
             session_id, conv, body, conversation_store, runner_client, **kwargs
@@ -6554,13 +6604,14 @@ async def _dispatch_session_event_to_runner_uncoalesced(
         # again. Answer with what the first delivery produced instead.
         web_stable_id = _web_stable_id(body)
         if web_stable_id is not None:
-            committed_id = pending_inputs.committed_item_id(session_id, web_stable_id)
-            if committed_id is not None:
-                return _SessionEventDispatchResult(item_id=committed_id, pending_id=None)
-            live_pending_id = pending_inputs.pending_id_for(session_id, web_stable_id)
-            if live_pending_id is not None:
-                return _SessionEventDispatchResult(item_id=None, pending_id=live_pending_id)
-            # The caches above are process-local. When the mirrored message was
+            known = pending_inputs.submission_for(session_id, web_stable_id)
+            if known is not None:
+                if not _same_web_submission(known.content, known.created_by, body, created_by):
+                    raise _stable_id_collision()
+                return _SessionEventDispatchResult(
+                    item_id=known.item_id, pending_id=known.pending_id
+                )
+            # The index above is process-local. When the mirrored message was
             # persisted under the stable id (a forwarder that sends no
             # source_id), a late re-send after a restart or expiry resolves
             # from the store instead of pasting. Terminal forwarders that do
@@ -6569,15 +6620,8 @@ async def _dispatch_session_event_to_runner_uncoalesced(
                 conversation_store.get_item, session_id, web_stable_id
             )
             if stored is not None:
-                if not _same_web_submission(
-                    stored,
-                    _build_new_item(body, "stable-id-check", created_by=created_by),
-                    created_by,
-                ):
-                    raise OmnigentError(
-                        "stable_id already identifies a different item in this session",
-                        code=ErrorCode.INVALID_INPUT,
-                    )
+                if not _same_web_submission(*_stored_web_submission(stored), body, created_by):
+                    raise _stable_id_collision()
                 return _SessionEventDispatchResult(item_id=web_stable_id, pending_id=None)
         ensure_outcome = (
             _NativeTerminalEnsureOutcome(error=None)

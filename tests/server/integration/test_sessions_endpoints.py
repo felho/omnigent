@@ -12331,3 +12331,154 @@ async def test_native_duplicate_during_transcript_append_does_not_repaste(
             assert pastes == 1
         finally:
             pending_inputs.reset_for_tests()
+
+
+async def test_native_duplicate_after_cache_loss_resolves_from_the_store(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A late re-send still finds the committed copy after the caches are gone.
+
+    The pending and committed memories are process-local; a server restart or
+    cache expiry between the first delivery and a reconnecting client's
+    re-send must not paste the prompt again. The mirrored item is persisted
+    under the web stable id, so the store answers.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    runner_requests: list[httpx.Request] = []
+
+    def runner_handler(request: httpx.Request) -> httpx.Response:
+        runner_requests.append(request)
+        return httpx.Response(202, json={})
+
+    monkeypatch.setattr(
+        orchestration,
+        "_ensure_native_terminal_ready",
+        AsyncMock(return_value=_NativeTerminalEnsureOutcome(error=None)),
+    )
+    monkeypatch.setattr(
+        sessions_module, "_ensure_runner_session_initialized", AsyncMock(return_value=True)
+    )
+    stable_id = "9" * 32
+    content = [{"type": "input_text", "text": "outlive the cache"}]
+    message = {
+        "type": "message",
+        "data": {"role": "user", "content": content, "stable_id": stable_id},
+    }
+    pending_inputs.reset_for_tests()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner_handler), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(orchestration, "_get_runner_client", AsyncMock(return_value=runner))
+        agent = await create_test_agent(client, name="claude-native-ui")
+        created = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "labels": {"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"},
+            },
+        )
+        assert created.status_code == 201, created.text
+        session_id = created.json()["id"]
+        events_url = f"/v1/sessions/{session_id}/events"
+        try:
+            first = await client.post(events_url, json=message)
+            assert first.status_code == 202, first.text
+            echoed = await client.post(
+                events_url,
+                json={
+                    "type": "external_conversation_item",
+                    "data": {
+                        "item_type": "message",
+                        "item_data": {"role": "user", "content": content},
+                    },
+                },
+            )
+            assert echoed.status_code == 202, echoed.text
+            assert echoed.json()["item_id"] == stable_id
+
+            pending_inputs.reset_for_tests()  # restart / expiry: every cache is empty
+
+            late = await client.post(events_url, json=message)
+            assert late.status_code == 202, late.text
+            assert late.json() == {"queued": True, "item_id": stable_id}
+            pastes = [
+                r for r in runner_requests if r.method == "POST" and r.url.path == events_url
+            ]
+            assert len(pastes) == 1
+        finally:
+            pending_inputs.reset_for_tests()
+
+
+async def test_overlapping_duplicates_share_the_first_dispatch_outcome(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A re-send that overlaps the first request gets that request's outcome.
+
+    While the first forward is still running, a duplicate must neither
+    dispatch again nor be told "queued" ahead of time: if the first forward
+    is rejected, the duplicate fails with it, and the client keeps Retry. A
+    later re-send then dispatches again.
+    """
+    from omnigent.runtime import pending_inputs
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    forwards: list[httpx.Request] = []
+    gate = asyncio.Event()
+
+    async def runner_handler(request: httpx.Request) -> httpx.Response:
+        forwards.append(request)
+        if len(forwards) == 1:
+            await gate.wait()  # hold the first forward until the duplicate has arrived
+            return httpx.Response(500, json={"detail": "runner hiccup"})
+        return httpx.Response(202, json={"queued": True})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(runner_handler), base_url="http://runner"
+    )
+
+    async def get_runner_client(_session_id: str, _runner_router: object) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr("omnigent.server.routes.sessions._get_runner_client", get_runner_client)
+    stable_id = "7" * 32
+    message = {
+        "type": "message",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "overlap me"}],
+            "stable_id": stable_id,
+        },
+    }
+    events_url = f"/v1/sessions/{session['id']}/events"
+    pending_inputs.reset_for_tests()
+    try:
+        first_task = asyncio.create_task(client.post(events_url, json=message))
+        for _ in range(100):
+            if forwards:
+                break
+            await asyncio.sleep(0.01)
+        assert forwards, "the first forward never started"
+        second_task = asyncio.create_task(client.post(events_url, json=message))
+        await asyncio.sleep(0.05)
+        assert not second_task.done(), "the duplicate answered before the first outcome was known"
+        gate.set()
+        first, second = await asyncio.gather(first_task, second_task)
+        assert first.status_code >= 400, first.text
+        assert second.status_code == first.status_code, second.text
+        assert len(forwards) == 1
+
+        third = await client.post(events_url, json=message)
+        assert third.status_code == 202, third.text
+        assert len(forwards) == 2
+    finally:
+        await fake_runner.aclose()
+        pending_inputs.reset_for_tests()

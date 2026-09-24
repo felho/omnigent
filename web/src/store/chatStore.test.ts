@@ -5550,6 +5550,30 @@ describe("chatStore — send (failed send)", () => {
     expect(state.pendingUserMessages[0]!.failed).toBeUndefined();
   });
 
+  it("hands the message back to the composer when the upload fails on the network", async () => {
+    // No server copy exists to re-send and the attachment lives only in this
+    // tab, so a bubble would be lost on reload; the composer's draft
+    // persistence keeps the text.
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/files") && init?.method === "POST") {
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const file = new File(["bytes"], "a.png", { type: "image/png" });
+    await useChatStore.getState().send("with a picture", "agent_xyz", [file]);
+
+    const state = useChatStore.getState();
+    expect(state.pendingUserMessages).toEqual([]);
+    expect(state.failedSendDraft).toMatchObject({
+      conversationId: "conv_existing",
+      text: "with a picture",
+      files: [file],
+    });
+    expect(state.status).toBe("idle");
+  });
+
   it("does not post a message that was cancelled while its upload was in flight", async () => {
     let finishUpload: (() => void) | undefined;
     const bodies: unknown[] = [];
@@ -5579,32 +5603,47 @@ describe("chatStore — send (failed send)", () => {
     expect(useChatStore.getState().status).toBe("idle");
   });
 
-  it("does not revive a remembered send the server already shows", () => {
+  it("does not revive a remembered send the server already shows, matching by identity only", () => {
     const content = [{ type: "input_text" as const, text: "already there" }];
-    // The first attempt landed after all: the snapshot replays it as a pending entry.
+    // The first attempt landed after all: the snapshot replays it as a pending
+    // entry carrying the same stable id.
     persistPendingSend("conv_existing", { stableId: "f".repeat(32), content });
-    useChatStore.setState({ pendingUserMessages: [{ tempId: "pending_srv_1", content }] });
+    useChatStore.setState({
+      pendingUserMessages: [{ tempId: "pending_srv_1", content, stableId: "f".repeat(32) }],
+    });
     rehydratePersistedSends("conv_existing");
     expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual([
       "pending_srv_1",
     ]);
     expect(readPendingSends("conv_existing")).toEqual([]);
 
-    // Or it was committed while the tab was away.
+    // Or it was committed while the tab was away, under its stable id.
     persistPendingSend("conv_existing", { stableId: "e".repeat(32), content });
     useChatStore.setState({
       pendingUserMessages: [],
-      blocks: [committed("msg_c", "already there")],
+      blocks: [committed("e".repeat(32), "already there")],
     });
     rehydratePersistedSends("conv_existing");
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
     expect(readPendingSends("conv_existing")).toEqual([]);
+
+    // Same wording under a different id is a different message: it is revived.
+    persistPendingSend("conv_existing", { stableId: "d".repeat(32), content });
+    useChatStore.setState({
+      pendingUserMessages: [],
+      blocks: [committed("msg_other", "already there")],
+    });
+    rehydratePersistedSends("conv_existing");
+    expect(useChatStore.getState().pendingUserMessages.map((p) => p.stableId)).toEqual([
+      "d".repeat(32),
+    ]);
   });
 
-  it("acknowledges receipts against the live queue first and a failed bubble only by exact match", () => {
+  it("acknowledges receipts against the live queue first and a failed bubble only by identity", () => {
     // A genuinely failed first message must not swallow the receipt for a
-    // later message that went through, and a receipt for the failed message
-    // itself (its response was lost) must still clear it.
+    // later message that went through; a receipt for the failed message
+    // itself (its response was lost) clears it; and matching wording under
+    // another id is not a receipt at all.
     useChatStore.setState({
       pendingUserMessages: [
         {
@@ -5616,6 +5655,11 @@ describe("chatStore — send (failed send)", () => {
         { tempId: "pend_b", content: [{ type: "input_text", text: "second" }], posted: true },
       ],
     });
+    const committedIds = () =>
+      useChatStore
+        .getState()
+        .blocks.filter((b): b is UserMessageBlock => b.type === "user_message")
+        .map((b) => b.ctx.itemId);
 
     handleSessionEvent({
       type: "session_input_consumed",
@@ -5623,27 +5667,26 @@ describe("chatStore — send (failed send)", () => {
       itemType: "message",
       data: { role: "user", content: [{ type: "input_text", text: "second" }] },
     });
-    let state = useChatStore.getState();
-    expect(state.pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_a"]);
-    expect(
-      state.blocks
-        .filter((b): b is UserMessageBlock => b.type === "user_message")
-        .map((b) => b.ctx.itemId),
-    ).toEqual(["msg_b"]);
+    expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_a"]);
+    expect(committedIds()).toEqual(["msg_b"]);
 
     handleSessionEvent({
       type: "session_input_consumed",
-      itemId: "msg_a",
+      itemId: "msg_lookalike",
       itemType: "message",
       data: { role: "user", content: [{ type: "input_text", text: "first" }] },
     });
-    state = useChatStore.getState();
-    expect(state.pendingUserMessages).toEqual([]);
-    expect(
-      state.blocks
-        .filter((b): b is UserMessageBlock => b.type === "user_message")
-        .map((b) => b.ctx.itemId),
-    ).toEqual(["msg_b", "msg_a"]);
+    expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_a"]);
+    expect(committedIds()).toEqual(["msg_b", "msg_lookalike"]);
+
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "a".repeat(32),
+      itemType: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "first" }] },
+    });
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(committedIds()).toEqual(["msg_b", "msg_lookalike", "a".repeat(32)]);
   });
 });
 

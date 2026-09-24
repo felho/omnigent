@@ -586,6 +586,27 @@ class ConversationStore(ABC):
         """
         ...
 
+    def has_item(self, conversation_id: str, item_id: str) -> bool:
+        """
+        Whether ``item_id`` is persisted in ``conversation_id``.
+
+        Used to recognise a web re-send of a message whose committed copy has
+        left the process-local caches (server restart, cache expiry). The
+        default walks the conversation; stores override it with a point lookup.
+
+        :param conversation_id: The conversation to look in.
+        :param item_id: The item id, e.g. a web client's ``stable_id``.
+        :returns: ``True`` when the item exists.
+        """
+        after: str | None = None
+        while True:
+            page = self.list_items(conversation_id, limit=500, after=after)
+            if any(item.id == item_id for item in page.data):
+                return True
+            if not page.has_more or not page.data:
+                return False
+            after = page.data[-1].id
+
     @abstractmethod
     def list_items(
         self,

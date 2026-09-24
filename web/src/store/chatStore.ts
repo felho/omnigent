@@ -1443,24 +1443,24 @@ async function deliverRevivedSend(
 /**
  * Revive sends this tab left failed before a reload. Called on a cold load
  * once the snapshot's pending entries and history are in place: a record whose
- * message the server already shows (a replayed pending entry with the same
- * content, or a committed copy) is dropped; the rest come back as failed
- * bubbles and are re-sent once with their original stable id.
+ * stable id the server already shows (a replayed pending entry, or a committed
+ * item persisted under it) is dropped; the rest come back as failed bubbles
+ * and are re-sent once with their original stable id.
  */
 export function rehydratePersistedSends(conversationId: string): void {
   const records = readPendingSends(conversationId);
   if (records.length === 0) return;
   const state = setterForState(conversationId);
   if (state === null) return;
-  const committedTexts = committedUserTextsOf(state.blocks);
-  const serverKeys = state.pendingUserMessages.map((p) => contentKeyOf(p.content));
   const revived: PendingUserMessage[] = [];
   for (const record of records) {
-    if (state.pendingUserMessages.some((p) => p.stableId === record.stableId)) continue;
-    const twin = serverKeys.indexOf(contentKeyOf(record.content));
-    const text = messageContentText(record.content);
-    if (twin !== -1 || (text !== "" && committedTexts.some((c) => c.endsWith(text)))) {
-      if (twin !== -1) serverKeys.splice(twin, 1);
+    // Identity only: a snapshot pending entry or a committed item carrying
+    // this stable id means the server has it. Matching wording is not
+    // evidence — two identical messages are two messages.
+    const serverHasIt =
+      state.pendingUserMessages.some((p) => p.stableId === record.stableId) ||
+      hasCommittedItem(state.blocks, record.stableId);
+    if (serverHasIt) {
       forgetPendingSend(conversationId, record.stableId);
       continue;
     }
@@ -2532,9 +2532,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Native model startup failed or timed out while the draft was still held
     // locally: that path restores the draft itself, so the send is not retained.
     let modelGateFailed = false;
-    // The server rejected an attachment (a 4xx from the upload): the message
-    // needs editing, so it is handed back to the composer, not retained.
-    let uploadRejected = false;
+    // An attachment failed to upload: the message is handed back to the
+    // composer with its files, not retained as a bubble.
+    let uploadFailed = false;
     let initialDispatched = false;
     const initialSendPending = () => {
       const id = postedSessionId ?? submitConversationId;
@@ -2584,9 +2584,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         try {
           fileBlocks = await uploadFileBlocks(sessionId, files ?? []);
         } catch (uploadErr) {
-          // The server refused an attachment: the message needs editing, so it
-          // goes back to the composer with its files rather than to Retry.
-          if (!isTransportError(uploadErr)) uploadRejected = true;
+          // An attachment never made it up, whether refused or lost to the
+          // network: there is no server copy to re-send, so the message goes
+          // back to the composer with its files, whose draft persistence also
+          // keeps the text across a reload.
+          uploadFailed = true;
           throw uploadErr;
         }
         // Cancelled while the upload was in flight: don't post it. A codex
@@ -2719,18 +2721,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // session to retry against, and a caller with its own error UX wants
       // the rollback, so those still hand the text back as a draft.
       // Three cases keep their own recovery: a draft the native model gate
-      // turned away (startup failed or timed out) restores itself, a rejected
-      // attachment needs editing so the message goes back to the composer, and
-      // a navigate-first send whose session never bound has nothing to retry
-      // against. Everything else, including a failed re-bind of a dropped
-      // stream on an existing conversation, is re-sendable.
+      // turned away (startup failed or timed out) restores itself, a message
+      // whose attachment never uploaded goes back to the composer with its
+      // files, and a navigate-first send whose session never bound has nothing
+      // to retry against. Everything else, including a failed re-bind of a
+      // dropped stream on an existing conversation, is re-sendable.
       let retained = false;
       if (
         deliver !== null &&
         failTarget !== null &&
         !callerHandlesError &&
         !modelGateFailed &&
-        !uploadRejected &&
+        !uploadFailed &&
         (postedSessionId !== null || opts?.reusePendingTempId === undefined)
       ) {
         retained = true;
@@ -4469,6 +4471,7 @@ async function bindStream(
         tempId: p.pendingId,
         content: p.content,
         ...(p.createdBy !== undefined ? { author: p.createdBy } : {}),
+        ...(p.stableId !== undefined ? { stableId: p.stableId } : {}),
       });
       let candidatePending: PendingUserMessage[];
       if (!hydratePending) {
@@ -6412,22 +6415,16 @@ function committedContentFor(
  * Which optimistic bubble a consumed event acknowledges. In-flight and posted
  * bubbles are matched by queue position: per-session ordering makes the oldest
  * the right one. A failed bubble has left the queue, so it is matched only by
- * an exact receipt — the committed item id equal to its stable id, or the same
- * text on native where the mirrored item carries the forwarder's id — and only
- * when the queue head does not match that receipt itself. Returns -1 when
- * nothing should be acknowledged (an unsent draft at the head, or nothing waits).
+ * identity — the committed item id equal to its stable id, which is how the
+ * SDK path persists it — and only when the queue head does not match that
+ * receipt itself. Wording is never evidence: a native receipt carries the
+ * forwarder's id, so a failed native bubble is cleared by its own re-send
+ * instead. Returns -1 when nothing should be acknowledged (an unsent draft at
+ * the head, or nothing waits).
  */
-function pickPendingForConsumed(
-  pending: PendingUserMessage[],
-  itemId: string,
-  eventContent: MessageContentBlock[] | null,
-): number {
-  const eventText = eventContent === null ? "" : messageContentText(eventContent);
-  const matches = (p: PendingUserMessage): boolean => {
-    if (p.stableId !== undefined && p.stableId === itemId) return true;
-    const text = messageContentText(p.content);
-    return text !== "" && eventText.endsWith(text);
-  };
+function pickPendingForConsumed(pending: PendingUserMessage[], itemId: string): number {
+  const matches = (p: PendingUserMessage): boolean =>
+    p.stableId !== undefined && p.stableId === itemId;
   const firstLive = pending.findIndex((p) => p.failed === undefined);
   const head = firstLive >= 0 && !pending[firstLive]!.initialDraft ? firstLive : -1;
   const failedIdx = pending.findIndex((p) => p.failed !== undefined && matches(p));
@@ -7201,7 +7198,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // steal a real queued message's bubble. Hold the head back for a marker.
           const eventContent = userContentFromEvent(event);
           if (eventContent !== null && isSystemUserContent(eventContent)) return {};
-          const ack = pickPendingForConsumed(s.pendingUserMessages, event.itemId, eventContent);
+          const ack = pickPendingForConsumed(s.pendingUserMessages, event.itemId);
           if (ack < 0) return {};
           return { pendingUserMessages: s.pendingUserMessages.filter((_, i) => i !== ack) };
         }
@@ -7243,13 +7240,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         //    `[System: …]` notice DOES have a pending entry, but the server
         //    drains it and names it via `clearedPendingId`, so it lands on
         //    branch 1 and never reaches this fallback. A failed bubble is out
-        //    of the queue and is acknowledged only by an exact receipt (see
+        //    of the queue and is acknowledged only by identity (see
         //    `pickPendingForConsumed`).
         const eventContent = userContentFromEvent(event);
         const headIdx =
           eventContent !== null && isSystemUserContent(eventContent)
             ? -1
-            : pickPendingForConsumed(s.pendingUserMessages, event.itemId, eventContent);
+            : pickPendingForConsumed(s.pendingUserMessages, event.itemId);
         const head = headIdx >= 0 ? s.pendingUserMessages[headIdx] : undefined;
         if (head) {
           const content = committedContentFor(event, head.content);

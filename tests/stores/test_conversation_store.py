@@ -7782,3 +7782,26 @@ def test_get_conversation_keeps_distinct_query_names(
         "omnigent.conversation_store.select_conversation_metadata_by_id",
         "omnigent.conversation_store.select_conversation_labels",
     ], names
+
+
+def test_has_item_is_scoped_to_the_conversation(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A web re-send is recognised by its stable id only within its own conversation."""
+    conv = conversation_store.create_conversation()
+    other = conversation_store.create_conversation()
+    stable = "cd" * 16
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_x",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+                stable_id=stable,
+            )
+        ],
+    )
+    assert conversation_store.has_item(conv.id, stable) is True
+    assert conversation_store.has_item(other.id, stable) is False
+    assert conversation_store.has_item(conv.id, "ef" * 16) is False

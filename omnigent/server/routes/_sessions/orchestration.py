@@ -5516,21 +5516,19 @@ async def _forward_event_to_runner(
         session_id,
         [item],
     )
-    if web_stable_id is not None:
+    if web_stable_id is not None and pending_inputs.dispatch_done(session_id, web_stable_id):
         # The item is persisted before it is forwarded, so "already stored" is
-        # not "already delivered": a re-send after a rejected forward must
-        # dispatch again, while one that overlaps or follows a successful
-        # forward must not run the turn twice.
-        claim = pending_inputs.claim_dispatch(session_id, web_stable_id)
-        if claim != "won":
-            _logger.info(
-                "Duplicate message POST for session=%s stable_id=%s (%s); not re-dispatching",
-                session_id,
-                web_stable_id,
-                claim,
-                extra={"session_id": session_id},
-            )
-            return persisted_items[0].id
+        # not "already delivered": only a re-send of a message the runner
+        # already accepted is answered without dispatching. A re-send after a
+        # rejected forward runs the turn; an overlapping re-send is coalesced
+        # by the caller and never gets here.
+        _logger.info(
+            "Duplicate message POST for session=%s stable_id=%s; already dispatched",
+            session_id,
+            web_stable_id,
+            extra={"session_id": session_id},
+        )
+        return persisted_items[0].id
     await _seed_missing_title_from_user_message(
         conv,
         item,
@@ -5998,8 +5996,6 @@ async def _forward_event_to_runner(
                 _reject_error,
                 failure_origin="runner_rejected_event",
             )
-            if web_stable_id is not None:
-                pending_inputs.finish_dispatch(session_id, web_stable_id, ok=False)
             raise OmnigentError(
                 f"Runner rejected the message: {_reject_detail}",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
@@ -6007,7 +6003,7 @@ async def _forward_event_to_runner(
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
         if web_stable_id is not None:
-            pending_inputs.finish_dispatch(session_id, web_stable_id, ok=True)
+            pending_inputs.mark_dispatched(session_id, web_stable_id)
         _publish_input_consumed(session_id, persisted_items[0])
         _logger.info(
             "turn dispatched to runner for session=%s",
@@ -6113,8 +6109,6 @@ async def _forward_event_to_runner(
             extra={"session_id": session_id},
         )
         _publish_status(session_id, "idle")
-        if web_stable_id is not None:
-            pending_inputs.finish_dispatch(session_id, web_stable_id, ok=False)
         raise OmnigentError(
             "Runner is unreachable; message was persisted but could not be delivered. "
             "The runner may be restarting — retry or spawn a new session.",
@@ -6326,7 +6320,89 @@ async def _forward_codex_side_chat_turn(
     return _SessionEventDispatchResult(item_id=None, pending_id=None)
 
 
+# Web message dispatches in flight, keyed by (session_id, stable_id).
+_web_dispatches: WorkspaceScopedCache[tuple[str, str], asyncio.Future[Any]] = (
+    WorkspaceScopedCache()
+)
+
+
 async def _dispatch_session_event_to_runner_impl(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+    runner_client: httpx.AsyncClient,
+    *,
+    agent_name: str | None,
+    file_store: FileStore | None,
+    artifact_store: ArtifactStore | None,
+    has_mcp_servers: bool = False,
+    created_by: str | None = None,
+    runner_router: RunnerRouter | None = None,
+    native_terminal_ready: bool = False,
+    host_store: HostStore | None = None,
+    host_registry: HostRegistry | None = None,
+    background_titles_enabled: bool = True,
+) -> _SessionEventDispatchResult:
+    """
+    Dispatch an event, coalescing concurrent re-sends of one web submission.
+
+    A browser whose POST failed re-sends the same ``stable_id`` while the
+    first request may still be running. The duplicate must not dispatch
+    again, and it must not be answered before the first delivery's outcome is
+    known either: it awaits that outcome and returns (or raises) the same
+    result, so a client never learns "queued" for a message whose only
+    dispatch then failed. Events without a web stable id dispatch directly.
+    """
+    web_stable_id = _web_stable_id(body) if body.type == "message" else None
+    kwargs: dict[str, Any] = {
+        "agent_name": agent_name,
+        "file_store": file_store,
+        "artifact_store": artifact_store,
+        "has_mcp_servers": has_mcp_servers,
+        "created_by": created_by,
+        "runner_router": runner_router,
+        "native_terminal_ready": native_terminal_ready,
+        "host_store": host_store,
+        "host_registry": host_registry,
+        "background_titles_enabled": background_titles_enabled,
+    }
+    if web_stable_id is None:
+        return await _dispatch_session_event_to_runner_uncoalesced(
+            session_id, conv, body, conversation_store, runner_client, **kwargs
+        )
+    key = (session_id, web_stable_id)
+    in_flight = _web_dispatches.get(key)
+    if in_flight is not None:
+        _logger.info(
+            "Duplicate message POST for session=%s stable_id=%s while the first is in flight; "
+            "awaiting its outcome",
+            session_id,
+            web_stable_id,
+            extra={"session_id": session_id},
+        )
+        # Shielded so a waiter that goes away cannot cancel the shared future.
+        return await asyncio.shield(in_flight)
+    future: asyncio.Future[_SessionEventDispatchResult] = (
+        asyncio.get_running_loop().create_future()
+    )
+    _web_dispatches[key] = future
+    try:
+        result = await _dispatch_session_event_to_runner_uncoalesced(
+            session_id, conv, body, conversation_store, runner_client, **kwargs
+        )
+    except BaseException as exc:
+        future.set_exception(exc)
+        future.exception()  # marked retrieved: no log noise when nobody was waiting
+        raise
+    else:
+        future.set_result(result)
+        return result
+    finally:
+        _web_dispatches.pop(key, None)
+
+
+async def _dispatch_session_event_to_runner_uncoalesced(
     session_id: str,
     conv: Conversation,
     body: SessionEventInput,
@@ -6442,6 +6518,12 @@ async def _dispatch_session_event_to_runner_impl(
             live_pending_id = pending_inputs.pending_id_for(session_id, web_stable_id)
             if live_pending_id is not None:
                 return _SessionEventDispatchResult(item_id=None, pending_id=live_pending_id)
+            # The caches above are process-local. After a restart or expiry
+            # the committed copy is still in the store under the stable id
+            # (a forwarder without a source_id persists the mirrored message
+            # under it), so a late re-send resolves there instead of pasting.
+            if await asyncio.to_thread(conversation_store.has_item, session_id, web_stable_id):
+                return _SessionEventDispatchResult(item_id=web_stable_id, pending_id=None)
         ensure_outcome = (
             _NativeTerminalEnsureOutcome(error=None)
             if native_terminal_ready
@@ -6625,11 +6707,6 @@ async def _dispatch_session_event_to_runner_impl(
         # dropping the first message). model_override alone is applied only
         # at spawn, so the in-band switch is what makes routing take on an
         # already-running pane.
-        # A concurrent re-send of this submission (same stable_id; the client
-        # gave up on the first request while the pane was still being
-        # prepared) shares the entry recorded above; only one may paste.
-        if pending_id is not None and not pending_inputs.claim_forward(session_id, pending_id):
-            return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
         forwarded = False
         try:
             await _forward_native_terminal_message(

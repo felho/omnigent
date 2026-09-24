@@ -16,6 +16,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
+vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  useSessionRunnerOnline: vi.fn(() => true),
+}));
+
 afterEach(cleanup);
 
 const WORKSPACE = "/home/u/ws";

@@ -15,7 +15,6 @@ from omnigent.models.model_override import (
     MODEL_OVERRIDE_MAX_LEN,
     canonical_model_spelling,
     harness_supports_model_override,
-    inherited_model_unservable_reason,
     model_family_mismatch,
     normalize_model_for_provider,
     validate_model_override,
@@ -246,58 +245,6 @@ class TestModelFamilyMismatch:
             assert msg is not None
             assert "pi" in msg
             assert "openai-agents" in msg
-
-
-class TestInheritedModelUnservableReason:
-    """Best-effort inheritance skips a bare id an opencode child cannot resolve."""
-
-    @pytest.mark.parametrize("harness", ["opencode-native", "native-opencode", "opencode"])
-    def test_opencode_bare_id_without_profile_is_unservable(self, harness: str) -> None:
-        """A bare vendor id has no ``provider/`` prefix opencode can resolve."""
-        reason = inherited_model_unservable_reason(
-            harness,
-            "claude-opus-5",
-            databricks_profile=None,
-        )
-        assert reason is not None
-        assert "claude-opus-5" in reason
-
-    def test_opencode_provider_prefixed_id_is_servable(self) -> None:
-        """opencode resolves ``provider/model`` ids against its own auth."""
-        assert (
-            inherited_model_unservable_reason(
-                "opencode-native",
-                "anthropic/claude-sonnet-4-5",
-                databricks_profile=None,
-            )
-            is None
-        )
-
-    def test_opencode_bare_id_with_databricks_profile_is_servable(self) -> None:
-        """A profile lets the launch synthesize a gateway provider for the id."""
-        assert (
-            inherited_model_unservable_reason(
-                "opencode-native",
-                "databricks-claude-opus-4-8",
-                databricks_profile="oss",
-            )
-            is None
-        )
-
-    @pytest.mark.parametrize(
-        "harness",
-        ["pi", "pi-native", "native-pi", "claude-sdk", "codex", "openai-agents", "kimi"],
-    )
-    def test_other_harnesses_are_not_gated(self, harness: str) -> None:
-        """Non-OpenCode harnesses are not filtered at the dispatch gate."""
-        assert (
-            inherited_model_unservable_reason(
-                harness,
-                "claude-opus-5",
-                databricks_profile=None,
-            )
-            is None
-        )
 
 
 @pytest.mark.parametrize(

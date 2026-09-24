@@ -200,35 +200,6 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
     return None
 
 
-# OpenCode needs a provider prefix unless launch synthesizes a gateway.
-_OPENCODE_HARNESSES: frozenset[str] = frozenset({"opencode-native", "native-opencode", "opencode"})
-
-
-def inherited_model_unservable_reason(
-    harness: str,
-    model: str,
-    *,
-    databricks_profile: str | None,
-) -> str | None:
-    """Return a known reason to skip best-effort model inheritance.
-
-    Bare OpenCode ids need a Databricks profile to synthesize a provider.
-    Other harnesses are not filtered by this check.
-    """
-    canon = canonicalize_harness(harness)
-    if canon in _OPENCODE_HARNESSES:
-        if "/" in model:
-            return None
-        if databricks_profile:
-            return None
-        return (
-            f"opencode resolves a model's provider from its 'provider/' prefix; "
-            f"the bare id {model!r} has none and no Databricks profile is "
-            "configured to synthesize a gateway provider for it"
-        )
-    return None
-
-
 # Bare canonical vendor ids ("claude-opus-4-8", "gpt-5-4", "glm-5-2",
 # "kimi-k2-instruct"); slash/colon/bracket/vendor-prefixed shapes have no
 # mechanical gateway counterpart. The GLM/Kimi families belong here for the

@@ -1,36 +1,35 @@
-"""A bare Claude id an opencode worker cannot resolve must not be inherited.
+"""A parent's model must not be inherited into a foreign multi-model worker.
 
 Reproduces the reported journey. A user selects a Claude model
-(``claude-opus-5``) for a claude-native orchestrator, then the orchestrator
-fans out to an ``opencode-native`` worker via ``sys_session_send`` **without**
-an explicit ``args.model``. A dispatch gate that only rejects a cross-*family*
-id treats opencode as "multi-model, accept anything" and inherits the bare
-``claude-opus-5`` id into the child's ``model_override``. opencode resolves a
-model's provider from the id's own ``provider/`` prefix, so the synthesized
-``opencode.json`` gets a bare ``claude-opus-5`` and the first turn dies with
+(``claude-opus-5``) for an orchestrator, then fans out to an
+``opencode-native`` worker via ``sys_session_send`` **without** an explicit
+``args.model``. A dispatch gate that only rejects a cross-*family* id treats
+opencode as "multi-model, accept anything" and inherits ``claude-opus-5`` into
+the child's ``model_override``. But a multi-model harness accepts any id only to
+route it against *its own* configured provider, where the parent's id -- from a
+different harness's vocabulary -- need not be servable: opencode resolves a
+model's provider from the id's ``provider/`` prefix against its own auth, so a
+bare ``claude-opus-5`` in the synthesized ``opencode.json`` dies with
 ``ProviderModelNotFoundError: Model not found: claude-opus-5/``.
 
-Expected: a dispatch that names no model runs the child on opencode's own
-default -- inheritance should *skip* when a bare id has nowhere to route rather
-than push it through. So the child session must **not** be created with
-``model_override == "claude-opus-5"``.
+Expected (the maintainer's suggested fix): a multi-model child that is a
+*different* harness from the parent runs its own default; the parent's model is
+inherited only when parent and child share a harness (same provider vocabulary)
+or an inference binding validates the id. So the opencode child must **not** be
+created with ``model_override == "claude-opus-5"``.
 
 Fail -> pass contract: on the buggy build the child is created with
-``model_override == "claude-opus-5"`` (the unresolvable inherited id), so the
-assertion fails. Once inheritance is servability-aware the child keeps its own
+``model_override == "claude-opus-5"``, so the assertion fails. Once the gate
+skips inheritance into a foreign multi-model harness the child keeps its own
 default and the assertion passes.
 
-(``pi`` is deliberately not exercised here: on the gateway path it routes a
-claude id to its Databricks Anthropic surface (``/serving-endpoints/anthropic``
-on the workspace host its credentials resolve), so an inherited claude id is
-servable and must not be skipped -- unlike opencode's bare-id case.)
-
 The claude-native brain is swapped for openai-agents against a mock LLM (the
-standard mock-polly pattern from ``test_polly_e2e``); the opencode worker keeps
-its NATIVE harness id, because the defect lives in how its id is inherited. The
-plumbing under test -- CLI ``--model`` -> parent session -> ``sys_session_send``
-(no args.model) -> ``_inherited_parent_model`` -> child session
-``model_override`` -- is the real production path.
+standard mock-polly pattern from ``test_polly_e2e``) -- itself a multi-model
+harness distinct from opencode, so the "foreign multi-model child" rule applies;
+the opencode worker keeps its NATIVE harness id, because the defect lives in how
+its id is inherited. The plumbing under test -- CLI ``--model`` -> parent session
+-> ``sys_session_send`` (no args.model) -> ``_inherited_parent_model`` -> child
+session ``model_override`` -- is the real production path.
 
 The opencode child is torn down shortly after creation (its native terminal
 cannot boot on the unservable model here), so the child row is captured while
@@ -229,15 +228,15 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_opencode_worker_does_not_inherit_unservable_claude_model(
+def test_foreign_multi_model_worker_does_not_inherit_parent_model(
     local_polly_server: str,  # noqa: F811  (imported fixture)
     mock_llm_server_url: str,
     tmp_path: Any,
 ) -> None:
-    """An opencode-native worker dispatched with no model must not inherit a
-    bare Claude id it cannot serve.
+    """An opencode-native worker (a multi-model harness distinct from the
+    parent's) dispatched with no model must not inherit the parent's Claude id.
 
-    Without a servability check the gate inherits ``claude-opus-5`` into the
+    Without the harness rule the gate inherits ``claude-opus-5`` into the
     child's ``model_override``; the synthesized ``opencode.json`` then pins a
     bare ``claude-opus-5`` (no ``provider/`` prefix) and opencode's first turn
     dies with ``ProviderModelNotFoundError: Model not found: claude-opus-5/``.
@@ -252,8 +251,9 @@ def test_opencode_worker_does_not_inherit_unservable_claude_model(
     assert _SELECTED_MODEL not in overrides, (
         f"opencode-native worker dispatched without args.model inherited the "
         f"parent's Claude id {_SELECTED_MODEL!r} into its model_override -- "
-        f"opencode requires a 'provider/model' id, so a bare {_SELECTED_MODEL!r} "
-        f"makes its first turn fail with 'Model not found'. Inheritance should "
-        f"skip an unservable id and let the worker keep its own default, but the "
+        f"opencode is a multi-model harness distinct from the parent, and it "
+        f"resolves a bare {_SELECTED_MODEL!r} against its own provider, failing "
+        f"the first turn with 'Model not found'. Inheritance should skip a "
+        f"foreign multi-model child and let it keep its own default, but the "
         f"child session was created with model_override values {overrides!r}."
     )

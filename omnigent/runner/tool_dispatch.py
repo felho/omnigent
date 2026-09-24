@@ -52,7 +52,6 @@ from omnigent.debug_logging import runner_primary_session_id
 from omnigent.harness_aliases import canonicalize_harness, is_native_harness
 from omnigent.models.model_override import (
     harness_supports_model_override,
-    inherited_model_unservable_reason,
     model_family_mismatch,
     normalize_model_for_provider,
     validate_model_override,
@@ -1808,8 +1807,13 @@ async def _inherited_parent_model(
     - a child harness without model-override plumbing runs its default;
     - a parent model outside the child harness's family (e.g. a Claude
       selection dispatched to a codex worker) is not forced across vendors;
-    - a bare parent id an opencode child's launch path cannot resolve is
-      skipped — see :func:`inherited_model_unservable_reason`.
+    - a **multi-model** child harness (``pi``, ``opencode``, ``openai-agents``,
+      … — ``ModelFamily.MULTI``) runs its own default unless it is the *same*
+      harness as the parent, or an inference binding validates the id (see
+      :func:`_child_is_foreign_multi_model_harness` and
+      :func:`_harness_has_inference_binding`). Such a harness accepts "any id"
+      but resolves it against its *own* provider, where the parent's id — from
+      a different harness's vocabulary — may not be servable.
 
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The parent session id.
@@ -1853,29 +1857,22 @@ async def _inherited_parent_model(
             extra={"session_id": runner_primary_session_id()},
         )
         return None
-    if child_harness is not None and not _harness_has_inference_binding(child_harness):
-        sub_config = getattr(getattr(sub_spec, "executor", None), "config", None)
-        spec_profile = sub_config.get("profile") if isinstance(sub_config, dict) else None
-        # Match OpenCode launch's spec-over-ambient profile precedence.
-        unservable = inherited_model_unservable_reason(
-            child_harness,
+    if (
+        child_harness is not None
+        and not _harness_has_inference_binding(child_harness)
+        and _child_is_foreign_multi_model_harness(child_harness, snap.get("harness"))
+    ):
+        _logger.info(
+            "sys_session_send: not inheriting parent model %r for sub-agent %r "
+            "(child harness %s is multi-model and differs from the parent harness "
+            "%r); child runs its default",
             parent_model,
-            databricks_profile=(
-                str(spec_profile)
-                if spec_profile
-                else os.environ.get("DATABRICKS_CONFIG_PROFILE") or None
-            ),
+            sub_agent_name,
+            child_harness,
+            snap.get("harness"),
+            extra={"session_id": runner_primary_session_id()},
         )
-        if unservable is not None:
-            _logger.info(
-                "sys_session_send: not inheriting parent model %r for sub-agent %r "
-                "(%s); child runs its default",
-                parent_model,
-                sub_agent_name,
-                unservable,
-                extra={"session_id": runner_primary_session_id()},
-            )
-            return None
+        return None
     return parent_model
 
 
@@ -2337,6 +2334,39 @@ def _harness_has_inference_binding(harness: str) -> bool:
     from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
 
     return binding_for_harness(load_runtime_inference_config(), harness) is not None
+
+
+def _child_is_foreign_multi_model_harness(child_harness: str, parent_harness: object) -> bool:
+    """
+    Report whether *child_harness* is a multi-model harness unlike the parent's.
+
+    A multi-model harness (``ModelFamily.MULTI`` — pi, opencode, openai-agents,
+    …) accepts any validated id but routes it to *its own* configured provider,
+    where the parent's model id need not be servable. So the parent's selection
+    is only safe to inherit when the child is literally the same harness as the
+    parent (same provider vocabulary). Single-vendor children are handled by the
+    family check in :func:`_dispatch_model_mismatch`, and a child whose binding
+    validated the id is exempted upstream by :func:`_harness_has_inference_binding`
+    — neither is gated here.
+
+    :param child_harness: The child's resolved harness, alias or canonical.
+    :param parent_harness: The parent session's ``harness`` field from its
+        snapshot; a non-string (missing) is treated as "differs".
+    :returns: ``True`` when inheritance should be skipped for this child.
+    """
+    from omnigent.harness_capabilities import ModelFamily
+    from omnigent.harness_plugins import harness_capabilities
+
+    child_canon = canonicalize_harness(child_harness)
+    if child_canon is None:
+        return False
+    capability = harness_capabilities().get(child_canon)
+    if capability is None or capability.model_family is not ModelFamily.MULTI:
+        return False
+    parent_canon = (
+        canonicalize_harness(parent_harness) if isinstance(parent_harness, str) else None
+    )
+    return parent_canon != child_canon
 
 
 def _normalize_subagent_model(

@@ -1853,7 +1853,7 @@ async def _inherited_parent_model(
             extra={"session_id": runner_primary_session_id()},
         )
         return None
-    if child_harness is not None:
+    if child_harness is not None and not _harness_has_inference_binding(child_harness):
         sub_config = getattr(getattr(sub_spec, "executor", None), "config", None)
         spec_profile = sub_config.get("profile") if isinstance(sub_config, dict) else None
         # Match OpenCode launch's spec-over-ambient profile precedence.
@@ -2320,6 +2320,23 @@ def _dispatch_model_mismatch(harness: str, model: str) -> str | None:
             return str(exc)
         return None
     return model_family_mismatch(harness, model)
+
+
+def _harness_has_inference_binding(harness: str) -> bool:
+    """Whether an inference binding owns *harness*'s model namespace.
+
+    A bound harness resolves ids through ``resolve_bound_model`` at launch
+    (see the opencode/claude launch paths in :mod:`omnigent.runner.app`), so a
+    binding-validated bare id needs no ``provider/`` prefix or Databricks
+    profile; ``_dispatch_model_mismatch`` has already vetted the id against
+    the binding's allowlist by the time inheritance consults this.
+
+    :param harness: The child's resolved harness, e.g. ``"opencode-native"``.
+    :returns: ``True`` when a binding is configured for the harness.
+    """
+    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+
+    return binding_for_harness(load_runtime_inference_config(), harness) is not None
 
 
 def _normalize_subagent_model(

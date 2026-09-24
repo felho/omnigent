@@ -383,6 +383,90 @@ async def test_opencode_worker_with_profile_inherits_gateway_id(
 
 
 @pytest.mark.asyncio
+async def test_opencode_worker_with_binding_inherits_bare_bound_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A binding-validated bare id is inherited without a prefix or profile.
+
+    An inference binding owns the harness's model namespace — launch resolves
+    ids through ``resolve_bound_model`` — so the prefix/profile restriction
+    does not apply. The inherited model deliberately differs from the
+    binding's default: inheritance must carry the parent's selection rather
+    than fall back to the worker default.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    _stub_worker_launchable(monkeypatch)
+    config: dict[str, Any] = {
+        "providers": {"gw": {}},
+        "inference": {
+            "harnesses": {
+                "opencode-native": {
+                    "provider": "gw",
+                    "default_model": "claude-sonnet-4-6",
+                    "model_allowlist": ["claude-sonnet-4-6", "claude-opus-4-8"],
+                }
+            }
+        },
+    }
+    monkeypatch.setattr(
+        "omnigent.inference_config.load_runtime_inference_config",
+        lambda base_config=None: config,
+    )
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("opencode-native"),
+        conv_id="conv_parent_opencode_binding",
+        parent_snapshot={
+            "id": "conv_parent_opencode_binding",
+            "agent_id": "ag_parent",
+            "model_override": "claude-opus-4-8",
+            "llm_model": None,
+        },
+    )
+    assert bodies[0]["model_override"] == "claude-opus-4-8"
+
+
+@pytest.mark.asyncio
+async def test_opencode_worker_with_binding_skips_unlisted_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parent model outside the binding's allowlist is not inherited.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    _stub_worker_launchable(monkeypatch)
+    config: dict[str, Any] = {
+        "providers": {"gw": {}},
+        "inference": {
+            "harnesses": {
+                "opencode-native": {
+                    "provider": "gw",
+                    "default_model": "claude-sonnet-4-6",
+                    "model_allowlist": ["claude-sonnet-4-6"],
+                }
+            }
+        },
+    }
+    monkeypatch.setattr(
+        "omnigent.inference_config.load_runtime_inference_config",
+        lambda base_config=None: config,
+    )
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("opencode-native"),
+        conv_id="conv_parent_opencode_unlisted",
+        parent_snapshot={
+            "id": "conv_parent_opencode_unlisted",
+            "agent_id": "ag_parent",
+            "model_override": "claude-opus-4-8",
+            "llm_model": None,
+        },
+    )
+    assert "model_override" not in bodies[0]
+
+
+@pytest.mark.asyncio
 async def test_pi_worker_inherits_claude_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
 import subprocess
+import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -17,6 +19,7 @@ import pytest
 
 from omnigent.runner._entry import (
     _InitialAuthTokenFactory,
+    _make_auth_token_factory,
     _RunnerDatabricksAuth,
 )
 from omnigent.runner.identity import (
@@ -231,3 +234,92 @@ def test_expired_accounts_login_does_not_fall_through_to_databricks(
     assert "databricks auth login" not in remedy_logs.lower(), (
         f"remedy log points an accounts-mode host at Databricks:\n{remedy_logs}"
     )
+
+
+def test_expired_stored_login_blocks_sdk_after_real_callback(
+    accounts_server: str,
+    tmp_path: Path,
+) -> None:
+    session_id = _seed_owned_session(accounts_server)
+    payload = {
+        "server_url": accounts_server,
+        "contents_path": f"/v1/sessions/{session_id}/agent/contents",
+        "owner_bearer": _login_owner(accounts_server),
+    }
+    env = {**os.environ}
+    env["OMNIGENT_DATA_DIR"] = str(tmp_path / "runner-data")
+    env["RUNNER_SERVER_URL"] = accounts_server
+    env["PYTHONPATH"] = f"{_REPO_ROOT}{os.pathsep}{env.get('PYTHONPATH', '')}"
+    for key in list(env):
+        if key.startswith("DATABRICKS_") or key in {
+            RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+            RUNNER_DELEGATED_AUTH_ENV_VAR,
+            RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+            "OPENAI_API_KEY",
+        }:
+            env.pop(key)
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json, sys; "
+            "from tests.e2e.test_expired_accounts_login_no_databricks_fallthrough "
+            "import _stored_login_probe; _stored_login_probe(json.load(sys.stdin))",
+        ],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        cwd=_REPO_ROOT,
+        env=env,
+        timeout=45,
+        check=False,
+    )
+    assert probe.returncode == 0, probe.stderr[-3000:]
+
+
+def _stored_login_probe(payload: dict[str, str]) -> None:
+    import omnigent.inner.databricks_executor as databricks_executor
+    from omnigent.cli_auth import store_token
+    from omnigent.inner.databricks_executor import _DatabricksBearerAuth
+
+    server_url = payload["server_url"]
+    contents_path = payload["contents_path"]
+    owner_bearer = payload["owner_bearer"]
+    sdk_calls = 0
+
+    class _AmbientConfig:
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": "Bearer ambient-databricks-token"}
+
+    def _resolve_sdk(*args: object, **kwargs: object) -> tuple[_DatabricksBearerAuth, str]:
+        nonlocal sdk_calls
+        sdk_calls += 1
+        return _DatabricksBearerAuth(_AmbientConfig(), profile_name=None), server_url
+
+    databricks_executor._resolve_databricks_auth = _resolve_sdk
+
+    store_token(
+        server_url,
+        token=owner_bearer,
+        user_id=_OWNER,
+        expires_at=time.time() + 3600,
+    )
+    factory = _make_auth_token_factory(server_url)
+    assert factory is not None
+    auth = _RunnerDatabricksAuth(factory, server_url=server_url)
+    response = asyncio.run(_get_agent_contents(server_url, contents_path, auth))
+    assert response.status_code == 200, (response.status_code, response.text)
+
+    store_token(
+        server_url,
+        token=owner_bearer,
+        user_id=_OWNER,
+        expires_at=time.time() - 1,
+    )
+    with pytest.raises(httpx.RequestError) as excinfo:
+        asyncio.run(_get_agent_contents(server_url, contents_path, auth))
+
+    message = str(excinfo.value)
+    assert "Omnigent login" in message and server_url in message
+    assert "Databricks" not in message
+    assert sdk_calls == 0

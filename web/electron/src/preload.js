@@ -447,6 +447,13 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
   },
   /** Organization-provided server URLs from macOS Managed Preferences. */
   getManagedServers: () => ipcRenderer.invoke("omnigent:get-managed-servers"),
+  /** Wizard capabilities, e.g. `{v2Forced}` — v2Forced disables "Switch to
+   *  legacy" because the env var pins the selector on. */
+  getSetupCapabilities: () => ipcRenderer.invoke("omnigent:get-setup-capabilities"),
+  /** Live color-scheme override for the wizard (System/Light/Dark). Not
+   *  persisted — resets to the OS default on relaunch.
+   *  @param {"light"|"dark"|"system"} scheme */
+  setColorScheme: (scheme) => ipcRenderer.send("omnigent:setup-set-color-scheme", scheme),
   /** Recently-connected server URLs, most recent first. */
   getRecentServers: () => ipcRenderer.invoke("omnigent:get-recent-servers"),
   /** Drop one recent server from the saved list; resolves the remaining ones. */

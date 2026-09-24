@@ -12,6 +12,10 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { LandingFooter } from "@/pages/onboarding/LandingFooter";
@@ -76,6 +80,12 @@ export interface ServerSelectorV2Setup {
   onCloudSetup: () => void;
   /** Revert to the classic (legacy) setup page. */
   onSwitchToLegacy: () => void;
+  /** Disable "Switch to legacy" — the env var pins the selector on, so it can't
+   *  take effect. */
+  switchToLegacyDisabled?: boolean;
+  /** Set the wizard's live color scheme (System/Light/Dark), if the shell
+   *  supports it. Absent → the theme submenu is hidden. */
+  onSetColorScheme?: (scheme: "light" | "dark" | "system") => void;
 }
 
 /** Result of the advisory reachability probe. */
@@ -105,6 +115,9 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   const [step, setStep] = useState<Step>(
     setup.error || setup.initialStep === "server" || setup.installed ? "server" : "landing",
   );
+  // Wizard color scheme (live only; the shell resets to the OS default on
+  // relaunch, so we default to "system" and don't try to read it back).
+  const [colorScheme, setColorScheme] = useState<"system" | "light" | "dark">("system");
   // The preset server picked from the landing split button (drives the detail step).
   const [detailUrl, setDetailUrl] = useState<string | null>(null);
   // What the terminal step should run after any install: start the local server,
@@ -173,13 +186,30 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
             </button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
-            <DropdownMenuItem onSelect={setup.onSwitchToLegacy}>
+            <DropdownMenuItem
+              onSelect={setup.onSwitchToLegacy}
+              disabled={setup.switchToLegacyDisabled}
+            >
               Switch to legacy selector experience
             </DropdownMenuItem>
-            {/* Debug aid: flip the theme in place (not persisted). */}
-            <DropdownMenuItem onSelect={() => document.documentElement.classList.toggle("dark")}>
-              Toggle light/dark mode
-            </DropdownMenuItem>
+            {setup.onSetColorScheme && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuLabel>Appearance</DropdownMenuLabel>
+                <DropdownMenuRadioGroup
+                  value={colorScheme}
+                  onValueChange={(v) => {
+                    const scheme = v as "system" | "light" | "dark";
+                    setColorScheme(scheme);
+                    setup.onSetColorScheme?.(scheme);
+                  }}
+                >
+                  <DropdownMenuRadioItem value="system">System (default)</DropdownMenuRadioItem>
+                  <DropdownMenuRadioItem value="light">Light</DropdownMenuRadioItem>
+                  <DropdownMenuRadioItem value="dark">Dark</DropdownMenuRadioItem>
+                </DropdownMenuRadioGroup>
+              </>
+            )}
           </DropdownMenuContent>
         </DropdownMenu>
       </div>

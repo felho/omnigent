@@ -3005,6 +3005,16 @@ function registerIpc() {
     return managedServerUrls();
   });
 
+  // Setup page → capabilities that gate wizard chrome. `v2Forced` means the env
+  // var pins the selector on, so "Switch to legacy" can't take effect and the
+  // menu item is disabled.
+  ipcMain.handle("omnigent:get-setup-capabilities", (event) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("get-setup-capabilities is only available to the setup page");
+    }
+    return { v2Forced: serverSelectorV2EnvForced() };
+  });
+
   ipcMain.handle("omnigent:copy-setup-text", (event, text) => {
     if (!isSetupPageSender(event)) {
       throw new Error("copy-setup-text is only available to the setup page");
@@ -3388,6 +3398,16 @@ function registerIpc() {
   // foreign page can't drive the shell's native appearance.
   ipcMain.on("omnigent:set-color-scheme", (event, scheme) => {
     if (!isPinnedOriginSender(event)) return;
+    if (scheme === "light" || scheme === "dark" || scheme === "system") {
+      nativeTheme.themeSource = scheme;
+    }
+  });
+
+  // Setup page → live color-scheme override (System/Light/Dark) for the wizard.
+  // Separate sender gate from the SPA handler above: the setup page isn't a
+  // pinned origin. Not persisted — resets to the OS default on relaunch.
+  ipcMain.on("omnigent:setup-set-color-scheme", (event, scheme) => {
+    if (!isSetupPageSender(event)) return;
     if (scheme === "light" || scheme === "dark" || scheme === "system") {
       nativeTheme.themeSource = scheme;
     }

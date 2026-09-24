@@ -24,6 +24,8 @@ interface OmnigentSetup {
   checkServer?: (url: string) => Promise<{ status: "ok" | "reachable" | "unreachable" }>;
   copyText: (text: string) => Promise<unknown>;
   setServerSelectorV2?: (enabled: boolean) => Promise<unknown>;
+  getSetupCapabilities?: () => Promise<{ v2Forced?: boolean }>;
+  setColorScheme?: (scheme: "light" | "dark" | "system") => void;
   getCliStatus: () => Promise<{ installed?: boolean; installSupported?: boolean }>;
   startLocalServer: () => Promise<{ ok?: boolean; url?: string; error?: string }>;
   onLocalServerSetupLog?: (cb: (line: string) => void) => () => void;
@@ -67,6 +69,9 @@ function BridgeSetupApp() {
   // Whether in-app install is available on this platform (macOS only). Off →
   // connect/local must never route through an install step.
   const [installSupported, setInstallSupported] = useState(false);
+  // Whether the env var pins the selector on → "Switch to legacy" can't take
+  // effect, so the menu item is disabled.
+  const [v2Forced, setV2Forced] = useState(false);
   // Hold the initial paint until the CLI probe resolves, so the wizard opens on
   // the correct step (welcome vs server list) instead of flashing the wrong one.
   const [ready, setReady] = useState(false);
@@ -93,6 +98,11 @@ function BridgeSetupApp() {
       setInstalled(status?.installed === true);
       setInstallSupported(status?.installSupported === true);
     });
+    // Older shells omit getSetupCapabilities → leave the item enabled.
+    bridge
+      .getSetupCapabilities?.()
+      .then((caps) => setV2Forced(caps?.v2Forced === true))
+      .catch(() => {});
     Promise.allSettled([savedUrl, recents, managed, cli]).then(() => {
       // A failed CLI probe means "not installed" rather than unknown.
       setInstalled((prev) => prev ?? false);
@@ -213,6 +223,11 @@ function BridgeSetupApp() {
         ?.setServerSelectorV2?.(false)
         ?.catch(() => {});
     },
+    switchToLegacyDisabled: v2Forced,
+    // Live color-scheme override; only offered when the shell exposes it.
+    onSetColorScheme: setupBridge()?.setColorScheme
+      ? (scheme) => setupBridge()?.setColorScheme?.(scheme)
+      : undefined,
   };
 
   return (

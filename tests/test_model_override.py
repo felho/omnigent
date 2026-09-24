@@ -289,12 +289,7 @@ class TestInheritedModelUnservableReason:
         ["pi", "pi-native", "native-pi", "claude-sdk", "codex", "openai-agents", "kimi"],
     )
     def test_other_harnesses_are_not_gated(self, harness: str) -> None:
-        """Only opencode is gated here; every other harness routes its own id.
-
-        pi in particular is intentionally excluded: it routes a validated id to
-        the provider its launch configured (see ``_pi_provider_for_model``), so
-        servability is a provider-resolution concern, not a dispatch-gate one.
-        """
+        """Non-OpenCode harnesses are not filtered at the dispatch gate."""
         assert (
             inherited_model_unservable_reason(
                 harness,

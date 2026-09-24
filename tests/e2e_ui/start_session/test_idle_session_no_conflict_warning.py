@@ -330,10 +330,6 @@ async def _drive(base_url: str, mock_llm_url: str, tmp_path: Path) -> None:
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
 
-    async with httpx.AsyncClient() as client:
-        agents = (await client.get(f"{base_url}/v1/agents", timeout=10.0)).json()["data"]
-    agent_id = next(a["id"] for a in agents if a["name"] == "hello_world")
-
     host = _LocalHost(base_url, mock_llm_url, home, log_dir)
     session_id: str | None = None
     async with _local_host(host) as host_id, async_playwright() as pw:
@@ -343,11 +339,11 @@ async def _drive(base_url: str, mock_llm_url: str, tmp_path: Path) -> None:
             await page.goto(base_url)
             await expect(page.get_by_test_id("new-chat-landing")).to_be_visible(timeout=15_000)
 
-            # Custom agents may be nested in the flyout.
+            # A newer same-name upload can replace the server template's picker row.
             await page.get_by_test_id("new-chat-landing-agent-select").click()
-            agent_row = page.get_by_test_id(f"new-chat-landing-agent-{agent_id}")
-            if not await agent_row.is_visible():
-                await page.get_by_test_id("new-chat-landing-custom-agents").click()
+            await page.get_by_test_id("new-chat-landing-custom-agents").click()
+            agent_row = page.get_by_role("menuitem", name=re.compile(r"^hello_world$", re.I))
+            await expect(agent_row).to_be_visible(timeout=15_000)
             await agent_row.click()
 
             await page.get_by_test_id("new-chat-landing-host-chip").click()
@@ -442,6 +438,8 @@ async def _drive(base_url: str, mock_llm_url: str, tmp_path: Path) -> None:
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
+# Exercise the newer session-scoped version alongside the catalog template.
+@pytest.mark.usefixtures("seeded_session")
 def test_default_state_directory_picker_has_no_conflict_warning(
     live_server: str,
     mock_llm_server_url: str,

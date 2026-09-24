@@ -291,6 +291,11 @@ async def _drive_sdk_readiness(base_url: str, host: dict[str, Any]) -> None:
                 await expect(warning).to_be_visible(timeout=15_000)
                 warned_before_launch = True
             except AssertionError:
+                # No under-composer notice within the window. That is fine
+                # when the disabled menu row already carried the warning badge
+                # (warned_before_launch is then already True); otherwise the
+                # final warned_before_launch assertion fails and reports the
+                # captured first-turn error as evidence.
                 pass
 
             # Launch anyway (the readiness signal warns, it does not block) and

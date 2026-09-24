@@ -2906,6 +2906,38 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(state.blocks.filter((b) => b.type === "error")).toHaveLength(0);
   });
 
+  it("surfaces the server's runner-unavailable cause verbatim when it names one", async () => {
+    // Preserve the server's phase-specific detail as the retained bubble's reason.
+    const causefulDetail =
+      "The host launched runner runner_token_abc123 for this session, but it " +
+      "never connected to the server within 30s — the runner process may be " +
+      "hung or unable to reach the server. Check the runner log on the host.";
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      status: "idle",
+      sessionStatus: "running",
+      blocks: [],
+      pendingUserMessages: [],
+    });
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/events")) {
+        return mockResponse(
+          { error: { code: "runner_unavailable", message: causefulDetail } },
+          { ok: false, status: 503 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().send("hi", "agent_xyz");
+
+    const state = useChatStore.getState();
+    expect(state.pendingUserMessages[0]!.failed).toEqual({ reason: causefulDetail, attempts: 1 });
+    expect(state.blocks.filter((b) => b.type === "error")).toHaveLength(0);
+  });
+
   it("carries a definitive refusal's own message onto the bubble, but not a plain 5xx", async () => {
     // A 4xx is the server's final word and its message is shown at once. A
     // 5xx may have arrived after the message was persisted, so it says

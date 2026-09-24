@@ -1,6 +1,6 @@
-// Claude Code's permission modes. Two vocabularies: every mode
-// `--permission-mode` accepts when starting a session, and the subset a
-// running session can be switched to (see the SWITCHABLE list below).
+// Claude Code's permission modes: every mode `--permission-mode` accepts
+// when starting a session, the subset a running session can switch to, and
+// the New Chat-only no-flag default (see the lists below).
 
 import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 
@@ -26,16 +26,12 @@ export interface ClaudePermissionModeOption {
 // "inherit" is a web-UI sentinel: no --permission-mode flag is passed, so
 // Claude Code uses whatever the user has configured in their settings file.
 export const CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE = "inherit";
+export const CLAUDE_NATIVE_INHERIT_PERMISSION_MODE = CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE;
 
 // Claude Code's `claude --permission-mode` choices (v2.1). Keep in sync
-// with `claude --help`. "inherit" is prepended as the no-flag default; the
-// rest map 1:1 to --permission-mode values sent on session create.
+// with `claude --help`. Every value here maps 1:1 to a launch flag; the
+// frontend-only "inherit" sentinel is deliberately excluded.
 export const CLAUDE_NATIVE_PERMISSION_MODES: ClaudePermissionModeOption[] = [
-  {
-    value: "inherit",
-    label: "Default",
-    description: "Uses your configured Claude Code permission mode",
-  },
   { value: "default", label: "Manual", description: "Prompts before edits and commands" },
   {
     value: "auto",
@@ -56,9 +52,21 @@ export const CLAUDE_NATIVE_PERMISSION_MODES: ClaudePermissionModeOption[] = [
   },
 ];
 
+const CLAUDE_NATIVE_INHERIT_PERMISSION_MODE_OPTION: ClaudePermissionModeOption = {
+  value: CLAUDE_NATIVE_INHERIT_PERMISSION_MODE,
+  label: "Default",
+  description: "Uses your configured Claude Code permission mode",
+};
+
+// The New Chat and fork pickers offer the no-flag Default entry first, then
+// every real launch mode. Scheduled tasks keep their own "Default" sentinel
+// and use only CLAUDE_NATIVE_PERMISSION_MODES.
+export const CLAUDE_NATIVE_NEW_CHAT_PERMISSION_MODES: ClaudePermissionModeOption[] = [
+  CLAUDE_NATIVE_INHERIT_PERMISSION_MODE_OPTION,
+  ...CLAUDE_NATIVE_PERMISSION_MODES,
+];
+
 /** Modes a running session can be switched to (shift+tab-reachable). */
-// "inherit" is launch-only — there is no --permission-mode flag that means
-// "use my settings", so it cannot be sent as a mid-session switch.
 export const CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES: ClaudePermissionModeOption[] =
   CLAUDE_NATIVE_PERMISSION_MODES.filter((mode) =>
     ["default", "acceptEdits", "plan", "auto"].includes(mode.value),

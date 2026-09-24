@@ -241,6 +241,8 @@ export default defineConfig(({ command }) => ({
     // vitest's default glob descends into the nested electron package and
     // tries to run its node:test files (which aren't vitest suites).
     include: ["src/**/*.{test,spec}.?(c|m)[jt]s?(x)"],
+    // The host grammar sentinel intentionally fails on standalone React Router 7.
+    exclude: ["src/managedRouterRoutes.test.ts"],
     coverage: {
       provider: "v8",
       // With `include` set, vitest counts every matching source file (untested

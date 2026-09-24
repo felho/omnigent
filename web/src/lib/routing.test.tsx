@@ -23,6 +23,16 @@ function renderRebasedLink(basename: string, to: To): string | null {
 }
 
 describe("basenamedRouting Link rebasing", () => {
+  it.each(["/omnigent", "/ml/omnigents"])(
+    "keeps settings links under the managed mount %s",
+    (basename) => {
+      expect(renderRebasedLink(basename, "/settings/general?o=123")).toBe(
+        `${basename}/settings/general?o=123`,
+      );
+      expect(renderRebasedLink(basename, `${basename}?o=123`)).toBe(`${basename}?o=123`);
+    },
+  );
+
   it("rebases a string absolute path under the basename", () => {
     // String form already worked; this is the baseline the object form must match.
     expect(renderRebasedLink("/mount", "/c/abc")).toBe("/mount/c/abc");

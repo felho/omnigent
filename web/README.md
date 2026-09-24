@@ -87,6 +87,19 @@ pnpm run test          # vitest run
 pnpm run test:watch    # vitest in watch mode
 ```
 
+## Databricks managed embed routing
+
+The managed embed renders in the host's React tree and router, with no nested
+`<Router>`. Its route table must match both `/omnigent` and the legacy
+`/ml/omnigents` mount. The host supplies React Router 6.4.1, which does not
+support optional route segments such as `:subSection?`; use explicit paths.
+Links and navigation must stay under the mount basename, including paths that
+already carry the basename or a workspace query string.
+
+Run `pnpm run test:managed-router` to check the same-root embed, app routes,
+basename navigation, and every `App` route pattern against the pinned host
+router. The `web Tests` workflow runs this command on web changes.
+
 ## Reducer parity
 
 The TypeScript reducer at `src/lib/blockStream.ts` is a hand-mirror of

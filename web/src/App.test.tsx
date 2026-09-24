@@ -17,13 +17,17 @@ vi.mock("@/shell/AppShell", () => ({
   ),
 }));
 vi.mock("@/pages/ChatPage", () => ({ ChatPage: () => <div>chat page</div> }));
+vi.mock("@/pages/InboxPage", () => ({ InboxPage: () => <div>inbox page</div> }));
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
 vi.mock("@/pages/CanvasPage", () => ({ CanvasPage: () => <div>canvas page</div> }));
 vi.mock("@/pages/SettingsPage", async () => {
   const { useLocation } = await import("react-router-dom");
   return {
-    SettingsPage: () => <div data-testid="settings-location">{useLocation().pathname}</div>,
+    SettingsPage: () => {
+      const location = useLocation();
+      return <div data-testid="settings-location">{location.pathname + location.search}</div>;
+    },
   };
 });
 vi.mock("@/extensions/ExtensionPageHost", () => ({
@@ -236,5 +240,44 @@ describe("Settings routes", () => {
     expect(await screen.findByTestId("settings-location")).toHaveTextContent(
       "/settings/appearance",
     );
+  });
+});
+
+describe.each(["/omnigent", "/ml/omnigents"])("Databricks host mount %s", (basename) => {
+  function renderEmbeddedRoute(path: string) {
+    return render(
+      <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+        <MemoryRouter initialEntries={[`${basename}${path}`]}>
+          <App basename={basename} />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
+  }
+
+  it.each([
+    { path: "/settings", destination: "/settings/general" },
+    { path: "/settings/general?o=123", destination: "/settings/general?o=123" },
+    { path: "/settings/appearance", destination: "/settings/appearance" },
+    { path: "/settings/customize/skills", destination: "/settings/customize/skills" },
+    { path: "/members", destination: "/settings/members" },
+    { path: "/policies", destination: "/settings/policies" },
+  ])("renders $path at the managed mount", async ({ path, destination }) => {
+    renderEmbeddedRoute(path);
+
+    expect(await screen.findByTestId("settings-location")).toHaveTextContent(
+      `${basename}${destination}`,
+    );
+    expect(screen.queryByText("not found")).toBeNull();
+  });
+
+  it.each([
+    { path: "", page: "chat page" },
+    { path: "/c/session-123", page: "chat page" },
+    { path: "/inbox", page: "inbox page" },
+  ])("renders $path inside the host router", async ({ path, page }) => {
+    renderEmbeddedRoute(path);
+
+    expect(await screen.findByText(page)).toBeInTheDocument();
+    expect(screen.queryByText("not found")).toBeNull();
   });
 });

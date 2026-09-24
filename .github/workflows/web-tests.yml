@@ -63,6 +63,9 @@ jobs:
       - name: Run tests with coverage
         run: pnpm --filter web run test:coverage
 
+      - name: Test routes with the Databricks host router
+        run: pnpm --filter web run test:managed-router
+
       # Distill the v8 json-summary into a single total.txt, mirroring the
       # backend's coverage-report job. ui-code-coverage.yml (privileged
       # workflow_run) consumes this artifact and posts the report-only status.

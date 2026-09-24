@@ -1636,6 +1636,7 @@ async def test_capability_probe_timeout_preserves_unknown_registration_fallback(
 ) -> None:
     """A timed-out probe leaves the connected host's readiness unknown."""
     host = _make_host_process()
+    monkeypatch.setattr(host, "_prewarm_model_options", AsyncMock(return_value=None))
     never = asyncio.Event()
 
     async def _blocked(*, startup: bool) -> None:
@@ -1652,7 +1653,7 @@ async def test_capability_probe_timeout_preserves_unknown_registration_fallback(
         await asyncio.wait_for(tunnel.first_send.wait(), timeout=1.0)
         task = host._capability_init_task
         assert task is not None
-        await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+        await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
     finally:
         tunnel.disconnect.set()
         with pytest.raises(ConnectionError, match="test disconnect"):

@@ -22,6 +22,12 @@ a hand-written wire body — is what the picker renders.
   is configured, the picker warns for it, and ``claude-native`` is a readiness
   entry distinct from ``claude-sdk``.
 
+Since #7882 the picker renders a not-ready agent's menu row disabled (with a
+per-row warning badge) rather than selectable-with-a-warning, so both tests
+seed the persisted last pick (``omnigent:last-agent-id``) to select the agent
+and accept either warning surface — the disabled row's badge or the
+under-composer notice — as the pre-launch signal.
+
 The async-in-a-fresh-thread shape is inherited from
 ``start_session/test_start_session.py``: once a pytest-playwright sync test has
 run in the session, pytest-asyncio can't start a loop on the main thread.
@@ -171,8 +177,14 @@ def _register_harness_agent(base_url: str, name: str, harness: str, model: str) 
     return agent_id
 
 
-async def _select_agent(page: Any, agent_id: str) -> None:
-    """Pick *agent_id* in the landing picker's agent menu, then dismiss it."""
+async def _reveal_agent_row(page: Any, agent_id: str) -> Any:
+    """Open the landing picker's agent menu and reveal *agent_id*'s row.
+
+    Returns the row locator without clicking it: since #7882 the picker
+    renders a not-ready agent's row *disabled* (with a per-row warning
+    badge), so whether the row is clickable is itself part of what the
+    tests observe.
+    """
     picker = page.get_by_test_id("new-chat-landing-agent-select")
     await picker.click()
     await expect(page.get_by_role("menu").first).to_be_visible()
@@ -188,10 +200,30 @@ async def _select_agent(page: Any, agent_id: str) -> None:
         more = page.get_by_test_id("new-chat-landing-harness-more")
         if await more.count() > 0:
             await more.click()
-    await row.click()
+    await row.wait_for(state="visible", timeout=10_000)
+    return row
+
+
+async def _dismiss_agent_menu(page: Any) -> None:
+    """Close the landing picker's agent menu (and any open flyout)."""
+    picker = page.get_by_test_id("new-chat-landing-agent-select")
     await page.keyboard.press("Escape")
     if await picker.get_attribute("aria-expanded") == "true":
         await page.keyboard.press("Escape")
+
+
+async def _seed_last_agent(page: Any, agent_id: str) -> None:
+    """Persist *agent_id* as the landing picker's last pick before page load.
+
+    Since #7882 the picker menu *disables* a not-ready agent's row instead of
+    merely warning about it, so the fixed state can no longer click the row to
+    select the agent. Seeding the persisted last pick selects it the same way
+    a returning user lands on their previous agent, keeping the launch journey
+    (which warns but does not block) drivable.
+    """
+    await page.add_init_script(
+        f'window.localStorage.setItem("omnigent:last-agent-id", {json.dumps(agent_id)})'
+    )
 
 
 async def _seed_recent_workspace(page: Any, host_id: str, workspace: str) -> None:
@@ -230,21 +262,36 @@ async def _drive_sdk_readiness(base_url: str, host: dict[str, Any]) -> None:
         page = await browser.new_page()
         try:
             await _seed_recent_workspace(page, host["host_id"], host["workspace"])
+            await _seed_last_agent(page, agent_id)
             await page.goto(f"{base_url}/")
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            await _select_agent(page, agent_id)
 
-            # The under-composer readiness notice for the selected agent on the
-            # selected host. Today it never appears for an SDK harness; after
-            # the fix it must.
+            # Post-fix (with #7882's picker), the needs-auth agent's menu row
+            # is disabled and carries a warning badge — the strongest form of
+            # the pre-launch warning. In the regression state (the daemon
+            # claims the SDK harness is ready) the row is enabled with no
+            # badge, so click it exactly as the reported journey did.
+            row = await _reveal_agent_row(page, agent_id)
+            if await row.is_enabled():
+                await row.click()
+            else:
+                badge = page.get_by_test_id(f"new-chat-landing-agent-warning-{agent_id}")
+                await expect(badge).to_be_visible()
+                warned_before_launch = True
+            await _dismiss_agent_menu(page)
+
+            # The under-composer readiness notice for the selected agent on
+            # the selected host (the agent is selected either by the click
+            # above or by the seeded last pick). In the regression state it
+            # never appears for an SDK harness; after the fix it must.
             warning = page.get_by_test_id("new-chat-landing-harness-warning")
             try:
                 await expect(warning).to_be_visible(timeout=15_000)
                 warned_before_launch = True
             except AssertionError:
-                warned_before_launch = False
+                pass
 
             # Launch anyway (the readiness signal warns, it does not block) and
             # watch the first turn. Today it dies with an auth error the picker
@@ -280,8 +327,8 @@ async def _drive_sdk_readiness(base_url: str, host: dict[str, Any]) -> None:
     row = _fetch_host_row(base_url, host["name"])
     assert row is not None, "credential-less host dropped offline mid-test"
     availability = (row.get("configured_harnesses") or {}).get("claude-sdk")
-    assert availability is not True, (
-        "host with no credentials reported claude-sdk as ready "
+    assert availability == "needs-auth", (
+        "host with no credentials must report claude-sdk as 'needs-auth' "
         f"(configured_harnesses['claude-sdk'] == {availability!r}); "
         f"the launched session's first turn then failed with: {first_turn_error!r}"
     )
@@ -329,11 +376,21 @@ async def _drive_pi_readiness(base_url: str, host: dict[str, Any]) -> None:
         page = await browser.new_page()
         try:
             await _seed_recent_workspace(page, host["host_id"], host["workspace"])
+            await _seed_last_agent(page, agent_id)
             await page.goto(f"{base_url}/")
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            await _select_agent(page, agent_id)
+            # needs-auth renders the pi row disabled with a warning badge
+            # (#7882); the seeded last pick keeps the agent selected so the
+            # under-composer notice can render and name the host.
+            row = await _reveal_agent_row(page, agent_id)
+            if await row.is_enabled():
+                await row.click()
+            else:
+                badge = page.get_by_test_id(f"new-chat-landing-agent-warning-{agent_id}")
+                await expect(badge).to_be_visible()
+            await _dismiss_agent_menu(page)
             warning = page.get_by_test_id("new-chat-landing-harness-warning")
             await expect(warning).to_be_visible(timeout=30_000)
             await expect(warning).to_contain_text(host["name"])

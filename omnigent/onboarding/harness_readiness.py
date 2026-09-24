@@ -29,8 +29,8 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Callable
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import omnigent.onboarding.gemini_auth as _gemini_auth
 import omnigent.onboarding.kimi_auth as _kimi_auth
@@ -457,21 +457,57 @@ def _claude_code_login_configured() -> bool:
         return False
 
 
-def _databricks_workspace_configured() -> bool:
-    """Whether an ambient Databricks workspace is resolvable on this machine.
+def _databricks_config_override_has_profiles(path: str) -> bool:
+    """Whether a ``DATABRICKS_CONFIG_FILE`` override declares any profile.
 
-    The SDK executors mint a gateway bearer from ambient Databricks
-    credentials (``DATABRICKS_HOST`` env, a ``~/.databrickscfg`` profile) for
-    ``databricks-*`` models even with no ``providers:`` entry, so a resolvable
-    workspace counts as a credential source. Local file/env reads only; never
+    Mirrors
+    :func:`~omnigent.onboarding.databricks_config.list_databricks_profiles`
+    (which reads only the default ``~/.databrickscfg`` location): a profile
+    section, or a ``DEFAULT`` section that actually carries keys, counts. A
+    file that merely exists proves nothing. Local file read only; never
     raises.
 
-    :returns: ``True`` when a workspace host is ambiently resolvable.
+    :param path: The override path from ``DATABRICKS_CONFIG_FILE``.
+    :returns: ``True`` when the file parses and declares at least one profile.
+    """
+    import configparser
+
+    try:
+        if not os.path.exists(path):
+            return False
+        parser = configparser.ConfigParser()
+        parser.read(path)
+        return bool(parser.sections() or parser.defaults())
+    except Exception:
+        _logger.debug("readiness: databricks config override parse failed", exc_info=True)
+        return False
+
+
+def _databricks_workspace_configured() -> bool:
+    """Whether an ambient Databricks credential source is resolvable here.
+
+    The SDK executors mint a gateway bearer from ambient Databricks
+    credentials for ``databricks-*`` models even with no ``providers:``
+    entry, so a resolvable credential source counts. A workspace URL alone
+    is **not** a credential: env-based readiness requires ``DATABRICKS_HOST``
+    plus authentication material (a ``DATABRICKS_TOKEN`` PAT, or an OAuth
+    service-principal ``DATABRICKS_CLIENT_ID``/``DATABRICKS_CLIENT_SECRET``
+    pair), and a config file counts only when it actually declares a profile.
+    Local file/env reads only; never raises.
+
+    :returns: ``True`` when an ambient Databricks credential source is
+        resolvable.
     """
     if os.environ.get("DATABRICKS_HOST", "").strip():
-        return True
+        if os.environ.get("DATABRICKS_TOKEN", "").strip():
+            return True
+        if (
+            os.environ.get("DATABRICKS_CLIENT_ID", "").strip()
+            and os.environ.get("DATABRICKS_CLIENT_SECRET", "").strip()
+        ):
+            return True
     config_override = os.environ.get("DATABRICKS_CONFIG_FILE", "").strip()
-    if config_override and os.path.exists(config_override):
+    if config_override and _databricks_config_override_has_profiles(config_override):
         return True
     try:
         from omnigent.onboarding.databricks_config import list_databricks_profiles

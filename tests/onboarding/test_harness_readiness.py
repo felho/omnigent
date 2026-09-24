@@ -47,6 +47,9 @@ def _isolate_cli_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
         "ANTIGRAVITY_API_KEY",
         "GOOGLE_APPLICATION_CREDENTIALS",
         "DATABRICKS_HOST",
+        "DATABRICKS_TOKEN",
+        "DATABRICKS_CLIENT_ID",
+        "DATABRICKS_CLIENT_SECRET",
         "DATABRICKS_CONFIG_FILE",
     ):
         monkeypatch.delenv(var, raising=False)
@@ -899,13 +902,16 @@ def test_claude_sdk_ready_via_managed_gateway(
 
 
 def test_sdk_harness_ready_via_databricks_workspace(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An ambient Databricks workspace counts as an SDK credential source.
+    """An ambient Databricks *credential* counts as an SDK credential source.
 
     The SDK executors mint a gateway bearer from ``~/.databrickscfg`` / the
     Databricks env for ``databricks-*`` models even with no provider entry, so
-    a host configured only that way must not read ``needs-auth``.
+    a host configured with a profile, ``DATABRICKS_HOST`` plus auth material,
+    or a profile-bearing ``DATABRICKS_CONFIG_FILE`` must not read
+    ``needs-auth``.
     """
     import omnigent.onboarding.databricks_config as dbc
 
@@ -917,9 +923,54 @@ def test_sdk_harness_ready_via_databricks_workspace(
 
     monkeypatch.setattr(dbc, "list_databricks_profiles", list)
     monkeypatch.setenv("DATABRICKS_HOST", "https://example.cloud.databricks.com")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-test-token")
     result = configured_harness_map()
     assert result["claude-sdk"] is True
     assert result["openai-agents"] is True
+
+    monkeypatch.delenv("DATABRICKS_HOST")
+    monkeypatch.delenv("DATABRICKS_TOKEN")
+    config_file = tmp_path / "databrickscfg-override"
+    config_file.write_text("[work]\nhost = https://example.cloud.databricks.com\ntoken = t\n")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(config_file))
+    result = configured_harness_map()
+    assert result["claude-sdk"] is True
+    assert result["openai-agents"] is True
+
+
+def test_databricks_workspace_url_alone_is_not_a_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``DATABRICKS_HOST`` without auth material must read ``needs-auth``.
+
+    A workspace URL names where to authenticate, not a way to authenticate:
+    with no token, OAuth pair, profile, or other local source, the executors
+    cannot mint a gateway bearer, so readiness must not report the SDK
+    harnesses ready off the URL alone.
+    """
+    _no_clis_installed(monkeypatch)
+    monkeypatch.setenv("DATABRICKS_HOST", "https://example.cloud.databricks.com")
+    result = configured_harness_map()
+    assert result["claude-sdk"] == "needs-auth"
+    assert result["openai-agents"] == "needs-auth"
+
+
+def test_databricks_profileless_config_override_is_not_a_credential(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``DATABRICKS_CONFIG_FILE`` that declares no profile is not a credential.
+
+    Mere existence of the override file (including an empty one) proves no
+    authentication source, so readiness must still read ``needs-auth``.
+    """
+    _no_clis_installed(monkeypatch)
+    empty_config = tmp_path / "databrickscfg-empty"
+    empty_config.write_text("")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(empty_config))
+    result = configured_harness_map()
+    assert result["claude-sdk"] == "needs-auth"
+    assert result["openai-agents"] == "needs-auth"
 
 
 def test_antigravity_sdk_readiness_keys_off_gemini_credential(

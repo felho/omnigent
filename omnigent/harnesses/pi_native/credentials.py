@@ -808,11 +808,11 @@ def _run_auth_command(auth_command: str, *, timeout: float = 15.0) -> str | None
             text=True,
             **spawn_kwargs(),
         )
-    except OSError:
+    except Exception:  # noqa: BLE001 — a command that cannot start is a failed mint
         return None
     try:
         stdout, _ = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    except Exception:  # noqa: BLE001 — a stalled or undecodable helper is a failed mint
         kill_tree(process)
         with suppress(Exception):
             process.communicate()

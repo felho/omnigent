@@ -482,6 +482,42 @@ def test_run_auth_command_uses_the_shell() -> None:
     assert creds._run_auth_command("exit 3") is None
 
 
+def test_run_auth_command_undecodable_output_is_a_failed_mint() -> None:
+    """Non-UTF-8 output is a failed token mint, not an exception for the caller."""
+    assert creds._run_auth_command("printf '\\xff\\xfe'") is None
+
+
+def test_inline_databricks_gateway_failed_token_mint_keeps_the_provider() -> None:
+    """A failing ``auth_command`` skips discovery but keeps the configured provider.
+
+    Pi must not lose its provider (and fall to its own login) because the
+    one-shot listing token could not be minted; the single-family config with
+    the ``!command`` apiKey still launches, and Pi retries the command itself.
+    """
+    config = {
+        "providers": {
+            "openai-gateway": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": "https://wkspc.cloud.databricks.com/ai-gateway/codex/v1",
+                    "auth_command": "printf '\\xff\\xfe'",
+                    "wire_api": "responses",
+                    "models": {"default": "system.ai.gpt-5"},
+                },
+            }
+        }
+    }
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+
+    assert provider is not None
+    assert provider.api == "openai-responses"
+    assert provider.model == "system.ai.gpt-5"
+    assert provider.api_key == "!printf '\\xff\\xfe'"
+    assert not provider.additional_providers
+
+
 def test_run_auth_command_timeout_kills_the_helper(tmp_path: Path) -> None:
     """A helper that stalls past the timeout does not outlive the call."""
     import shlex

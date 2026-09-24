@@ -628,8 +628,6 @@ def test_append_keeps_caller_supplied_created_at(
             ),
         ],
     )
-    # The timestamped item keeps its source time; the bare one gets the
-    # append time as before.
     assert items[0].created_at == source_at
     assert items[1].created_at > source_at
 

@@ -68,11 +68,7 @@ def _exceeds_compaction_trim_size(path: Path) -> bool:
 
 
 def _source_epoch(value: object) -> int | None:
-    """Parse a source record time (ISO-8601 or epoch seconds/millis) to Unix seconds.
-
-    Returns ``None`` for anything absent or unparseable so callers fall back
-    to the import time rather than fail the import.
-    """
+    """Parse a source timestamp to Unix seconds, or return None if unusable."""
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
@@ -530,7 +526,6 @@ def load_claude_session(
             type=item.item_type,
             response_id=item.response_id,
             data=parse_item_data(item.item_type, _claude_import_item_data(item)),
-            # The bridge stamps each record's own ISO timestamp on its items.
             created_at=int(item.created_at) if item.created_at is not None else None,
         )
         for item in source_items
@@ -752,8 +747,7 @@ def _codex_compacted_baseline_items(
     for entry in history:
         if not isinstance(entry, dict):
             continue
-        # Baseline entries carry no time of their own; the compaction
-        # record's time keeps the item sequence chronologically sane.
+        # Replacement-history entries inherit the compaction record's time.
         item = _codex_response_item(entry, response_id="codex:compaction", created_at=created_at)
         if item is not None:
             baseline.append(item)
@@ -792,7 +786,6 @@ def load_codex_session(
             if not isinstance(record, dict) or not isinstance(record.get("payload"), dict):
                 continue
             payload = record["payload"]
-            # Rollout lines carry their own wall-clock time; preserve it.
             recorded_at = _source_epoch(record.get("timestamp"))
             if record.get("type") == "session_meta":
                 cwd = payload.get("cwd")

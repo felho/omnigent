@@ -427,9 +427,6 @@ def create_imports_router(
                 external_session_id,
             )
             await asyncio.to_thread(conversation_store.append, conversation.id, items)
-            # Stamp the source session's own activity window so imported
-            # history sorts by when the work happened, not the import run.
-            # Items without source times leave the import-time stamps.
             source_times = [item.created_at for item in items if item.created_at is not None]
             if source_times:
                 await asyncio.to_thread(

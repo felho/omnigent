@@ -2333,7 +2333,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 "id": item_id,
                 "conversation_id": conversation_id,
                 "response_id": item.response_id,
-                # Imported items keep their source record's own time.
                 "created_at": item.created_at if item.created_at is not None else now,
                 "status": completed_status,
                 "type": encode_item_type(item.type),
@@ -2462,7 +2461,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                         type=item.type,
                         status="completed",
                         response_id=item.response_id,
-                        # Match the row: an imported item keeps its source time.
                         created_at=item.created_at if item.created_at is not None else now,
                         data=item.data,
                         created_by=item.created_by,
@@ -3981,23 +3979,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         created_at: int,
         updated_at: int,
     ) -> Conversation:
-        """
-        Overwrite a conversation's created/updated times.
-
-        See :meth:`ConversationStore.set_conversation_timestamps` for
-        the full contract (session import stamps the source session's
-        activity window here).
-
-        :param conversation_id: Conversation to update, e.g.
-            ``"conv_abc123"``.
-        :param created_at: Unix epoch seconds for the first source
-            activity, e.g. ``1781514000``.
-        :param updated_at: Unix epoch seconds for the last source
-            activity, e.g. ``1784635800``.
-        :returns: The updated :class:`Conversation`.
-        :raises ConversationNotFoundError: If no conversation row
-            exists for ``conversation_id``.
-        """
+        """Set source activity times; see the store interface for the contract."""
 
         def update_ap(ap_sess: Session) -> tuple[SqlConversation, dict[str, str]]:
             ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))

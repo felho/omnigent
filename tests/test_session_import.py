@@ -428,7 +428,6 @@ def test_load_claude_session_preserves_record_timestamps(tmp_path: Path) -> None
             "message": {"role": "assistant", "content": [{"type": "text", "text": "Done."}]},
         },
         {
-            # A record with no timestamp falls back to the import time later.
             "type": "user",
             "uuid": "user-2",
             "message": {"role": "user", "content": "thanks"},

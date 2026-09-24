@@ -240,7 +240,6 @@ async def test_import_preserves_source_timestamps(
 ) -> None:
     """Imported rows keep the source record times, not the import run time."""
     _seed_claude_agent(db_uri)
-    # A historical source window, far before any test run's wall clock.
     first_at, last_at = 1_681_514_000, 1_681_517_600
     payload = {
         "source": "claude",
@@ -274,8 +273,6 @@ async def test_import_preserves_source_timestamps(
     session_id = created.json()["session_id"]
     conversation = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conversation is not None
-    # The session's activity window is the source's, so imported history
-    # sorts by when the work happened rather than when it was imported.
     assert conversation.created_at == first_at
     assert conversation.updated_at == last_at
     items = await client.get(f"/v1/sessions/{session_id}/items")

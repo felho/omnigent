@@ -120,14 +120,12 @@ def test_import_command_sends_source_record_times(tmp_path: Path) -> None:
         result = CliRunner().invoke(
             cli,
             ["import", "--harness", "claude", "--session", session_id],
-            # Clear CLAUDE_CONFIG_DIR so an ambient value can't redirect the
-            # loader away from this test's transcript under HOME.
+            # Avoid loading an ambient Claude configuration.
             env={"HOME": str(tmp_path), "CLAUDE_CONFIG_DIR": None},
         )
 
     assert result.exit_code == 0, result.output
     payload = json.loads(route.calls.last.request.content)
-    # 2026-06-15T09:00:00Z; the bug dropped this and the server stamped now().
     assert payload["items"][0]["created_at"] == 1781514000
 
 

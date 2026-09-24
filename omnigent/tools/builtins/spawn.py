@@ -18,6 +18,7 @@ from omnigent.entities import (
 )
 from omnigent.runtime import pending_elicitations
 from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
+from omnigent.runtime.session_status import resolve_child_session_status
 from omnigent.spec import AgentSpec
 from omnigent.stores import ConversationStore
 from omnigent.tools.base import Tool, ToolContext
@@ -654,11 +655,9 @@ class SysSessionListTool(Tool):
                     "agent": sa_agent,
                     "title": sa_title,
                     "conversation_id": child.id,
-                    # The durable relay-persisted turn status (None when
-                    # never reported) — lets the caller tell a finished or
-                    # interrupted child from one still working, matching
-                    # the runner (REST) path's per-child ``status``.
-                    "status": child.live_status,
+                    "status": resolve_child_session_status(
+                        child.id, child.live_status, child.labels
+                    ),
                 }
             )
         # ``sessions`` (the global, permission-bounded view) is empty on

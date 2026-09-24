@@ -61,6 +61,7 @@ import httpx
 import pytest
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
+from omnigent.server.routes.sessions import RUNNER_DISCONNECT_GRACE_S
 from tests._helpers.compat import apply_runner_env, apply_server_env
 from tests.e2e.conftest import (
     configure_mock_llm,
@@ -75,11 +76,8 @@ _STATUS_DONE = "STATUS_CHECKED_STALE_STATUS_5823"
 _CHILD_COMPLETION = "RESEARCH_COMPLETE_STALE_STATUS_5823"
 _STATUS_CALL_ID = "call_status_5823"
 
-# Server-side reconnect grace (RUNNER_DISCONNECT_GRACE_S = 10.0). After the
-# replacement runner is online, wait past it (plus margin) so the skipped
-# offline-marking timer has provably fired and any reconnect-time
-# reconciliation a fixed build performs has had time to settle.
-_SETTLE_AFTER_RECONNECT_S = 15.0
+# Wait past the server's disconnect grace after the replacement is online.
+_SETTLE_AFTER_RECONNECT_S = RUNNER_DISCONNECT_GRACE_S + 5.0
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HEALTH_TIMEOUT_S = 90.0
@@ -686,8 +684,19 @@ def test_stopped_subagent_not_reported_running_after_runner_restart(
     # replacement reconnects under the same runner id, inside the server's
     # disconnect grace. The child's in-flight turn is gone for good — its
     # sole scripted completion is released into the dead process below.
+    interrupted_at = time.monotonic()
     stack.kill_runner()
+    _poll_until(
+        lambda: not stack.runner_online(),
+        timeout=5,
+        what="the old runner tunnel to go offline",
+    )
     stack.spawn_replacement_runner()
+    reconnect_seconds = time.monotonic() - interrupted_at
+    assert reconnect_seconds < RUNNER_DISCONNECT_GRACE_S, (
+        f"Replacement connected after {reconnect_seconds:.1f}s, outside the "
+        f"{RUNNER_DISCONNECT_GRACE_S:.1f}s disconnect grace"
+    )
     _release_gate(mock_llm_server_url)
 
     # Let the disconnect grace elapse and any reconnect-time reconciliation
@@ -697,6 +706,7 @@ def test_stopped_subagent_not_reported_running_after_runner_restart(
     # Ground truth: the child never completed (no completion marker in its
     # transcript) and never will — its turn died with the old runner.
     child_completed = _CHILD_COMPLETION in _session_blob(client, child_id)
+    assert not child_completed, "Precondition: the killed runner's child turn must not complete"
 
     # The user asks the supervisor to check on the sub-agent; the
     # supervisor inspects via sys_session_list.

@@ -131,8 +131,7 @@ def test_accepted_background_message_is_not_retried_after_response_loss(
     _wait_for(page, lambda: len(request_failures) == 1, timeout_s=15.0)
     _wait_for(page, lambda: _session_is_idle(base_url, session_id), timeout_s=60.0)
 
-    # Wait past the old retry cooldown, then return to force the foreground
-    # queue flush that used to send the accepted message a second time.
+    # Revisit after the former retry cooldown.
     page.wait_for_timeout(5_500)
     source_link = page.locator(f'a[href="/c/{session_id}"]')
     expect(source_link).to_be_visible(timeout=30_000)

@@ -262,9 +262,7 @@ export function QueuedMessagesStrip({
 
   if (messages.length === 0) return null;
 
-  // An uncertain row is an ordering barrier. Hide every drag handle until the
-  // user retries, edits, or removes it so the UI does not advertise an action
-  // that the store must reject to keep later messages behind it.
+  // An uncertain row blocks reordering until the user resolves it.
   const reorderable =
     onReorder !== undefined && !messages.some((message) => message.deliveryState === "uncertain");
   const uncertainIndex = messages.findIndex((message) => message.deliveryState === "uncertain");

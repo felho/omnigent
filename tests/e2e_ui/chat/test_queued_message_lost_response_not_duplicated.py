@@ -1,26 +1,4 @@
-"""E2E: a queued user message whose accepted POST loses its response must not duplicate.
-
-The browser POSTs a
-queued user message, the server accepts it (202 — the message is persisted
-and a turn is dispatched), but the response never reaches the browser
-(flaky network / proxy drop). The client cannot tell the send succeeded,
-treats it as failed, and re-sends the same message — so the server persists
-a second identical user message and runs a second turn. The user sees
-their message twice in the transcript.
-
-The test drives the real SPA journey:
-
-    send a message while the agent is busy -> it parks in the queue strip ->
-    switch to another session -> the held turn finishes and the queued POST
-    fires; its response is lost in flight (injected fault) -> switch back ->
-    the message must appear exactly once.
-
-On the buggy build the message is persisted twice (once per POST attempt)
-and renders as two identical user bubbles, so the final assertions fail.
-The fault injection (aborting the response of the first *accepted* POST)
-models the ambiguous-delivery trigger: the server committed the message,
-the browser cannot know that.
-"""
+"""An accepted queued POST with a lost response must not duplicate its message."""
 
 from __future__ import annotations
 
@@ -116,8 +94,6 @@ def test_lost_post_response_does_not_duplicate_user_message(
     setup_text = f"hold-the-turn-open-{run_tag}"
     sentinel = f"queued-once-{run_tag} deliver exactly once"
 
-    # The setup turn parks on the mock LLM's gate so the session stays busy
-    # for as long as the test needs (content-routed by the setup text).
     configure_mock_llm(
         mock_url,
         [{"block": True, "text": "setup turn released"}],
@@ -134,9 +110,7 @@ def test_lost_post_response_does_not_duplicate_user_message(
         upstream = route.fetch()
         post_attempt_statuses.append(upstream.status)
         if len(post_attempt_statuses) == 1:
-            # The server has already accepted and persisted this message.
-            # Hide that response so the client's delivery result is
-            # ambiguous — the real-world lost-response fault.
+            # Hide an accepted response to model ambiguous delivery.
             route.abort("failed")
         else:
             route.fulfill(response=upstream)
@@ -147,37 +121,28 @@ def test_lost_post_response_does_not_duplicate_user_message(
     composer = page.get_by_label(_COMPOSER_LABEL)
     expect(composer).to_be_visible(timeout=30_000)
 
-    # 1. Occupy the agent: this turn blocks on the mock LLM's gate.
     composer.fill(setup_text)
     composer.press("Enter")
     _wait_for(page, lambda: _gate_is_pending(mock_url), timeout_s=60.0)
 
-    # 2. Send the message under test while the agent is busy — it queues.
     composer.fill(sentinel)
     composer.press("Enter")
     expect(page.get_by_test_id("composer-queued-strip")).to_contain_text(sentinel)
 
-    # 3. Switch to the other session; the queue drains in the background.
     page.locator(f'a[href="/c/{other_session_id}"]').click()
     expect(page).to_have_url(f"{base_url}/c/{other_session_id}", timeout=30_000)
 
-    # 4. Let the held turn finish. The background flush POSTs the queued
-    #    message; the injected fault swallows the accepted response.
     _release_gate(mock_url)
     _wait_for(page, lambda: len(post_attempt_statuses) >= 1, timeout_s=90.0)
     _wait_for(page, lambda: _session_is_idle(base_url, session_id), timeout_s=60.0)
 
-    # 5. Wait past the client's retry cooldown, then return to the
-    #    conversation — the journey step that lets the client re-send.
     page.wait_for_timeout(6_000)
     source_link = page.locator(f'a[href="/c/{session_id}"]')
     expect(source_link).to_be_visible(timeout=30_000)
     source_link.click()
     expect(page).to_have_url(f"{base_url}/c/{session_id}", timeout=30_000)
 
-    # Give a buggy build ample time to fire its duplicate POST and persist
-    # it; a fixed build simply idles through this window (the wait times out
-    # without ever seeing a second copy — the correct behaviour).
+    # Allow an erroneous retry time to appear.
     with contextlib.suppress(AssertionError):
         _wait_for(
             page,

@@ -161,16 +161,12 @@ export interface SendOptions {
    */
   onConversationCreated?: (conversationId: string) => void;
   /**
-   * Original client queue entry for queue-originated sends. If the event POST
-   * rejects after starting, `send` restores this entry as delivery-uncertain
-   * instead of turning it into a normal draft that could be sent again without
-   * warning.
+   * Retained so a rejected queue send can reappear without becoming a draft.
    */
   queueEntry?: QueuedMessage;
   /**
-   * Stable id to reuse for this send instead of generating a fresh one.
-   * Set by ChatPage when retrying a `failedSendDraft` so the server-side
-   * dedup recognises the retry and does not re-dispatch to the runner.
+   * Reuse this logical message's ID on retry. Native-terminal transcript
+   * deduplication uses it; SDK dispatch is not covered by that guarantee.
    */
   stableId?: string;
   /**
@@ -538,22 +534,12 @@ export interface PendingUserMessage {
   posted?: boolean;
 }
 
-/**
- * A message the user submitted while the agent was busy. Ordinary entries have
- * not been posted yet and flush FIFO when the agent goes idle. If an event POST
- * fails ambiguously, the same entry stays in the strip as delivery-uncertain
- * and blocks automatic sends for that conversation until the user resolves it.
- *
- * In-memory only: a hard reload clears the queue, so `files` can be held
- * directly (no serialization concern).
- */
+/** In-memory draft awaiting a turn; uncertain delivery blocks automatic sends. */
 export interface QueuedMessage {
   /** Client-only id, e.g. `q_1`. */
   queueId: string;
   /**
-   * Set after an event POST fails without proving whether the server accepted
-   * it. Omitted for ordinary queued messages. Uncertain messages stay visible
-   * but never retry automatically.
+   * The event POST may have been accepted; retry requires a user action.
    */
   deliveryState?: "uncertain";
   /** Fully-assembled message text (mentions/quotes already applied). */
@@ -570,11 +556,8 @@ export interface QueuedMessage {
    */
   agentId?: string;
   /**
-   * Stable 32-char hex id for this logical message submit. Generated once at
-   * enqueue time and kept across retries so the server-side append is
-   * idempotent — a re-post of the same message after a network failure does
-   * not insert a duplicate conversation item. Optional for backward
-   * compatibility with serialized queue state that predates this field.
+   * Stable 32-char hex ID kept across retries for native-terminal transcript
+   * deduplication. SDK dispatch still needs uncertain-delivery protection.
    */
   stableId?: string;
   /** A failed send stays queued until the user explicitly retries or edits it. */
@@ -1557,10 +1540,7 @@ function enterSendChain(conversationId: string | null): {
 let flashTimer: ReturnType<typeof setTimeout> | null = null;
 const workspaceInvalidationTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-// Background-flush throttle, kept OUT of store state so it can't re-trigger the
-// queue effect. A conversation currently sending (inFlight) or retrying work
-// that failed before the event POST (cooldown) is skipped. Once an event POST
-// starts, failures become delivery-uncertain and never retry automatically.
+// In-flight and cooldown gates stay outside store state to avoid flush loops.
 const BACKGROUND_FLUSH_COOLDOWN_MS = 5_000;
 const QUEUED_EVENT_POST_TIMEOUT_MS = 180_000;
 const queuedFlushInFlight = new Map<string, Set<string>>();
@@ -1611,11 +1591,7 @@ function releaseQueuedSend(conversationId: string, queueId: string): void {
   if (inFlight?.size === 0) queuedFlushInFlight.delete(conversationId);
 }
 
-/**
- * Bound queue-owned work so a dead connection cannot hide a removed head
- * forever. Callers decide whether timeout is pre-POST and safe to retry, or
- * post-start and therefore delivery-uncertain.
- */
+/** Bound queue work; a timed-out event POST remains delivery-uncertain. */
 async function withQueuedWorkTimeout<T>(work: Promise<T>, onTimeout?: () => void): Promise<T> {
   let timeout: ReturnType<typeof setTimeout> | null = null;
   const timedOut = new Promise<never>((_resolve, reject) => {
@@ -1975,9 +1951,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Reorder only within this conversation's messages, in their current
       // relative order, then drop `moved` before its target (or at the end).
       const own = s.queuedMessages.filter((m) => m.conversationId === conversationId);
-      // An uncertain entry is a hard ordering barrier. Moving it or a successor
-      // around it could let a later message auto-flush before the user decides
-      // whether the earlier one was delivered.
+      // Preserve the position of an uncertain delivery and its successors.
       if (own.some((message) => message.deliveryState === "uncertain")) return {};
       const without = own.filter((m) => m.queueId !== queueId);
       const at =
@@ -2138,9 +2112,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const now = Date.now();
     for (const conversationId of candidateIds) {
       if (statusById.get(conversationId) !== "idle") continue;
-      // Skip a conversation mid-send or retrying work that failed before its
-      // event POST. An uncertain head below blocks its successors until the
-      // user edits, removes, or explicitly retries it.
+      // An in-flight or failed head blocks this conversation's queue.
       if (queuedFlushInFlight.has(conversationId)) continue;
       const cooldownUntil = backgroundFlushCooldownUntil.get(conversationId);
       if (cooldownUntil !== undefined && cooldownUntil > now) continue;
@@ -2387,11 +2359,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     try {
       await waitForPrior();
       if (initialDraft && !initialSendPending()) return;
-      // A direct send can enter this chain while a queue-owned POST has removed
-      // its head from the visible queue. Recheck after the prior slot settles:
-      // if that head came back uncertain, or another queued message is already
-      // waiting, this later message must join the queue instead of overtaking
-      // the ordering barrier.
+      // A removed queue head may return uncertain; recheck after the chain wait.
       if (
         opts?.queueEntry === undefined &&
         !opensSideChat &&

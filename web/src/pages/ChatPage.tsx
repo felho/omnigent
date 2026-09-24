@@ -2948,11 +2948,7 @@ function ComposerImpl(
       isTempConvId(conversationId) ||
       hasPendingInitialMessage);
 
-  // Keep one draft consumed until React commits its changed/cleared state.
-  // A microtask is too short here: browsers can run it between two delivered
-  // form events, before the controlled textarea has committed its empty value.
-  // Once any draft part changes, a new submit is allowed—even with identical
-  // text—so an intentional second entry remains distinct.
+  // Re-arm submission only when the draft actually changes.
   useEffect(() => {
     submitGuardRef.current = false;
   }, [fullText, files, mentionedItems]);

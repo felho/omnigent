@@ -212,7 +212,7 @@ def named_provider_server(
         server_executable(),
         "-c",
         "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
-        "from omnigent.cli import main; main()",
+        + "from omnigent.cli import main; main()",
         "server",
         "--host",
         "127.0.0.1",

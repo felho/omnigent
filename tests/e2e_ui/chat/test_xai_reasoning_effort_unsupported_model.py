@@ -53,8 +53,7 @@ _TURN_SETTLE_TIMEOUT_MS = 120_000
 
 # ``use_responses: false`` pins the chat-completions wire, matching what a
 # configured xAI provider uses (xAI serves no OpenAI /responses endpoint).
-# No executor.auth: the harness falls back to the ambient OPENAI_BASE_URL,
-# which the live_server runner points at the mock LLM.
+# Pin the mock endpoint so a configured default provider cannot reroute the turn.
 _AGENT_YAML = """\
 name: {name}
 prompt: You are a helpful assistant. Answer briefly.
@@ -63,12 +62,16 @@ executor:
   model: xai/grok-4
   harness: openai-agents
   use_responses: false
+  auth:
+    type: api_key
+    api_key: mock-key
+    base_url: {mock_base_url}
 """
 
 
-def _agent_bundle(name: str) -> bytes:
+def _agent_bundle(name: str, mock_base_url: str) -> bytes:
     """Gzip-tar the inline agent YAML for multipart upload."""
-    yaml_text = _AGENT_YAML.format(name=name)
+    yaml_text = _AGENT_YAML.format(name=name, mock_base_url=mock_base_url)
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         data = yaml_text.encode()
@@ -79,7 +82,9 @@ def _agent_bundle(name: str) -> bytes:
 
 
 @pytest.fixture
-def grok_reasoning_session(live_server: str) -> Iterator[tuple[str, str]]:
+def grok_reasoning_session(
+    live_server: str, mock_llm_server_url: str
+) -> Iterator[tuple[str, str]]:
     """Create a reasoning-enabled xai/grok-4 session bound to the shared runner.
 
     :param live_server: Spawned server base URL.
@@ -89,7 +94,13 @@ def grok_reasoning_session(live_server: str) -> Iterator[tuple[str, str]]:
     create_resp = httpx.post(
         f"{live_server}/v1/sessions",
         data={"metadata": json.dumps({"reasoning_effort": "medium"})},
-        files={"bundle": ("agent.tar.gz", _agent_bundle(name), "application/gzip")},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _agent_bundle(name, f"{mock_llm_server_url}/v1"),
+                "application/gzip",
+            )
+        },
         timeout=30.0,
     )
     if create_resp.status_code >= 400:

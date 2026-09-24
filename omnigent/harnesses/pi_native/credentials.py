@@ -26,16 +26,19 @@ import re
 import subprocess
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypeAlias, TypedDict, TypeGuard
 from urllib.parse import urlparse
 
+from omnigent._platform import default_shell_argv
 from omnigent.databricks_ai_gateway import (
     DATABRICKS_AI_GATEWAY_LABEL,
     DATABRICKS_TRUSTED_HOST_SUFFIXES,
     is_databricks_ai_gateway_url,
 )
+from omnigent.inner._proc import kill_tree, spawn_kwargs
 from omnigent.models import model_catalog
 from omnigent.models.databricks_model_discovery import preferred_served_claude_model
 from omnigent.models.model_metadata import ModelWireAPI
@@ -786,8 +789,10 @@ def _run_auth_command(auth_command: str, *, timeout: float = 15.0) -> str | None
     one-shot model-catalog API call. Returns ``None`` on any failure so
     callers can fall back gracefully.
 
-    Runs through the shell, as Pi runs a ``!command`` apiKey, so pipelines,
-    quoting and ``~`` behave here exactly as they do at request time.
+    Runs through the host's default shell, as Pi runs a ``!command`` apiKey,
+    so pipelines, quoting and ``~`` behave here exactly as they do at request
+    time. The shell gets its own process group, so a stalled helper is torn
+    down with it on timeout instead of outliving this call.
 
     :param auth_command: Shell command string, e.g.
         ``"jq -r .access_token ~/token.json"``.
@@ -796,18 +801,25 @@ def _run_auth_command(auth_command: str, *, timeout: float = 15.0) -> str | None
         fails, times out, or produces empty output.
     """
     try:
-        result = subprocess.run(
-            auth_command,
-            shell=True,
-            capture_output=True,
+        process = subprocess.Popen(
+            default_shell_argv(auth_command),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             text=True,
-            timeout=timeout,
+            **spawn_kwargs(),
         )
-        if result.returncode != 0:
-            return None
-        return result.stdout.strip() or None
-    except Exception:  # noqa: BLE001 — any subprocess failure should just return None
+    except OSError:
         return None
+    try:
+        stdout, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_tree(process)
+        with suppress(Exception):
+            process.communicate()
+        return None
+    if process.returncode != 0:
+        return None
+    return stdout.strip() or None
 
 
 # Entries at or below this need no probe: Pi's own default ceiling is lower, so

@@ -482,6 +482,27 @@ def test_run_auth_command_uses_the_shell() -> None:
     assert creds._run_auth_command("exit 3") is None
 
 
+def test_run_auth_command_timeout_kills_the_helper(tmp_path: Path) -> None:
+    """A helper that stalls past the timeout does not outlive the call."""
+    import shlex
+    import sys
+    import time
+
+    from omnigent.inner._proc import process_alive
+
+    pid_file = tmp_path / "helper.pid"
+    helper = "import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)"
+    command = shlex.join([sys.executable, "-c", helper, str(pid_file)])
+
+    assert creds._run_auth_command(command, timeout=1.0) is None
+
+    pid = int(pid_file.read_text())
+    deadline = time.monotonic() + 5
+    while process_alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not process_alive(pid)
+
+
 def test_inline_databricks_gateway_listed_default_follows_the_workspace_surface(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

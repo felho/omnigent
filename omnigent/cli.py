@@ -12575,47 +12575,68 @@ def login(server_url: str) -> None:
 
 _CLI_LOGIN_TIMEOUT_SECONDS = 300  # 5 minutes
 
-# The proxy env vars httpx consults for each target scheme: only the
-# matching scheme's proxy (or the scheme-agnostic ALL_PROXY) can route a
-# request, so a hint must never blame e.g. HTTPS_PROXY for an http:// target.
-_PROXY_ENV_VARS_BY_SCHEME = {
-    "http": ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"),
-    "https": ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"),
-}
+
+def _env_proxy_would_route(base_url: str) -> bool:
+    """Whether httpx with ``trust_env=True`` would proxy a *base_url* request.
+
+    Mirrors httpx's ``get_environment_proxies()``: the proxy map comes from
+    :func:`urllib.request.getproxies` (so lowercase variables take precedence
+    and an empty lowercase value disables its uppercase twin, exactly as
+    httpx sees it), only the target scheme's proxy (or ``all``) counts, and
+    ``NO_PROXY`` entries follow the curl-style semantics httpx implements:
+    ``*`` disables all proxies, a leading-dot entry (``.example.com``)
+    covers subdomains but not the apex, a bare hostname covers both, and a
+    ``host:port`` entry only covers that explicit port.
+
+    :param base_url: Server base URL, e.g. ``"http://omni.internal:6767"``.
+    :returns: True when an env-configured proxy would carry the request.
+    """
+    from urllib.parse import urlsplit
+    from urllib.request import getproxies
+
+    proxy_info = getproxies()
+    parts = urlsplit(base_url)
+    scheme = (parts.scheme or "http").lower()
+    if not (proxy_info.get(scheme) or proxy_info.get("all")):
+        return False
+    host = (parts.hostname or "").lower()
+    port = parts.port
+    for raw_entry in proxy_info.get("no", "").split(","):
+        entry = raw_entry.strip().lower()
+        if entry == "*":
+            return False
+        if not entry:
+            continue
+        if "://" in entry:
+            entry = entry.split("://", 1)[1]
+        entry_host, colon, entry_port = entry.rpartition(":")
+        if colon and entry_port.isdigit() and ":" not in entry_host:
+            if port != int(entry_port):
+                continue
+        else:
+            entry_host = entry
+        entry_host = entry_host.strip("[]")
+        if host == entry_host:
+            return False
+        if entry_host.startswith("."):
+            # ``.example.com`` covers subdomains only (the apex stays proxied).
+            if host.endswith(entry_host):
+                return False
+        elif host.endswith(f".{entry_host}"):
+            # ``example.com`` covers the apex (above) and subdomains.
+            return False
+    return True
 
 
 def _proxy_interference_hint(base_url: str) -> str:
     """A NO_PROXY hint when an env-configured proxy could answer for *base_url*.
 
-    Tracks httpx's actual routing: only proxy variables that apply to the
-    target's scheme count, and ``NO_PROXY`` entries — bare hostnames or
-    port-qualified ``host:port`` forms — that exclude the target suppress
-    the hint.
-
     :param base_url: Server base URL, e.g. ``"http://omni.internal:6767"``.
-    :returns: A newline-prefixed hint, or ``""`` when no env proxy applies.
+    :returns: A newline-prefixed hint, or ``""`` when no env proxy applies —
+        per :func:`_env_proxy_would_route`, so the hint never blames a proxy
+        httpx would not actually have used.
     """
-    if not _trust_env_for(base_url):
-        return ""
-    from urllib.parse import urlsplit
-
-    parts = urlsplit(base_url)
-    scheme = (parts.scheme or "http").lower()
-    relevant_vars = _PROXY_ENV_VARS_BY_SCHEME.get(scheme, ("ALL_PROXY", "all_proxy"))
-    if not any(os.environ.get(var) for var in relevant_vars):
-        return ""
-    # Runtime-only stdlib helper (present in CPython, absent from typeshed);
-    # it implements the NO_PROXY list matching we need here.
-    from urllib.request import proxy_bypass_environment  # type: ignore[missing-module-attribute]
-
-    # NO_PROXY may already exclude this host (as a bare hostname or a
-    # port-qualified host:port entry, both of which httpx honors), in which
-    # case the answer really came from the server and blaming a proxy would
-    # misdirect. Pass host:port only when the URL carries an explicit port,
-    # mirroring httpx's port matching.
-    host = parts.hostname
-    bypass_target = f"{host}:{parts.port}" if host and parts.port else host
-    if bypass_target and proxy_bypass_environment(bypass_target):
+    if not _trust_env_for(base_url) or not _env_proxy_would_route(base_url):
         return ""
     return (
         "\nA proxy from your environment (HTTP_PROXY/HTTPS_PROXY) may be "

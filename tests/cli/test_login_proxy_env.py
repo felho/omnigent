@@ -299,6 +299,51 @@ def test_login_probe_hint_honors_port_qualified_no_proxy(
     assert "NO_PROXY" not in result.output
 
 
+def test_login_probe_hint_honors_empty_lowercase_proxy_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty lowercase ``http_proxy`` disables its uppercase twin, so no hint.
+
+    ``urllib.request.getproxies`` (which httpx consults) lets lowercase
+    variables take precedence: an empty ``http_proxy`` removes the
+    ``HTTP_PROXY`` entry, so httpx sends the request directly and the
+    failure must not blame a proxy.
+    """
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: _response(500))
+    for var in _PROXY_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.corp.example:3128")
+    monkeypatch.setenv("http_proxy", "")
+
+    result = CliRunner().invoke(cli_group, ["login", "http://omni.internal:8000"])
+
+    assert result.exit_code != 0
+    assert "Unexpected response from http://omni.internal:8000/v1/me: HTTP 500" in result.output
+    assert "NO_PROXY" not in result.output
+
+
+def test_login_probe_hint_shown_when_leading_dot_no_proxy_misses_apex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``NO_PROXY=.omni.internal`` covers subdomains only — the apex stays proxied.
+
+    httpx's curl-style semantics: a leading-dot entry does not bypass the
+    apex domain itself, so a request to it still goes through the proxy and
+    the hint must appear.
+    """
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: _response(500))
+    for var in _PROXY_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.corp.example:3128")
+    monkeypatch.setenv("NO_PROXY", ".omni.internal")
+
+    result = CliRunner().invoke(cli_group, ["login", "http://omni.internal:8000"])
+
+    assert result.exit_code != 0
+    assert "Unexpected response from http://omni.internal:8000/v1/me: HTTP 500" in result.output
+    assert "NO_PROXY" in result.output
+
+
 def test_login_unrecognized_401_falls_back_to_oidc_ticket_flow(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

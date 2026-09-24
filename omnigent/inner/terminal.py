@@ -76,10 +76,6 @@ _TMUX_START_ON_ATTACH_CHANNEL = "omnigent-start-on-attach"
 # can reap tmux servers whose owner died without graceful shutdown
 # (``reap_orphaned_terminals``).
 _TERMINAL_DIR_PREFIX = "omnigent-terminal-"
-_OWNER_PID_FILENAME = owner_claim.OWNER_PID_FILENAME
-# Sibling of the owner-pid marker carrying the owner's kernel start
-# identity, so the dead-owner gate survives pid recycling.
-_OWNER_IDENTITY_FILENAME = "owner.ident"
 # Bound for each ``tmux kill-server`` in the orphan sweep; a wedged
 # tmux must not stall runner startup.
 _REAP_KILL_TIMEOUT_S = 10.0
@@ -812,25 +808,9 @@ def _terminals_tmp_root() -> Path:
 def terminal_owner_is_dead(instance_dir: Path) -> bool | None:
     """Whether the instance dir's recorded owner is provably dead."""
     claim = owner_claim.read_owner_claim(instance_dir)
-    if claim is not None:
-        return owner_claim.owner_is_gone(claim, process_alive=_process_alive)
-    try:
-        pid = int((instance_dir / _OWNER_PID_FILENAME).read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
+    if claim is None:
         return None
-    identity: str | None
-    try:
-        identity = (instance_dir / _OWNER_IDENTITY_FILENAME).read_text(encoding="utf-8").strip()
-    except OSError:
-        identity = None
-    if identity:
-        state = _proc.process_identity_state(pid, identity)
-        if state == "match":
-            return False
-        if state == "gone":
-            return True
-        return None
-    return not _process_alive(pid)
+    return owner_claim.owner_is_gone(claim, process_alive=_process_alive)
 
 
 def reap_orphaned_terminals() -> int:
@@ -858,18 +838,9 @@ def reap_orphaned_terminals() -> int:
         return 0
     reaped = 0
     for entry in entries:
-        if terminal_owner_is_dead(entry) is not True:
-            continue
         claim = owner_claim.read_owner_claim(entry)
-        if claim is not None:
-            owner_pid = claim.pid
-        else:
-            try:
-                owner_pid = int(
-                    (entry / _OWNER_PID_FILENAME).read_text(encoding="utf-8").splitlines()[0]
-                )
-            except (OSError, ValueError, IndexError):
-                continue
+        if claim is None or not owner_claim.owner_is_gone(claim, process_alive=_process_alive):
+            continue
         socket_path = entry / "tmux.sock"
         try:
             had_socket = socket_path.exists()
@@ -877,15 +848,40 @@ def reap_orphaned_terminals() -> int:
             # Foreign-owned dir on a shared host — not ours to reap.
             continue
         if had_socket:
-            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-                subprocess.run(
+            try:
+                result = subprocess.run(
                     ["tmux", "-S", str(socket_path), "kill-server"],
                     check=False,
                     capture_output=True,
                     timeout=_REAP_KILL_TIMEOUT_S,
                 )
+            except (OSError, subprocess.TimeoutExpired):
+                logger.warning(
+                    "Could not reap terminal %s; preserving its socket for retry", entry
+                )
+                continue
+            if result.returncode != 0:
+                detail = getattr(result, "stderr", b"").decode(errors="replace").strip()
+                try:
+                    unresolved_control_path = (
+                        socket_path.exists()
+                        and not socket_path.is_socket()
+                        and not _tmux_reports_target_gone(detail)
+                    )
+                except OSError:
+                    continue
+                if unresolved_control_path:
+                    logger.warning(
+                        "tmux orphan cleanup failed (rc=%s) for %s; preserving its "
+                        "socket for retry",
+                        result.returncode,
+                        entry,
+                    )
+                    continue
             if _tmux_server_alive(socket_path):
-                # Keep the socket path until the tmux server is confirmed gone.
+                logger.warning(
+                    "tmux server still listens on %s; preserving its socket", socket_path
+                )
                 continue
         shutil.rmtree(entry, ignore_errors=True)
         # Record what the sweep destroyed. The socket path is the join key
@@ -899,7 +895,7 @@ def reap_orphaned_terminals() -> int:
             entry.name,
             socket_path,
             "" if had_socket else " was already gone",
-            owner_pid,
+            claim.pid,
         )
         reaped += 1
     return reaped
@@ -912,13 +908,9 @@ def _tmux_server_alive(socket_path: Path) -> bool:
         probe.settimeout(2.0)
         probe.connect(str(socket_path))
     except TimeoutError:
-        # A wedged-but-bound server can time out the connect; that is
-        # still a server, not confirmed absence.
         return True
     except OSError as exc:
         if exc.errno is None:
-            # Python refuses over-long AF_UNIX paths before the syscall;
-            # no server could ever have bound such a path either.
             return False
         return exc.errno not in (
             errno.ENOENT,

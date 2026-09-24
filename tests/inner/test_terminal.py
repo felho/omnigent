@@ -3007,18 +3007,20 @@ def _dead_pid() -> int:
     return child.pid
 
 
-def test_terminal_owner_gate_is_identity_anchored(tmp_path: Path) -> None:
-    """A recycled owner pid reads as dead once the identity sibling exists."""
+def test_terminal_owner_gate_requires_qualified_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A legacy PID alone cannot prove ownership across process domains."""
     d = tmp_path / "omnigent-terminal-x"
     d.mkdir()
     (d / "owner.pid").write_text(str(__import__("os").getpid()), encoding="utf-8")
-    assert terminal_mod.terminal_owner_is_dead(d) is False
+    assert terminal_mod.terminal_owner_is_dead(d) is None
     (d / "owner.ident").write_text("not-our-identity", encoding="utf-8")
-    assert terminal_mod.terminal_owner_is_dead(d) is True
-    identity = terminal_mod._proc.process_start_identity(__import__("os").getpid())
-    assert identity is not None
-    (d / "owner.ident").write_text(identity, encoding="utf-8")
+    assert terminal_mod.terminal_owner_is_dead(d) is None
+    owner_claim.write_owner_claim(d)
     assert terminal_mod.terminal_owner_is_dead(d) is False
+    monkeypatch.setattr(terminal_mod, "_process_alive", lambda _pid: False)
+    assert terminal_mod.terminal_owner_is_dead(d) is True
     assert terminal_mod.terminal_owner_is_dead(tmp_path / "omnigent-terminal-none") is None
 
 
@@ -3110,17 +3112,19 @@ def test_reap_orphaned_terminals_kills_server_for_dead_owner_socket(
     assert kill_calls == [["tmux", "-S", str(socket_path), "kill-server"]]
 
 
+@pytest.mark.parametrize("kill_returncode", [0, 1])
 def test_reap_orphaned_terminals_keeps_dir_while_server_still_listens(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    kill_returncode: int,
 ) -> None:
     """A dir whose server survives the kill attempt is kept for a retry."""
     import socket as socket_mod
     import tempfile
 
-    def _failing_run(*args: object, **kwargs: object) -> SimpleNamespace:
-        """Model a kill-server that reports failure and kills nothing."""
-        return SimpleNamespace(returncode=1)
+    def _kill_run(*args: object, **kwargs: object) -> SimpleNamespace:
+        """Model a kill-server whose reported status does not stop the listener."""
+        return SimpleNamespace(returncode=kill_returncode)
 
     short_root = Path(tempfile.mkdtemp(prefix="omnigent-t-", dir="/tmp"))
     monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: short_root)
@@ -3128,7 +3132,7 @@ def test_reap_orphaned_terminals_keeps_dir_while_server_still_listens(
     monkeypatch.setattr(
         terminal_mod,
         "subprocess",
-        SimpleNamespace(run=_failing_run, TimeoutExpired=TimeoutError),
+        SimpleNamespace(run=_kill_run, TimeoutExpired=TimeoutError),
     )
     server = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
     try:

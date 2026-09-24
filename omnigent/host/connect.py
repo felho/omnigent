@@ -1460,6 +1460,7 @@ class HostProcess:
             child_pids = self._orphan_child_pids()
         reaped = 0
         tracked = self._tracked_runner_pids()
+        local_server_pids = self._local_server_pids()
         for pid in child_pids:
             if pid in tracked or pid in self._adopted_pins:
                 continue
@@ -1468,7 +1469,12 @@ class HostProcess:
                     continue
             except (psutil.Error, OSError):
                 continue
-            if self._is_subreaper and self._adoption_active and self._defer_dead_leader(pid):
+            if (
+                self._is_subreaper
+                and self._adoption_active
+                and pid not in local_server_pids
+                and self._defer_dead_leader(pid)
+            ):
                 continue
             if self._consume_child_zombie(pid):
                 reaped += 1

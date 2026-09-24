@@ -3256,6 +3256,38 @@ async def test_adopted_sweep_excludes_recorded_local_server(
         child.wait(timeout=10)
 
 
+async def test_local_server_zombie_is_reaped_without_adopted_pin() -> None:
+    """A stopped local server must not wait for the orphan-tree sweep."""
+    from omnigent.host import connect as connect_mod
+
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)"],
+        start_new_session=True,
+    )
+    host = HostProcess(
+        _make_host_process()._identity, "http://localhost:8000", local_server_pid=child.pid
+    )
+    host._is_subreaper = True
+    host._adoption_active = True
+    try:
+        assert host._local_server_pids() == {child.pid}
+        child.kill()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if connect_mod.psutil.Process(child.pid).status() == connect_mod.psutil.STATUS_ZOMBIE:
+                break
+            await asyncio.sleep(0.01)
+        assert connect_mod.psutil.Process(child.pid).status() == connect_mod.psutil.STATUS_ZOMBIE
+        assert host._local_server_pids() == {child.pid}
+        assert host._reap_orphans_targeted([child.pid]) == 1
+        assert child.pid not in host._adopted_pins
+    finally:
+        host._adopted_pins.clear()
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=10)
+
+
 async def test_dead_leader_attribution_uses_registry_and_spawn_records(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3419,6 +3451,7 @@ async def test_sweep_ownerless_trees_once_reaps_real_families(
 
     import omnigent.harnesses.codex_native.process_registry as registry_mod
     import omnigent.inner.terminal as terminal_mod
+    from omnigent.native import owner_claim
     from omnigent.runtime.harnesses.process_manager import (
         _AP_PID_FILE,
         _TMP_PARENT_ENV_VAR,
@@ -3434,10 +3467,17 @@ async def test_sweep_ownerless_trees_once_reaps_real_families(
     probe.wait()
     dead_owner_dir = terminals_root / "omnigent-terminal-deadhost"
     dead_owner_dir.mkdir()
-    (dead_owner_dir / "owner.pid").write_text(str(probe.pid), encoding="utf-8")
+    owner_claim.write_owner_claim(dead_owner_dir)
+    dead_claim_path = dead_owner_dir / "owner.pid"
+    dead_claim_lines = dead_claim_path.read_text(encoding="utf-8").splitlines()
+    dead_claim_lines[0] = str(probe.pid)
+    dead_claim_path.write_text("\n".join(dead_claim_lines) + "\n", encoding="utf-8")
     live_owner_dir = terminals_root / "omnigent-terminal-livehost"
     live_owner_dir.mkdir()
-    (live_owner_dir / "owner.pid").write_text(str(os.getpid()), encoding="utf-8")
+    owner_claim.write_owner_claim(live_owner_dir)
+    legacy_owner_dir = terminals_root / "omnigent-terminal-legacyhost"
+    legacy_owner_dir.mkdir()
+    (legacy_owner_dir / "owner.pid").write_text(str(probe.pid), encoding="utf-8")
 
     # Instance-dir family: dead-AP dir plus a live-AP sibling.
     ap_parent = tmp_path / "ap-parent"
@@ -3474,6 +3514,7 @@ async def test_sweep_ownerless_trees_once_reaps_real_families(
 
         assert not dead_owner_dir.exists()
         assert live_owner_dir.exists()
+        assert legacy_owner_dir.exists()
         assert not dead_ap.exists()
         assert live_ap.exists()
         # The sweep SIGTERMed the ownerless group; the process dies.

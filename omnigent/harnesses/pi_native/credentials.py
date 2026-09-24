@@ -1060,6 +1060,116 @@ def cli_config_pi_provider_capable(entry: ProviderEntry) -> bool:
     return _cli_config_databricks_transport(entry) is not None
 
 
+def _databricks_gateway_pi_provider(
+    *,
+    gateway_base_url: str,
+    model: str | None,
+    auth_command: str | None = None,
+    static_api_key: str | None = None,
+    profile: str | None = None,
+    workspace_url: str | None = None,
+) -> PiProviderConfig:
+    """Build a multi-surface Pi config from a Databricks AI Gateway base URL.
+
+    Shared by the cli-config path (a codex ``config.toml`` gateway table) and
+    the inline key/gateway path (an ``~/.omnigent`` provider whose family
+    ``base_url`` is a Databricks AI Gateway). Both front one workspace origin
+    serving Claude on the Anthropic surface plus GPT / Gemini / OSS on the
+    Responses / MLflow / serving-endpoints surfaces. Enumerating the workspace's
+    Unity Catalog model services lets Pi surface every family the gateway
+    serves, not just the family the entry declares.
+
+    :param gateway_base_url: A gateway URL for the workspace (any surface), e.g.
+        ``".../ai-gateway/codex/v1"`` or ``".../ai-gateway/anthropic"``.
+    :param model: Session model override, or ``None`` for the default.
+    :param auth_command: Bearer-token command; becomes Pi's ``!command`` apiKey
+        (refreshed per request) and mints the token used to list models.
+    :param static_api_key: A resolved literal/env key, used when no
+        ``auth_command`` is configured.
+    :param profile: Databricks profile for a dedicated ``ai-gateway`` subdomain;
+        a workspace-hosted gateway needs none.
+    :param workspace_url: Pre-resolved workspace origin; resolved from
+        *gateway_base_url* when omitted.
+    :returns: The Pi provider config — Anthropic base plus additional
+        OpenAI/Gemini/completions providers for what the workspace serves.
+    """
+    # Prefer a "!command" apiKey (Pi refreshes the gateway token per request);
+    # a static key is sent verbatim. Both go in the Authorization: Bearer header.
+    api_key = f"!{auth_command}" if auth_command else (static_api_key or "")
+    claude_models: list[_PiModelEntry] = []
+    gpt_models: list[_PiModelEntry] = []
+    completions_models: list[_PiModelEntry] = []
+    gemini_models: list[_PiModelEntry] = []
+    parsed_gateway = urlparse(gateway_base_url)
+    gateway_labels = (parsed_gateway.hostname or "").split(".")
+    if workspace_url is None:
+        workspace_url = _databricks_workspace_url_for_gateway(gateway_base_url, profile=profile)
+    if workspace_url is None:
+        _LOGGER.info(
+            "pi-native: could not resolve workspace URL for gateway model listing; "
+            "Pi will show only the selected model"
+        )
+    else:
+        # The auth_command token (or static key) is the credential the gateway
+        # uses; the SDK's minted token may lack serving-endpoints access.
+        list_token = _run_auth_command(auth_command) if auth_command else static_api_key
+        if list_token:
+            try:
+                claude_models, gpt_models, completions_models, gemini_models = (
+                    _fetch_pi_model_lists(workspace_url, list_token)
+                )
+            except Exception:  # noqa: BLE001 — network failure must not break launch
+                _LOGGER.info(
+                    "pi-native: could not fetch workspace model list; showing default model only",
+                    exc_info=True,
+                )
+        else:
+            _LOGGER.info(
+                "pi-native: no gateway token available; Pi will show only the selected model"
+            )
+    # Codex (OpenAI Responses) surface URL. A dedicated ``ai-gateway`` subdomain
+    # carries the codex path on the gateway host; a workspace-hosted gateway
+    # builds it from the workspace hostname.
+    if _DATABRICKS_AI_GATEWAY_LABEL in gateway_labels:
+        codex_gateway_url = gateway_base_url.rstrip("/")
+        if codex_gateway_url.endswith(_DATABRICKS_GATEWAY_CODEX_SUFFIX):
+            codex_gateway_url = codex_gateway_url[: -len(_DATABRICKS_GATEWAY_CODEX_SUFFIX)]
+        codex_gateway_url = f"{codex_gateway_url}{_DATABRICKS_GATEWAY_CODEX_SUFFIX}"
+    else:
+        codex_gateway_url = f"https://{parsed_gateway.hostname}/ai-gateway/codex/v1"
+    workspace_completions_url = workspace_url + "/serving-endpoints" if workspace_url else None
+    workspace_mlflow_url = workspace_url + "/ai-gateway/mlflow/v1" if workspace_url else None
+    additional: dict[str, _PiProviderPayload] = {}
+    if gpt_models:
+        additional[_PI_OPENAI_PROVIDER_ID] = _databricks_openai_provider(
+            api_key, codex_gateway_url, gpt_models
+        )
+    if completions_models and workspace_completions_url:
+        additional[_PI_COMPLETIONS_PROVIDER_ID] = _databricks_openai_provider(
+            api_key, workspace_completions_url, completions_models, api_type="openai-completions"
+        )
+    if gemini_models and workspace_mlflow_url:
+        additional[_PI_MLFLOW_PROVIDER_ID] = _databricks_openai_provider(
+            api_key, workspace_mlflow_url, gemini_models, api_type="openai-completions"
+        )
+    surfaces = {DatabricksPiSurface.RESPONSES: codex_gateway_url}
+    if workspace_completions_url:
+        surfaces[DatabricksPiSurface.COMPLETIONS] = workspace_completions_url
+    if workspace_mlflow_url:
+        surfaces[DatabricksPiSurface.MLFLOW] = workspace_mlflow_url
+    return PiProviderConfig(
+        provider_id=_PI_PROVIDER_ID,
+        base_url=_gateway_anthropic_base_url(gateway_base_url),
+        api="anthropic-messages",
+        model=_select_databricks_claude_model(model, claude_models),
+        api_key=api_key,
+        auth_header=True,
+        extra_models=claude_models,
+        additional_providers=additional,
+        databricks_surfaces=surfaces,
+    )
+
+
 def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiProviderConfig | None:
     """Resolve a Codex ``cli-config`` Databricks-gateway provider into Pi config.
 
@@ -1087,91 +1197,10 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     transport = _cli_config_databricks_transport(entry)
     if transport is None:
         return None
-    api_key = f"!{transport.auth_command}"
-    # The AI Gateway hostname (e.g. ``<id>.ai-gateway.cloud.databricks.com``)
-    # is NOT the workspace hostname — stripping ``ai-gateway.`` produces an
-    # NXDOMAIN. Use resolve_databricks_workspace for the real workspace URL,
-    # but use the auth_command token (same credential the gateway uses) for
-    # the API call. The SDK's minted token may not have serving-endpoints
-    # access on workspaces where access is controlled via the auth command.
-    claude_models: list[_PiModelEntry] = []
-    gpt_models: list[_PiModelEntry] = []
-    completions_models: list[_PiModelEntry] = []
-    gemini_models: list[_PiModelEntry] = []
-    parsed_gateway = urlparse(transport.base_url)
-    gateway_labels = (parsed_gateway.hostname or "").split(".")
-    real_workspace_url = _databricks_workspace_url_for_gateway(transport.base_url)
-    if real_workspace_url is None:
-        _LOGGER.info(
-            "pi-native: cli-config path could not resolve workspace URL "
-            "for model listing; Pi will show only the selected model"
-        )
-    if real_workspace_url and transport.auth_command:
-        token = _run_auth_command(transport.auth_command)
-        if token:
-            try:
-                claude_models, gpt_models, completions_models, gemini_models = (
-                    _fetch_pi_model_lists(real_workspace_url, token)
-                )
-            except Exception:  # noqa: BLE001 — network failure must not break launch
-                _LOGGER.info(
-                    "pi-native: could not fetch workspace model list; showing default model only",
-                    exc_info=True,
-                )
-        else:
-            _LOGGER.info(
-                "pi-native: auth command produced no token; Pi will show only the selected model"
-            )
-    # Derive the AI Gateway codex URL for the openai-responses provider. For
-    # workspace-hosted URLs the transport base is already the codex path;
-    # for dedicated-subdomain URLs we build it from the workspace URL.
-    if _DATABRICKS_AI_GATEWAY_LABEL in gateway_labels:
-        # Dedicated subdomain: transport.base_url is the codex gateway URL.
-        # Strip trailing path suffixes to get the codex base, not /anthropic.
-        codex_gateway_url = transport.base_url.rstrip("/")
-        if codex_gateway_url.endswith(_DATABRICKS_GATEWAY_CODEX_SUFFIX):
-            codex_gateway_url = codex_gateway_url[: -len(_DATABRICKS_GATEWAY_CODEX_SUFFIX)]
-        codex_gateway_url = f"{codex_gateway_url}{_DATABRICKS_GATEWAY_CODEX_SUFFIX}"
-    else:
-        # Workspace-hosted gateway: build from workspace hostname.
-        codex_gateway_url = f"https://{parsed_gateway.hostname}/ai-gateway/codex/v1"
-    workspace_completions_url = (
-        real_workspace_url + "/serving-endpoints" if real_workspace_url else None
-    )
-    workspace_mlflow_url = (
-        real_workspace_url + "/ai-gateway/mlflow/v1" if real_workspace_url else None
-    )
-    additional: dict[str, _PiProviderPayload] = {}
-    if gpt_models:
-        additional[_PI_OPENAI_PROVIDER_ID] = _databricks_openai_provider(
-            api_key, codex_gateway_url, gpt_models
-        )
-    if completions_models and workspace_completions_url:
-        additional[_PI_COMPLETIONS_PROVIDER_ID] = _databricks_openai_provider(
-            api_key, workspace_completions_url, completions_models, api_type="openai-completions"
-        )
-    if gemini_models and workspace_mlflow_url:
-        additional[_PI_MLFLOW_PROVIDER_ID] = _databricks_openai_provider(
-            api_key, workspace_mlflow_url, gemini_models, api_type="openai-completions"
-        )
-    surfaces = {DatabricksPiSurface.RESPONSES: codex_gateway_url}
-    if workspace_completions_url:
-        surfaces[DatabricksPiSurface.COMPLETIONS] = workspace_completions_url
-    if workspace_mlflow_url:
-        surfaces[DatabricksPiSurface.MLFLOW] = workspace_mlflow_url
-    return PiProviderConfig(
-        provider_id=_PI_PROVIDER_ID,
-        base_url=_gateway_anthropic_base_url(transport.base_url),
-        api="anthropic-messages",
-        model=_select_databricks_claude_model(model, claude_models),
-        # Pi resolves a "!command" apiKey at request time, so the gateway
-        # bearer token (the codex auth command prints it) is refreshed per
-        # request — matching codex-native's refresh semantics.
-        api_key=api_key,
-        auth_header=True,
-        extra_models=claude_models,
-        additional_providers=additional,
-        databricks_surfaces=surfaces,
+    return _databricks_gateway_pi_provider(
+        gateway_base_url=transport.base_url,
+        model=model,
+        auth_command=transport.auth_command,
     )
 
 
@@ -1386,6 +1415,31 @@ def _inline_family_pi_provider(
     :returns: The Pi provider config, or ``None`` when no usable family with a
         base URL and credential is configured.
     """
+    # A Databricks AI Gateway fronts one workspace serving Claude, GPT and
+    # Gemini together; the single-family loop below would surface only the
+    # family this entry declares. Enumerate the whole workspace when we can,
+    # like the cli-config and databricks-kind paths.
+    for family_name in _inline_family_order(model):
+        family = entry.family(family_name)
+        if family is None or not family.base_url:
+            continue
+        if not _is_databricks_ai_gateway_url(family.base_url):
+            continue
+        if not (family.auth_command or family.api_key):
+            continue
+        workspace_url = _databricks_workspace_url_for_gateway(
+            family.base_url, profile=entry.profile
+        )
+        if workspace_url is None:
+            continue  # can't enumerate this gateway — fall through to single-family
+        return _databricks_gateway_pi_provider(
+            gateway_base_url=family.base_url,
+            model=model,
+            auth_command=family.auth_command,
+            static_api_key=family.api_key,
+            profile=entry.profile,
+            workspace_url=workspace_url,
+        )
     for family_name in _inline_family_order(model):
         family = entry.family(family_name)
         if family is None or not family.base_url:

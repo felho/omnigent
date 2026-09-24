@@ -155,6 +155,77 @@ def test_key_provider_resolves_to_inline_family() -> None:
     assert provider.model == "claude-sonnet-4-6"
 
 
+def test_inline_databricks_gateway_enumerates_all_families(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An inline gateway on a Databricks AI Gateway surfaces every family.
+
+    ``omnigent setup`` writes a single-family ``openai-gateway`` when the user
+    adds the Databricks AI Gateway as an OpenAI endpoint. Pi must not be capped
+    to that one family: the gateway fronts a workspace serving Claude, GPT and
+    Gemini, so the resolver enumerates the workspace and exposes all of them —
+    Claude on Pi's native Anthropic surface, GPT/Gemini as additional providers
+    — rather than an OpenAI-only config.
+    """
+    canned = (
+        [{"id": "system.ai.claude-opus-5"}],  # claude → anthropic surface
+        [{"id": "system.ai.gpt-5"}],  # gpt → responses surface
+        [],  # completions
+        [{"id": "system.ai.gemini-3-flash"}],  # gemini → mlflow surface
+    )
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", lambda host, token: canned)
+    config = {
+        "providers": {
+            "openai-gateway": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": "https://wkspc.cloud.databricks.com/ai-gateway/codex/v1",
+                    "api_key": "gw-token",
+                    "wire_api": "responses",
+                    "models": {"default": "system.ai.gpt-5"},
+                },
+            }
+        }
+    }
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+
+    assert provider is not None
+    # Claude on the native Anthropic surface — not a single-family OpenAI config.
+    assert provider.api == "anthropic-messages"
+    assert provider.base_url == "https://wkspc.cloud.databricks.com/ai-gateway/anthropic"
+    assert [m["id"] for m in provider.extra_models] == ["system.ai.claude-opus-5"]
+    # GPT and Gemini surface as additional providers (the openai-only bug hid these).
+    assert set(provider.additional_providers) == {"omnigent-openai", "omnigent-mlflow"}
+
+
+def test_inline_non_databricks_gateway_stays_single_family() -> None:
+    """A non-Databricks gateway keeps single-family behavior (no enumeration)."""
+    config = {
+        "providers": {
+            "openrouter": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "api_key": "sk-test",
+                    "wire_api": "responses",
+                    "models": {"default": "openai/gpt-4o"},
+                },
+            }
+        }
+    }
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+
+    assert provider is not None
+    assert provider.api == "openai-responses"
+    assert provider.base_url == "https://openrouter.ai/api/v1"
+    assert provider.model == "openai/gpt-4o"
+    assert not provider.additional_providers
+
+
 def test_managed_picker_prefix_is_not_part_of_provider_model() -> None:
     """A managed picker value resolves its provider-local model id."""
     config = {

@@ -478,8 +478,12 @@ def _databricks_config_override_has_profiles(path: str) -> bool:
         parser = configparser.ConfigParser()
         parser.read(path)
         return bool(parser.sections() or parser.defaults())
-    except Exception:
-        _logger.debug("readiness: databricks config override parse failed", exc_info=True)
+    except Exception as exc:
+        # Log only the exception class: configparser errors can embed the
+        # offending file's contents, which may include credential material.
+        _logger.debug(
+            "readiness: databricks config override parse failed (%s)", type(exc).__name__
+        )
         return False
 
 

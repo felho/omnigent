@@ -392,7 +392,9 @@ def _find_child_session_id(client: httpx.Client, parent_session_id: str) -> str 
     :param parent_session_id: The supervisor session id.
     :returns: The child session id, or ``None`` when not yet created.
     """
-    resp = client.get("/v1/sessions", params={"kind": "sub_agent", "limit": 50})
+    resp = client.get(
+        "/v1/sessions", params={"visibility": "all", "kind": "sub_agent", "limit": 50}
+    )
     resp.raise_for_status()
     for row in resp.json().get("data", []):
         if not isinstance(row, dict):

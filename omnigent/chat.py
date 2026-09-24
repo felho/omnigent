@@ -1717,15 +1717,8 @@ async def _prepare_chat_session_via_daemon(
             await wait_for_runner_online(
                 client, runner_id, timeout_s=_DAEMON_CHAT_RUNNER_ONLINE_TIMEOUT_S
             )
-            # launch_or_reuse_daemon_runner's atomic-bind / online-reuse paths
-            # don't pass through replace_runner_id, so re-bind via PATCH to
-            # clear the ``omnigent.stopped`` marker on resumed sessions. Must run
-            # AFTER wait_for_runner_online — a freshly launched runner isn't
-            # registered until then, and replace_runner_id 400s on an unregistered id.
-            # A freshly-created session was already bound atomically by the launch
-            # endpoint and carries no stopped marker, so this PATCH would be pure
-            # redundant latency — a full extra server round trip that costs seconds
-            # at WAN RTT. Only resumed sessions need it.
+            # Resumed sessions need a bind after the runner is online to clear
+            # the stopped marker; fresh sessions were bound by launch.
             if not fresh_session:
                 await bind_session_runner(client, session_id, runner_id)
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError) as exc:

@@ -4678,14 +4678,7 @@ async def _run_prepare_daemon_session(
     *,
     resume_conversation_id: str | None,
 ) -> tuple[_DaemonChatSession, dict[str, object], list[tuple[str, str]]]:
-    """Drive ``_prepare_chat_session_via_daemon`` with the launch helpers stubbed.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :param resume_conversation_id: Passed through; ``None`` creates a fresh session.
-    :returns: ``(result, launch_kwargs, bind_calls)`` where ``launch_kwargs`` records
-        the ``fresh`` flag the launch endpoint received and ``bind_calls`` records
-        every follow-up PATCH bind.
-    """
+    """Record the launch and bind calls for a daemon-backed session."""
     launch_kwargs: dict[str, object] = {}
     bind_calls: list[tuple[str, str]] = []
 
@@ -4752,9 +4745,7 @@ async def _run_prepare_daemon_session(
 async def test_fresh_daemon_session_skips_redundant_bind(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A fresh session is bound atomically by the launch endpoint, so the
-    follow-up PATCH bind — a full extra server round trip that costs seconds at
-    WAN RTT — must be skipped."""
+    """Fresh sessions use the launch endpoint's atomic bind."""
     result, launch_kwargs, bind_calls = await _run_prepare_daemon_session(
         monkeypatch, resume_conversation_id=None
     )

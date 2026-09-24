@@ -1,23 +1,6 @@
-"""Remote-server REPL latency e2e.
+"""Measure remote CLI startup and turn latency through a local TCP proxy.
 
-Reported journey: from a machine far from the server region (e.g. India ->
-US-East-1 for `isaac omni`), run ``omnigent run <agent> --server <url>``;
-startup stalls for 60+ seconds before the REPL accepts input and turns feel
-sluggish.
-
-The suite drives that journey twice against the same live server: once at
-loopback RTT (~0) and once through a TCP proxy that injects a fixed one-way
-delay simulating the WAN RTT. Two properties are asserted:
-
-- startup (spawn -> REPL prompt ready) finishes within an absolute budget at
-  the simulated WAN RTT — the user-facing "how long until I can type";
-- a steady-state turn's latency added by the RTT stays within a small
-  sequential round-trip budget, so the per-turn path never becomes chatty
-  (the delta between the two runs divided by the RTT is the round-trip depth).
-
-Usage::
-
-    python -m pytest tests/e2e/test_remote_server_repl_latency_e2e.py -v -s
+The proxy adds a simulated WAN delay; a mock LLM makes replies deterministic.
 """
 
 from __future__ import annotations
@@ -47,26 +30,17 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _PROMPT_READY = "❯"
 
-# Simulated one-way WAN delay. 100 ms each way ~= a 200 ms RTT, the ballpark
-# of the India -> US-East-1 path named in the report.
+# 100 ms each way simulates a 200 ms WAN round trip.
 _ONE_WAY_DELAY_S = 0.1
 _RTT_S = 2 * _ONE_WAY_DELAY_S
 
-# Absolute launch budget (spawn -> prompt ready) at the simulated WAN RTT,
-# with a mock LLM and a trivial agent. A bounded launch is a couple of
-# sequential round trips plus a few seconds of local process bring-up; the
-# reported 60+ s startups (and the ~18 s reproduced even at loopback RTT)
-# come from the serial host-daemon/runner/terminal launch pipeline, which is
-# what this budget fails on.
+# Seconds from CLI spawn to an input-ready REPL at the simulated RTT.
 _STARTUP_BUDGET_S = 10.0
 
-# Sequential round-trip budget for one steady-state turn (send -> reply
-# rendered). Keeps the per-turn client<->server path from becoming chatty,
-# which would hit far-from-server users hardest.
+# Maximum RTT-scaled latency added to a steady-state turn.
 _TURN_ROUND_TRIP_BUDGET = 12
 
-# Absolute jitter allowance on top of the RTT-proportional turn budget so
-# same-machine scheduling noise cannot fail the comparison by itself.
+# Absorb local scheduling jitter in the turn comparison.
 _JITTER_S = 3.0
 
 _LAUNCH_TIMEOUT_S = 240.0
@@ -76,12 +50,7 @@ _REQUEST_LINE_RE = re.compile(rb"(?:^|\r\n)(?:GET|POST|PUT|PATCH|DELETE|OPTIONS|
 
 
 def _strip_ansi(text: str) -> str:
-    """
-    Remove ANSI escape sequences before substring search.
-
-    :param text: Raw PTY output.
-    :returns: Plain text.
-    """
+    """Remove ANSI escapes from PTY output."""
     return _ANSI_RE.sub("", text)
 
 
@@ -96,12 +65,7 @@ class _ConnCounter:
         self._upgraded = False
 
     def feed(self, data: bytes) -> None:
-        """
-        Count request lines in the next client->server chunk.
-
-        :param data: Raw bytes read from the client socket.
-        :returns: None.
-        """
+        """Count HTTP request lines before a WebSocket upgrade."""
         if self._upgraded or not data:
             return
         buf = self._residual + data
@@ -112,8 +76,7 @@ class _ConnCounter:
                 self._proxy.record_request()
                 self._counted_upto = absolute + 1
         if b"Upgrade: websocket" in buf or b"upgrade: websocket" in buf:
-            # Tunnel frames after the WS handshake are opaque; method-looking
-            # bytes inside them must not inflate the request count.
+            # Tunnel frames can contain method-like bytes.
             self._upgraded = True
         keep = min(len(buf), 16)
         self._residual = buf[len(buf) - keep :]
@@ -139,29 +102,17 @@ class LatencyProxy:
         threading.Thread(target=self._accept_loop, daemon=True).start()
 
     def record_request(self) -> None:
-        """
-        Record one client->server HTTP request.
-
-        :returns: None.
-        """
+        """Record one client-to-server HTTP request."""
         with self._lock:
             self.request_count += 1
 
     def snapshot(self) -> tuple[int, int]:
-        """
-        Return the current (requests, connections) counters.
-
-        :returns: Counter pair.
-        """
+        """Return the request and connection counts."""
         with self._lock:
             return self.request_count, self.connection_count
 
     def stop(self) -> None:
-        """
-        Stop accepting connections and release the listener.
-
-        :returns: None.
-        """
+        """Stop accepting connections."""
         self._stopping.set()
         with contextlib.suppress(OSError):
             self._listener.close()
@@ -184,8 +135,7 @@ class LatencyProxy:
             self._pump(server, client, None)
 
     def _pump(self, src: socket.socket, dst: socket.socket, counter: _ConnCounter | None) -> None:
-        # Reader and writer are decoupled through a delivery queue so a burst
-        # of chunks pays the one-way delay once, not once per chunk.
+        # Queued chunks in a burst share one delay window.
         chunks: queue.Queue[tuple[float, bytes]] = queue.Queue()
 
         def reader() -> None:
@@ -232,11 +182,7 @@ class JourneyTiming:
     connections: int
 
     def as_dict(self) -> dict[str, Any]:
-        """
-        Serialize for the diagnostic printout.
-
-        :returns: Plain dict of the fields.
-        """
+        """Round timings for diagnostic output."""
         return {
             "prompt_ready_s": round(self.prompt_ready_s, 2),
             "first_reply_s": round(self.first_reply_s, 2),
@@ -249,12 +195,7 @@ class JourneyTiming:
 
 
 def _write_probe_agent(directory: Path) -> Path:
-    """
-    Write a minimal single-model agent spec for the journey.
-
-    :param directory: Existing temp directory to write into.
-    :returns: Path to the agent YAML.
-    """
+    """Write the minimal agent spec used by the journey."""
     agent_yaml = directory / "latency-probe.yaml"
     agent_yaml.write_text(
         "name: latency-probe\n"
@@ -268,13 +209,7 @@ def _write_probe_agent(directory: Path) -> Path:
 
 
 def _build_repl_env(mock_llm_server_url: str, tmp_home: Path) -> dict[str, str]:
-    """
-    Build the pexpect environment for ``omnigent run`` with the mock LLM.
-
-    :param mock_llm_server_url: Mock LLM server base URL.
-    :param tmp_home: Isolated HOME for this run.
-    :returns: Env mapping for ``pexpect.spawn``.
-    """
+    """Build an isolated CLI environment using the mock LLM."""
     sdk_paths = [
         str(_REPO_ROOT / "sdks" / "python-client"),
         str(_REPO_ROOT / "sdks" / "ui"),
@@ -309,14 +244,7 @@ def _build_repl_env(mock_llm_server_url: str, tmp_home: Path) -> dict[str, str]:
 
 
 def _await_reply(child: Any, reply_marker: str, timeout: float) -> float:
-    """
-    Wait until the REPL renders *reply_marker* and return the elapsed time.
-
-    :param child: Live pexpect child.
-    :param reply_marker: Unique assistant-reply substring to wait for.
-    :param timeout: Seconds to wait before failing.
-    :returns: Seconds from call to the marker rendering.
-    """
+    """Return elapsed time when the REPL renders the reply marker."""
     start = time.monotonic()
     deadline = start + timeout
     buffer = ""
@@ -341,19 +269,7 @@ def _drive_remote_repl(
     mock_llm_server_url: str,
     tmp_dir: Path,
 ) -> JourneyTiming:
-    """
-    Run the reported journey once and measure each phase.
-
-    Journey: ``omnigent run <agent> --server <url>`` -> wait for the REPL
-    prompt -> send a message -> wait for the reply -> send a second message
-    -> wait for its reply -> exit.
-
-    :param server_url: Server URL the CLI should target (the proxy).
-    :param proxy: The proxy fronting the live server, for traffic counters.
-    :param mock_llm_server_url: Mock LLM base URL for the spawned runner.
-    :param tmp_dir: Fresh directory for HOME + the agent spec.
-    :returns: Measured timings and counters.
-    """
+    """Time the CLI prompt and two replies through the proxy."""
     marker = uuid.uuid4().hex[:6]
     reply_one = f"PROBE-ONE-{marker}"
     reply_two = f"PROBE-TWO-{marker}"
@@ -417,17 +333,7 @@ def latency_measurements(
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> dict[str, JourneyTiming]:
-    """
-    Measure the journey at loopback RTT and at the simulated WAN RTT.
-
-    Both runs traverse an identical proxy hop so the only variable is the
-    injected delay.
-
-    :param live_server: Live e2e server base URL.
-    :param mock_llm_server_url: Mock LLM server base URL.
-    :param tmp_path_factory: Pytest temp factory.
-    :returns: ``{"direct": ..., "delayed": ...}`` measurements.
-    """
+    """Run the journey through zero-delay and delayed proxies."""
     parsed = urlparse(live_server)
     host = parsed.hostname or "localhost"
     port = parsed.port or 80

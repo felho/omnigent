@@ -1855,7 +1855,7 @@ async def test_cancelled_readiness_probe_keeps_orphan_reaper_paused(
 async def test_owner_lookup_overlaps_capability_discovery_after_websocket_upgrade(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Owner attribution adds no serial wait before host registration."""
+    """Owner lookup runs after upgrade while capability discovery continues."""
     host = _make_host_process()
     capability_started = asyncio.Event()
     capability_release = asyncio.Event()

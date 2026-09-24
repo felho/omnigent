@@ -380,7 +380,9 @@ async def _drive(base_url: str, mock_llm_url: str, tmp_path: Path) -> None:
             # Verify that the sole occupant is this idle, connected session.
             async with httpx.AsyncClient() as client:
                 listed = (
-                    await client.get(f"{base_url}/v1/sessions?limit=200", timeout=10.0)
+                    await client.get(
+                        f"{base_url}/v1/sessions?limit=200&visibility=all", timeout=10.0
+                    )
                 ).json()["data"]
                 occupants = [
                     s

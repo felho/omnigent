@@ -1,36 +1,9 @@
-"""E2E: an IME auto-pair must not corrupt the next composed candidate.
+"""Exercise IME auto-pair correction in a mobile-sized browser and live PTY.
 
-A mobile touch keyboard that auto-inserts paired punctuation puts ``()``
-into xterm's helper textarea and leaves the caret *between* the pair.
-xterm 6's ``CompositionHelper`` ignores the caret entirely:
-
-- ``_handleAnyTextareaChanges`` (the keydown-229 path that forwards the
-  pair) diffs textarea values only, so no cursor-left reaches the PTY:
-  the terminal cursor stays after ``)`` while the textarea caret sits
-  inside the pair.
-- ``compositionstart`` records ``textarea.value.length`` (the value's
-  end, not the caret) as the composition start, so when the following
-  Chinese composition commits, the substring forwarded to the PTY is the
-  text *after* that position — the trailing ``)`` — instead of the
-  composed candidate.
-
-Journey (mirrors the report; xterm's listeners on ``term.textarea`` do
-not check ``isTrusted``, so synthetic IME events drive its real
-composition state, exactly as in the sibling composition tests):
-
-1. On a phone-profile browser, open a session and a shell pane (kebab →
-   Shells → "New shell", the mobile entry point).
-2. Focus the terminal. The touch keyboard inserts ``()`` with the caret
-   between the pair: ``keydown(229)`` → textarea ``()`` / selection 1 →
-   ``input`` → ``keyup(229)``.
-3. Compose ``ni`` and select 你 without moving the caret out of the
-   pair: composition events ending in ``compositionend(你)`` with the
-   textarea at ``(你)`` / selection 2.
-
-Expected: the composed candidate 你 reaches the PTY and the input stream
-never decodes to ``())``. Observed on the unfixed build: the pair is
-forwarded with no caret sync and the composition commit sends ``)``, so
-the PTY input decodes to ``())`` and the pane echoes ``())``.
+A touch keyboard can append ``()`` with the caret inside. xterm tracks
+composition by value length, so without realignment it commits the trailing
+``)`` instead of 你. This test replays IME events in a phone-profile
+Chromium context; it does not emulate a physical phone keyboard.
 """
 
 from __future__ import annotations
@@ -41,15 +14,12 @@ import time
 
 from playwright.sync_api import Browser, Page, ViewportSize, expect
 
-# iPhone-12-class portrait viewport — below the Tailwind ``md`` breakpoint,
-# so the mobile kebab navigation (the phone user's entry point) renders.
+# Below the mobile navigation breakpoint.
 _MOBILE_VIEWPORT: ViewportSize = {"width": 390, "height": 844}
 
-# The candidate the user selects from the IME after composing "ni".
 _CANDIDATE = "你"
 
-# What a mobile keyboard's auto-pairing does: while the IME is active
-# (keydown 229), the pair lands in the textarea with the caret between it.
+# Replay a keyCode-229 insert with the caret inside the pair.
 _AUTO_PAIR_REPLAY = """(ta) => {
   const key = (type) => {
     const ev = new KeyboardEvent(type, {
@@ -67,8 +37,7 @@ _AUTO_PAIR_REPLAY = """(ta) => {
   ta.dispatchEvent(key("keyup"));
 }"""
 
-# One IME preedit update: replace the previous preedit at the caret with
-# the new one, exactly as a browser mutates the textarea mid-composition.
+# Replace the previous preedit at the caret.
 _COMPOSITION_STEP = """(ta, { prev, next }) => {
   const start = ta.selectionStart - prev.length;
   ta.dispatchEvent(new CompositionEvent("compositionupdate", { data: next, bubbles: true }));
@@ -88,15 +57,7 @@ _COMPOSITION_END = """(ta, data) => {
 
 
 def _capture_attach_frames(page: Page) -> tuple[list[bytes], list[bytes]]:
-    """Record every frame sent/received on terminal-attach WebSockets.
-
-    Registered before navigation so neither the relay attach nor a later
-    direct-loopback re-dial can slip through. Frames are normalized to
-    bytes (keystrokes go up as binary; text frames are UTF-8 encoded).
-
-    :param page: Playwright page, not yet navigated.
-    :returns: ``(sent, received)`` lists that fill in as frames flow.
-    """
+    """Capture attach frames before navigation, including later re-dials."""
     sent: list[bytes] = []
     received: list[bytes] = []
 
@@ -138,17 +99,7 @@ def _open_new_shell_mobile(page: Page) -> None:
 def test_ime_autopair_then_candidate_reaches_pty(
     browser: Browser, terminal_session: tuple[str, str]
 ) -> None:
-    """The candidate composed inside an IME auto-pair must reach the PTY.
-
-    Fails on the unfixed build: the composition commit sends the pair's
-    trailing ``)`` instead of the candidate, so the PTY input decodes to
-    ``())`` and the composed text never arrives.
-
-    :param browser: Playwright browser; the test opens its own phone-profile
-        context (the default ``page`` fixture is not mobile).
-    :param terminal_session: ``(base_url, session_id)`` of a runner-bound
-        session whose agent declares a shell (``terminals:`` block).
-    """
+    """Commit the candidate between an auto-pair through the mobile shell UI."""
     base_url, session_id = terminal_session
 
     context_kwargs: dict[str, object] = {
@@ -156,8 +107,7 @@ def test_ime_autopair_then_candidate_reaches_pty(
         "has_touch": True,
         "is_mobile": True,
     }
-    # The e2e_ui recording hook patches the async API only; opt this sync
-    # context into recording explicitly when a run requests it.
+    # Opt the sync browser context into recording when requested.
     record_dir = os.environ.get("OMNIGENT_E2E_RECORD_DIR")
     if record_dir:
         context_kwargs["record_video_dir"] = record_dir
@@ -175,10 +125,7 @@ def test_ime_autopair_then_candidate_reaches_pty(
         textarea = terminal_view.locator("textarea.xterm-helper-textarea")
         textarea.focus()
 
-        # Sanity: prove the frame capture and the input path are live before
-        # asserting on an absence — a plain keystroke must show up as a sent
-        # frame, otherwise the real assertions below could fail for capture
-        # reasons rather than the bug.
+        # Prove the input path is live before checking candidate bytes.
         page.keyboard.type("q")
         assert _wait_for_sent_bytes(page, sent, b"q", timeout_s=10), (
             "attach WebSocket frame capture saw no keystroke frame; "
@@ -186,14 +133,13 @@ def test_ime_autopair_then_candidate_reaches_pty(
         )
         page.keyboard.press("Backspace")
 
-        # Step 2 — the touch keyboard auto-inserts the pair, caret inside it.
         textarea.evaluate(_AUTO_PAIR_REPLAY)
         assert _wait_for_sent_bytes(page, sent, b"()", timeout_s=5), (
             "the auto-pair itself never reached the PTY; the replay did not "
             f"drive xterm's input path. Sent so far: {b''.join(sent)!r}"
         )
 
-        # Step 3 — compose "ni" at the caret and select the candidate.
+        # Compose "ni" at the in-pair caret.
         textarea.evaluate(
             '(ta) => ta.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }))'
         )
@@ -202,7 +148,6 @@ def test_ime_autopair_then_candidate_reaches_pty(
         textarea.evaluate(_COMPOSITION_STEP, {"prev": "n", "next": "ni"})
         page.wait_for_timeout(100)
 
-        # The preedit overlay is up: the composition is genuinely in flight.
         composition_view = terminal_view.locator(".composition-view")
         expect(composition_view).to_have_class(re.compile(r"\bactive\b"))
         expect(composition_view).to_have_text("ni")
@@ -211,8 +156,7 @@ def test_ime_autopair_then_candidate_reaches_pty(
         textarea.evaluate(_COMPOSITION_END, _CANDIDATE)
 
         committed = _wait_for_sent_bytes(page, sent, _CANDIDATE.encode("utf-8"), timeout_s=5)
-        # Let the PTY echo paint before judging, so a failure is visible in
-        # the pane (and in a recording) as the corrupted `())` line.
+        # Let the PTY echo paint before judging.
         page.wait_for_timeout(1_000)
         all_sent = b"".join(sent)
         assert committed, (
@@ -224,8 +168,7 @@ def test_ime_autopair_then_candidate_reaches_pty(
             "the terminal sent the corrupted '())' byte stream to the PTY "
             f"instead of keeping the candidate inside the pair: {all_sent!r}"
         )
-        # Order matters, not just presence: pair, then a realigning
-        # cursor-left (CSI or SS3, per DECCKM), then the candidate.
+        # Pair, cursor-left, candidate is the required PTY order.
         pair_at = all_sent.find(b"()")
         assert pair_at != -1, f"the pair was not sent intact: {all_sent!r}"
         left_positions = [

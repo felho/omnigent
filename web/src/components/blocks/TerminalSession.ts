@@ -228,39 +228,10 @@ export const CURSOR_LEFT_CSI = "\x1b[D";
 export const CURSOR_LEFT_SS3 = "\x1bOD";
 
 /**
- * Compute the realignment needed after an IME-processed insert leaves the
- * caret *inside* the text it appended.
- *
- * A mobile touch keyboard that auto-inserts a punctuation pair writes both
- * characters into xterm's helper textarea in one IME keystroke and parks
- * the caret between them. xterm's CompositionHelper tracks the textarea by
- * value only, never by caret: the pair reaches the PTY with no cursor
- * movement, and the next composition is anchored at the end of the value
- * instead of the caret, so the committed candidate arrives corrupted (the
- * terminal shows ``())`` where the user composed ``(你)``). Realignment
- * means moving the terminal cursor one cell left per character of the tail
- * — a line editor then inserts the coming candidate between the pair,
- * exactly as if the user had pressed the left arrow — and unstaging the
- * tail so the caret sits at the end of the textarea value again, the
- * invariant CompositionHelper's composition anchor assumes.
- *
- * Ownership of the tail is proven by the value pair, not by the event's
- * ``data`` (some keyboards report only the typed character for an
- * auto-pair): only a pure append of the previous value — the one shape
- * xterm's own value diff forwards verbatim — with the caret inside the
- * appended run qualifies. Replacements, middle inserts, deletions, and a
- * caret inside previously staged text leave xterm's bookkeeping untouched.
- *
- * Pure helper — exported for direct unit testing; the session applies it
- * to the helper textarea's ``input`` events one macrotask after xterm's
- * own value diff has forwarded the insert.
- *
- * :param previousValue: The textarea value before the insert, e.g. ``""``.
- * :param value: The textarea value after the insert, e.g. ``"()"``.
- * :param selectionStart: The caret position after the insert, or ``null``
- *     when the selection is unreadable.
- * :returns: The number of cells to move left and the textarea value with
- *     the tail unstaged, or ``null`` when no realignment applies.
+ * Realign an IME append whose caret lands inside its new text. xterm tracks
+ * composition by textarea value, not caret, so an auto-pair can put the next
+ * candidate after the closing mark. Only the newly appended tail is safe to
+ * unstage while moving the PTY cursor left.
  */
 export function imeInsertRealignment(
   previousValue: string,
@@ -675,20 +646,11 @@ export class TerminalSession {
       { capture: true, signal },
     );
 
-    // A mobile IME that auto-inserts a punctuation pair leaves the caret
-    // *inside* the pair; xterm's caret-blind CompositionHelper would then
-    // corrupt the next composed candidate (see imeInsertRealignment). Watch
-    // the helper textarea for non-composition inserts that leave the caret
-    // inside the value and realign PTY cursor + staged value to the caret.
+    // Realign auto-pairs only after xterm forwards their append to the PTY.
     const textarea = this.term.textarea;
     if (textarea) {
       let imeComposing = false;
-      // The pre-insert textarea value: the browser mutates the value between
-      // keydown and input, so a keydown-time snapshot is what the coming
-      // input event's append is measured against. Focus re-syncs after
-      // xterm's blur-time clear, and each input event rolls it forward for
-      // IME streams that fire no keydown. xterm's own listeners registered
-      // first (term.open above), so its keydown-time clears are seen here.
+      // Snapshot at keydown; focus and input also resync IMEs without keydown.
       let valueBeforeInput = textarea.value;
       const snapshotValue = () => {
         valueBeforeInput = textarea.value;
@@ -715,11 +677,8 @@ export class TerminalSession {
           const { isComposing, inputType } = ev as InputEvent;
           const previousValue = valueBeforeInput;
           valueBeforeInput = textarea.value;
-          // A composition owns the textarea until it commits; its updates
-          // (and the commit's own input event) must not be realigned.
+          // Leave composition updates, including their commit input, untouched.
           if (imeComposing || isComposing || inputType === "insertCompositionText") return;
-          // Decide at event time, against this event's own before/after
-          // values and caret.
           const realign = imeInsertRealignment(
             previousValue,
             textarea.value,
@@ -728,12 +687,10 @@ export class TerminalSession {
           if (realign === null) return;
           const decidedValue = textarea.value;
           const decidedCaret = textarea.selectionStart;
-          // Defer one macrotask so CompositionHelper's zero-delay textarea
-          // diff forwards the inserted characters before the cursor moves.
+          // xterm's zero-delay diff must forward the append before cursor-left.
           setTimeout(() => {
             if (imeComposing || this.disposed) return;
-            // Anything that touched the textarea since the decision — a new
-            // keystroke, a composition, xterm's own clears — invalidates it.
+            // A later edit or xterm clear invalidates the earlier decision.
             if (textarea.value !== decidedValue || textarea.selectionStart !== decidedCaret) {
               return;
             }

@@ -262,9 +262,6 @@ describe("terminalKeyEventPayload", () => {
 
 describe("imeInsertRealignment", () => {
   it("realigns an auto-inserted pair that left the caret inside", () => {
-    // The touch keyboard appended "()" in one IME keystroke, caret between
-    // the pair: one cell left re-joins the PTY insertion point to the caret
-    // and the tail is unstaged so the next composition anchors correctly.
     expect(imeInsertRealignment("", "()", 1)).toEqual({
       moveLeft: 1,
       stagedValue: "(",
@@ -272,8 +269,6 @@ describe("imeInsertRealignment", () => {
   });
 
   it("realigns a pair appended after previously staged text", () => {
-    // Ownership is proven by the appended run "b)": the caret sits inside
-    // it, so only its tail ")" is unstaged.
     expect(imeInsertRealignment("(", "(b)", 2)).toEqual({
       moveLeft: 1,
       stagedValue: "(b",
@@ -281,14 +276,10 @@ describe("imeInsertRealignment", () => {
   });
 
   it("is a no-op when the caret sits at the end of the value", () => {
-    // The overwhelmingly common IME insert (direct commit at the end)
-    // already satisfies CompositionHelper's caret==end assumption.
     expect(imeInsertRealignment("", "你好", 2)).toBeNull();
   });
 
   it("moves one cell per code point, not per UTF-16 unit", () => {
-    // A tail of two astral-plane characters is four UTF-16 units but must
-    // yield exactly two cells left — line editors move per character.
     expect(imeInsertRealignment("", "a😀😀", 1)).toEqual({
       moveLeft: 2,
       stagedValue: "a",
@@ -296,14 +287,10 @@ describe("imeInsertRealignment", () => {
   });
 
   it("refuses a caret inside text staged before this event", () => {
-    // The caret sits inside "()" — text already forwarded to the PTY by an
-    // earlier event — so unstaging would desync xterm's bookkeeping.
     expect(imeInsertRealignment("()", "()!", 1)).toBeNull();
   });
 
   it("refuses changes that are not a pure append", () => {
-    // A replacement (or middle insert) is not the shape xterm's value diff
-    // forwards verbatim; the appended-run ownership proof does not hold.
     expect(imeInsertRealignment("(a)", "(b)", 2)).toBeNull();
     expect(imeInsertRealignment("()", "()", 1)).toBeNull();
     expect(imeInsertRealignment("()", "(", 0)).toBeNull();
@@ -819,13 +806,7 @@ describe("TerminalSession", () => {
   });
 
   it("realigns the cursor and composition anchor after an IME auto-pair", async () => {
-    // WHY: a mobile IME writes an automatic punctuation pair in one
-    // 229-keystroke and parks the caret between the pair. xterm's
-    // caret-blind CompositionHelper forwards the pair with no cursor-left
-    // and anchors the next composition at the value end, so the PTY would
-    // receive `())` where the user composed `(你)`. The session must send
-    // the pair, then a realigning cursor-left, then the committed
-    // candidate — and never the uncommitted preedit.
+    // The PTY must receive the pair, cursor-left, then candidate; never preedit.
     const settle = () =>
       new Promise<void>((resolve) => {
         setTimeout(resolve, 25);
@@ -851,7 +832,6 @@ describe("TerminalSession", () => {
         }),
       );
 
-    // The touch keyboard auto-inserts the pair, caret left inside it.
     fire229("keydown");
     textarea.value = "()";
     textarea.selectionStart = 1;
@@ -867,12 +847,11 @@ describe("TerminalSession", () => {
     fire229("keyup");
     await settle();
 
-    // The tail is unstaged so the caret sits at the end of the value again
-    // — the invariant the CompositionHelper's anchor assumes.
+    // CompositionHelper anchors at the end of the unstaged value.
     expect(textarea.value).toBe("(");
     expect(textarea.selectionStart).toBe(1);
 
-    // Compose "ni" at the in-pair caret…
+    // Compose "ni" at the in-pair caret.
     fire229("keydown");
     textarea.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
     textarea.value = "(n";
@@ -893,7 +872,7 @@ describe("TerminalSession", () => {
     fire229("keyup");
     await settle();
 
-    // …and select 你 from the candidate list (Chromium's commit stream).
+    // Commit the selected candidate.
     textarea.value = "(你";
     textarea.selectionStart = 2;
     textarea.selectionEnd = 2;
@@ -904,23 +883,17 @@ describe("TerminalSession", () => {
     compositionInput("你");
     await settle();
 
-    // Keystroke frames go up as Uint8Array — but from the source module's
-    // realm, so filter by "not a string" rather than instanceof (which
-    // fails cross-realm under jsdom; see the ArrayBuffer note above).
+    // instanceof Uint8Array fails across jsdom realms.
     const sentBytes = socket.sent
       .filter((frame) => typeof frame !== "string")
       .map((frame) => new TextDecoder().decode(frame as Uint8Array))
       .join("");
-    // Pair first (already user-visible), then the realigning cursor-left,
-    // then the committed candidate — a line editor renders `(你)`.
     expect(sentBytes).toBe(`()${CURSOR_LEFT_CSI}你`);
     session.dispose();
   });
 
   it("realigns even when the auto-pair event reports only the typed character", async () => {
-    // WHY: some keyboards report the auto-pair's InputEvent.data as "("
-    // although the textarea gained "()". Realignment must be driven by the
-    // observed value change, not the event's claimed data.
+    // Some keyboards report only "(" in InputEvent.data for the pair.
     const settle = () =>
       new Promise<void>((resolve) => {
         setTimeout(resolve, 25);
@@ -962,8 +935,7 @@ describe("TerminalSession", () => {
   });
 
   it("encodes the realigning arrow per application-cursor-keys mode", async () => {
-    // WHY: with DECCKM enabled a full-screen app expects arrows as SS3
-    // (ESC O D); the normal-mode CSI form may be unbound or misread there.
+    // DECCKM expects SS3 arrows rather than CSI.
     const settle = () =>
       new Promise<void>((resolve) => {
         setTimeout(resolve, 25);

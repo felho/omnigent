@@ -2786,9 +2786,10 @@ async def _persist_external_conversation_items(
             session_id,
             [new_item for entry in prepared for new_item in entry.batch],
         )
-    except BaseException:
+    except Exception:
         # Nothing persisted: hand every drained entry back in original queue
         # order (restore prepends, so reverse the consumption order).
+        # Cancellation is excluded: the append thread may still commit.
         consumed = [
             drained
             for entry in prepared

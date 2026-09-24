@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import base64
+
 from playwright.sync_api import Page, expect
 
 from tests.browser_ui.chat.session_contract import ChatSessionContract, model_option
+
+_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="
+)
 
 
 def test_contract_drives_history_catalog_and_live_status(
@@ -15,7 +21,7 @@ def test_contract_drives_history_catalog_and_live_status(
     chat = chat_session_contract
     chat.seed_transcript(24)
     chat.set_catalog(
-        harness="claude",
+        harness="claude-native",
         models=[
             model_option("sonnet", display_name="Sonnet", is_default=True),
             model_option("opus", display_name="Opus"),
@@ -23,6 +29,7 @@ def test_contract_drives_history_catalog_and_live_status(
         selected_model="sonnet",
     )
     page.goto(chat.url)
+    chat.wait_for_stream()
 
     expect(page.get_by_text("Request 24", exact=False)).to_be_visible(timeout=20_000)
     expect(page.get_by_text("print('browser turn 24')", exact=False)).to_be_visible()
@@ -33,12 +40,50 @@ def test_contract_drives_history_catalog_and_live_status(
         }""",
         chat.session_id,
     )
-    assert session["harness"] == "claude"
+    assert session["harness"] == "claude-native"
     assert [model["id"] for model in session["model_options"]] == ["sonnet", "opus"]
+    configure = page.get_by_role("button", name="Configure session")
+    configure.click()
+    page.get_by_role("menuitem", name="Model: Default").click()
+    expect(page.get_by_role("menuitemcheckbox", name="Sonnet")).to_be_visible()
+    expect(page.get_by_role("menuitemcheckbox", name="Opus")).to_be_visible()
+    page.keyboard.press("Escape")
 
     working = page.get_by_test_id("working-indicator")
     chat.emit_busy("fixture-turn")
     expect(working).to_be_visible(timeout=10_000)
+    reconnect_data = page.evaluate(
+        """async sessionId => {
+            const controller = new AbortController();
+            const response = await fetch(`/v1/sessions/${sessionId}/stream`, {
+                signal: controller.signal,
+            });
+            const reader = response.body.getReader();
+            const chunks = [];
+            const timer = setTimeout(() => controller.abort(), 100);
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    chunks.push(value);
+                }
+            } catch (error) {
+                if (error.name !== "AbortError") throw error;
+            } finally {
+                clearTimeout(timer);
+            }
+            return new TextDecoder().decode(
+                chunks.reduce((all, chunk) => {
+                    const joined = new Uint8Array(all.length + chunk.length);
+                    joined.set(all);
+                    joined.set(chunk, all.length);
+                    return joined;
+                }, new Uint8Array()),
+            );
+        }""",
+        chat.session_id,
+    )
+    assert "session.status" not in reconnect_data
     chat.emit_idle("fixture-turn")
     expect(working).to_be_hidden(timeout=10_000)
 
@@ -99,3 +144,41 @@ def test_contract_records_and_persists_session_patches(
     assert sessions["patched"]["model_override"] == "opus"
     assert "silent" not in sessions["patched"]
     assert sessions["current"]["model_override"] == "opus"
+
+
+def test_contract_records_binary_upload_and_returns_file_resource(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    chat = chat_session_contract
+    chat.reject_uploads = False
+    page.goto(chat.url)
+
+    resource = page.evaluate(
+        """async ({ sessionId, png }) => {
+            const bytes = Uint8Array.from(atob(png), char => char.charCodeAt(0));
+            const form = new FormData();
+            form.append("file", new File([bytes], "pixel.png", { type: "image/png" }));
+            const response = await fetch(`/v1/sessions/${sessionId}/resources/files`, {
+                method: "POST",
+                body: form,
+            });
+            return response.json();
+        }""",
+        {"sessionId": chat.session_id, "png": base64.b64encode(_PNG).decode()},
+    )
+
+    assert resource == {
+        "id": "browser-upload-1",
+        "name": "pixel.png",
+        "metadata": {
+            "filename": "pixel.png",
+            "bytes": len(_PNG),
+            "created_at": 1_704_067_200,
+        },
+    }
+    assert len(chat.upload_requests) == 1
+    request = chat.upload_requests[0]
+    assert request["content_type"].startswith("multipart/form-data; boundary=")
+    assert request["body_length"] > len(_PNG)
+    assert _PNG in request["body_bytes"]

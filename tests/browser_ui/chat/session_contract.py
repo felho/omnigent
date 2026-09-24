@@ -6,9 +6,12 @@ import json
 import queue
 import re
 import threading
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -118,10 +121,12 @@ class _ChatSseServer(ThreadingHTTPServer):
 class _ChatSseStream:
     """Tiny streaming HTTP server used as the target of the mocked SSE route."""
 
-    def __init__(self, session_id: str) -> None:
+    def __init__(self) -> None:
         self._clients: set[queue.Queue[bytes | None]] = set()
         self._lock = threading.Lock()
-        self._history: list[bytes] = []
+        self._pending: list[bytes] = []
+        self._ever_connected = False
+        self._connected = threading.Event()
         stream = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -136,9 +141,12 @@ class _ChatSseStream:
                 self.end_headers()
                 messages: queue.Queue[bytes | None] = queue.Queue()
                 with stream._lock:
-                    for event in stream._history:
+                    for event in stream._pending:
                         messages.put(event)
+                    stream._pending.clear()
+                    stream._ever_connected = True
                     stream._clients.add(messages)
+                    stream._connected.set()
                 try:
                     self.wfile.write(b": browser chat stream ready\n\n")
                     self.wfile.flush()
@@ -161,21 +169,28 @@ class _ChatSseStream:
                 return
 
         self._server = _ChatSseServer(("127.0.0.1", 0), Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread = threading.Thread(
+            target=lambda: self._server.serve_forever(poll_interval=0.05),
+            daemon=True,
+        )
         self._thread.start()
         host, port = self._server.server_address
         self.url = f"http://{host}:{port}/stream"
-        self.emit(session_status_event(session_id, "idle"))
+
+    @property
+    def connected(self) -> bool:
+        return self._connected.is_set()
 
     def emit(self, event: Mapping[str, Any]) -> None:
-        """Append and broadcast one named SSE event."""
+        """Queue pre-connect events once, then broadcast only to live clients."""
         name = event.get("event")
         data = event.get("data")
         if not isinstance(name, str) or not isinstance(data, Mapping):
             raise ValueError("SSE events require {'event': str, 'data': mapping}")
         encoded = f"event: {name}\ndata: {json.dumps(dict(data))}\n\n".encode()
         with self._lock:
-            self._history.append(encoded)
+            if not self._clients and not self._ever_connected:
+                self._pending.append(encoded)
             for client in self._clients:
                 client.put(encoded)
 
@@ -227,6 +242,15 @@ class ChatSessionContract:
     @property
     def base_url(self) -> str:
         return self.contract.base_url
+
+    def wait_for_stream(self, timeout: float = 10) -> None:
+        """Wait until the SPA has opened its live event stream."""
+        deadline = time.monotonic() + timeout
+        while not self.stream.connected:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Timed out waiting for the chat event stream")
+            self.page.wait_for_timeout(min(10, max(1, remaining * 1000)))
 
     def seed_transcript(self, turns: int) -> None:
         """Replace history with ``turns`` user/assistant markdown pairs."""
@@ -425,7 +449,7 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
             status=404,
         )
     contract.json(
-        re.compile(r"/health(?:\?.*)?$"),
+        "/health",
         lambda _request: {
             "sessions": {handle.session_id: {"runner_online": True, "host_online": True}}
         },
@@ -469,14 +493,27 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
         if route.request.method != "POST":
             route.fallback()
             return
-        handle.upload_requests.append(_request_record(route.request))
+        request = _request_record(route.request)
+        handle.upload_requests.append(request)
         if handle.reject_uploads:
             route.abort("blockedbyclient")
         else:
+            filename, size = _multipart_file_metadata(request)
+            upload_id = f"browser-upload-{len(handle.upload_requests)}"
             route.fulfill(
                 status=200,
                 content_type="application/json",
-                body=json.dumps({"object": "list", "data": []}),
+                body=json.dumps(
+                    {
+                        "id": upload_id,
+                        "name": filename,
+                        "metadata": {
+                            "filename": filename,
+                            "bytes": size,
+                            "created_at": 1_704_067_200,
+                        },
+                    }
+                ),
             )
 
     contract.route(matcher(f"{session_api}/resources/files"), upload)
@@ -496,11 +533,43 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
 
 
 def _request_record(request: Request) -> dict[str, Any]:
-    body: Any = request.post_data
-    if request.post_data:
-        with suppress(json.JSONDecodeError):
-            body = json.loads(request.post_data)
-    return {"url": request.url, "method": request.method, "body": body}
+    raw_body = request.post_data_buffer
+    content_type = request.headers.get("content-type")
+    body: Any = raw_body
+    if raw_body and content_type and content_type.split(";", 1)[0] == "application/json":
+        with suppress(json.JSONDecodeError, UnicodeDecodeError):
+            body = json.loads(raw_body)
+    record = {"url": request.url, "method": request.method, "body": body}
+    if raw_body is not None:
+        record.update(
+            {
+                "body_bytes": raw_body,
+                "body_length": len(raw_body),
+                "content_type": content_type,
+            }
+        )
+    return record
+
+
+def _multipart_file_metadata(request: Mapping[str, Any]) -> tuple[str, int]:
+    raw_body = request.get("body_bytes")
+    content_type = request.get("content_type")
+    if not isinstance(raw_body, bytes) or not isinstance(content_type, str):
+        return "upload.bin", 0
+    message = BytesParser(policy=email_policy).parsebytes(
+        f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode() + raw_body
+    )
+    for part in message.iter_parts():
+        if (
+            part.get_content_disposition() != "form-data"
+            or part.get_param("name", header="content-disposition") != "file"
+        ):
+            continue
+        payload = part.get_payload(decode=True)
+        return part.get_filename() or "upload.bin", len(payload) if isinstance(
+            payload, bytes
+        ) else 0
+    return "upload.bin", len(raw_body)
 
 
 def chat_session_handle(
@@ -508,10 +577,10 @@ def chat_session_handle(
     browser_contract: BrowserContract,
 ) -> Iterator[ChatSessionContract]:
     """Create, install, and clean up a reusable chat contract handle."""
-    stream = _ChatSseStream(DEFAULT_SESSION_ID)
-    handle = ChatSessionContract(page=page, contract=browser_contract, stream=stream)
-    install_chat_session_routes(handle)
+    stream = _ChatSseStream()
     try:
+        handle = ChatSessionContract(page=page, contract=browser_contract, stream=stream)
+        install_chat_session_routes(handle)
         yield handle
     finally:
         stream.close()

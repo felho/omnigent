@@ -20,7 +20,12 @@ _LONG_TEXT = "Compare these screenshots. " * 30
     [
         pytest.param(1280, _LONG_TEXT, "Screenshot 2026-09-18 at 11.49.24 AM.png", id="desktop"),
         pytest.param(390, "Hey", "", id="phone"),
-        pytest.param(320, "", "Screenshot 2026-09-18 at 11.49.24 AM.png", id="narrow-phone"),
+        pytest.param(
+            320,
+            _LONG_TEXT,
+            "Screenshot 2026-09-18 at 11.49.24 AM.png",
+            id="narrow-phone",
+        ),
     ],
 )
 def test_queued_attachments_keep_their_real_layout_contract(
@@ -35,6 +40,7 @@ def test_queued_attachments_keep_their_real_layout_contract(
     expected_names = [screenshot_name or "image.png", "after.png", "notes.txt"]
     page.set_viewport_size({"width": width, "height": 844})
     page.goto(chat.url)
+    chat.wait_for_stream()
 
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible(timeout=20_000)
@@ -83,6 +89,8 @@ def test_queued_attachments_keep_their_real_layout_contract(
     )
     if width >= 768:
         assert layout["sameLine"], layout
+    elif text:
+        assert not layout["sameLine"], layout
     assert layout["noOverlap"], layout
     assert layout["nameWidth"] >= 24, layout
     assert layout["rowHeight"] <= (48 if width < 768 else 28), layout
@@ -97,6 +105,7 @@ def test_queued_attachments_keep_their_real_layout_contract(
         expect(page.get_by_role("button", name=f"Remove {name}", exact=True)).to_be_visible()
     page.get_by_role("button", name="Send", exact=True).click()
     expect(chip).to_be_visible()
+    expect(chip).to_have_attribute("title", "\n".join(expected_names))
     strip.get_by_role("button", name="Remove queued message", exact=True).click()
     expect(strip).to_have_count(0)
     assert len(chat.event_posts) == 1

@@ -1438,9 +1438,6 @@ describe("browser-view teardown on server change (src/main.js)", () => {
 });
 
 describe("fullscreen state plumbing", () => {
-  // macOS fullscreen hides the traffic lights; the renderer drops the
-  // clearance it reserves for them only if the shell tells it about the
-  // transition. These guard the main-process half of that bridge.
   it("forwards native fullscreen transitions to the renderer", (t) => {
     const h = loadNavigationHarness();
     t.after(h.cleanup);

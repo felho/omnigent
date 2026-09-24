@@ -141,17 +141,14 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     return () => ipcRenderer.removeListener("omnigent:host-status-changed", listener);
   },
   /**
-   * Whether this window is currently native-fullscreen. Pairs with
-   * onFullScreenChanged, which only reports transitions.
+   * Current native fullscreen state; transition events have no initial value.
    * @returns {Promise<boolean>}
    */
   isFullScreen: () => ipcRenderer.invoke("omnigent:window-is-full-screen"),
   /**
-   * Subscribe to native fullscreen transitions (macOS hides the traffic
-   * lights in fullscreen, so the web layer drops its clearance for them).
-   * Returns an unsubscribe function.
+   * Subscribe to native fullscreen transitions.
    * @param {(fullScreen: boolean) => void} callback
-   * @returns {() => void}
+   * @returns {() => void} Unsubscribe function
    */
   onFullScreenChanged: (callback) => {
     const listener = (_event, fullScreen) => callback(fullScreen === true);

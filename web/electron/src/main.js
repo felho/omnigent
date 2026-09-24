@@ -1607,11 +1607,8 @@ function createWindow(targetUrl, opts = {}) {
     // Per-conversation embedded-browser view registry for this window.
     browserRegistry: createBrowserRegistryForWindow(win),
   });
-  // Mirror native fullscreen into the renderer: macOS fullscreen removes the
-  // traffic lights, so the web layer must drop the clearance it reserves for
-  // them (the [data-electron-mac] rules). Wired on every platform — the
-  // renderer side is macOS-gated, and platform-neutral events keep the
-  // plumbing exercisable by the Linux-driven desktop e2e lane.
+  // Native fullscreen removes macOS traffic lights; the renderer adjusts its
+  // clearance. Platform-neutral events also allow Linux desktop E2E coverage.
   const sendFullScreenState = () => {
     if (!win.isDestroyed()) {
       win.webContents.send("omnigent:full-screen-changed", win.isFullScreen());
@@ -2808,8 +2805,7 @@ function pickWorkspaceForBridge(parent, workspaces, { signal } = {}) {
 
 function registerIpc() {
   registerWorkspacePickerIpc();
-  // Initial fullscreen state for a renderer that loads while the window is
-  // already fullscreen; transitions arrive via omnigent:full-screen-changed.
+  // Initial state complements transition events for renderers loaded fullscreen.
   ipcMain.handle("omnigent:window-is-full-screen", (event) => {
     const win = BrowserWindow.fromWebContents(event.sender);
     return win ? win.isFullScreen() : false;

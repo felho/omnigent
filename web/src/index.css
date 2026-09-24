@@ -822,12 +822,8 @@ aside[aria-label="Workspace"][data-maximized] {
   .workspace-tab-strip {
   padding-left: 10.5rem;
 }
-/* Native fullscreen removes the traffic lights (macOS slides them into the
- * auto-hiding menu bar), so the clearances above would leave a dead strip at
- * the window's top-left. AppShell mirrors the shell's fullscreen state into
- * data-electron-fullscreen; while it is set, the cluster hugs the left edge
- * (0.75rem matches the sidebar's own padding) and the slot clearances shrink
- * by the same 4.75rem, preserving the gap past the Settings cog. */
+/* Fullscreen hides the traffic lights. Move the header to the sidebar's 0.75rem
+ * inset and shrink the slot clearances by 4.75rem, retaining the Settings gap. */
 [data-electron-mac][data-electron-fullscreen] .electron-sidebar-header-actions {
   left: 0.75rem;
 }

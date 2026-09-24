@@ -1,8 +1,3 @@
-// The renderer half of the fullscreen bridge: preload.js must read the
-// window's fullscreen state over IPC and forward main-process transitions as
-// booleans (macOS fullscreen hides the traffic lights, and the web layer
-// keys its clearance CSS off this signal).
-
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");

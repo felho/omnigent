@@ -1,26 +1,6 @@
-// Desktop shell — fullscreen must not keep the traffic-light offset on the
-// sidebar header controls.
-//
-// On the macOS desktop layout the Search/Settings/toggle cluster is pinned in
-// the title-bar strip at left:5.5rem so it clears the traffic lights (the
-// [data-electron-mac] rules in web/src/index.css). macOS fullscreen removes
-// the traffic lights, so the sidebar's header content must realign with the
-// window's left edge instead of keeping an empty 5.5rem strip.
-//
-// Journey: boot into the shell on the macOS layout → controls sit beside the
-// traffic lights (88px from the left edge) → enter fullscreen → the header
-// content must start near the left edge; leaving fullscreen restores the
-// clearance.
-//
-// Runs on the real Electron main process + preload against a local server.
-// The macOS layout is engaged the same way tests/e2e_ui does on non-mac
-// hosts: a Macintosh userAgent override (isMacElectronShell() is UA-keyed),
-// so the journey is drivable on Linux CI where window fullscreen still fires
-// Electron's enter-full-screen/leave-full-screen.
-//
-// Run: `node --test e2e/desktop_fullscreen_sidebar_controls.e2e.js`
-// from web/electron, AFTER building the SPA (pnpm --filter web run build).
-// Headless boxes need `xvfb-run -a` and OMNIGENT_PW_NO_SANDBOX=1.
+// Real Electron fullscreen journey for the macOS sidebar header layout.
+// A Macintosh UA activates that layout on non-macOS hosts; fullscreen events
+// still come from Electron's main process.
 
 "use strict";
 
@@ -40,11 +20,9 @@ const {
 const deps = desktopDepsAvailable();
 const RECORD_DIR = path.join(__dirname, "recordings", "desktop-fullscreen-sidebar-controls");
 
-// The 5.5rem clearance the cluster keeps for the traffic lights while
-// windowed; anything at or past it in fullscreen is the reported dead gap.
+// The windowed traffic-light clearance is 5.5rem.
 const TRAFFIC_LIGHT_CLEARANCE_PX = 88;
-// "Aligned with the sidebar content": the leftmost header control (or the
-// restored brand) must start well inside the old clearance.
+// Distinguish left alignment from the old 88px gap.
 const FULLSCREEN_ALIGNED_MAX_X = 48;
 
 /** The visible main window (firstWindow() can race to a hidden helper). */
@@ -52,7 +30,6 @@ async function mainWindow(electronApp, firstWindow) {
   for (let i = 0; i < 120; i++) {
     const page = electronApp.windows().find((p) => p.url().startsWith("http"));
     if (page) return page;
-    // Poll: window creation order is not deterministic at boot.
     // oxlint-disable-next-line no-await-in-loop
     await new Promise((resolve) => {
       setTimeout(resolve, 500);
@@ -61,11 +38,7 @@ async function mainWindow(electronApp, firstWindow) {
   return firstWindow;
 }
 
-/**
- * Left edge (x) of the leftmost visible sidebar-header element: the title-bar
- * cluster, the sidebar brand, or the in-sidebar actions cluster — whichever a
- * fix keeps or restores. Null when none is visible.
- */
+/** Smallest x among visible header controls, or null if none is visible. */
 async function leftmostHeaderControlX(window) {
   const candidates = [
     window.locator(".electron-sidebar-header-actions"),
@@ -74,7 +47,6 @@ async function leftmostHeaderControlX(window) {
   ];
   let min = null;
   for (const locator of candidates) {
-    // Sequential probing keeps the failure message attributable per locator.
     // oxlint-disable no-await-in-loop
     if (!(await locator.isVisible().catch(() => false))) continue;
     const box = await locator.boundingBox();
@@ -88,7 +60,6 @@ async function leftmostHeaderControlX(window) {
 async function waitForValue(probe, predicate, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let value = await probe();
-  // Polling is inherently sequential.
   /* oxlint-disable no-await-in-loop */
   while (!predicate(value) && Date.now() < deadline) {
     await new Promise((resolve) => {
@@ -118,7 +89,6 @@ describe(
     });
 
     it("realigns the sidebar header controls when the window goes fullscreen", async () => {
-      // Pre-seed the server: the bug is past connect, boot straight into the shell.
       const {
         electronApp,
         window: firstWindow,
@@ -172,8 +142,7 @@ describe(
           `window did not enter fullscreen: ${JSON.stringify(entered)}`,
         );
 
-        // Fullscreen: no traffic lights, so the header content must start
-        // near the window's left edge instead of leaving the 5.5rem gap.
+        // Fullscreen removes the lights and their 5.5rem gap.
         const fullscreenX = await waitForValue(
           () => leftmostHeaderControlX(window),
           (x) => x !== null && x < FULLSCREEN_ALIGNED_MAX_X,
@@ -212,8 +181,7 @@ describe(
           `windowed traffic-light clearance not restored, got x=${restoredBox.x}`,
         );
       } finally {
-        // Close first — video flushes on close — so a FAILING run (the repro
-        // use of this test) still yields the before-fix footage.
+        // Close first so failed runs still produce a recording.
         await electronApp.close();
         await stopDisplayCapture();
         saved = saveRecording(RECORD_DIR, "fullscreen-sidebar-controls");

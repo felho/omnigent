@@ -1,19 +1,6 @@
-"""E2E: macOS-shell fullscreen drops the traffic-light clearance.
+"""Check macOS sidebar-header clearance across fullscreen transitions.
 
-The macOS desktop layout pins the sidebar header cluster (toggle/Search/
-Settings) in the title-bar strip at ``left: 5.5rem`` so it clears the traffic
-lights (the ``[data-electron-mac]`` rules in ``web/src/index.css``). Native
-fullscreen removes the lights, so the cluster must realign with the window's
-left edge instead of keeping an empty 5.5rem strip; leaving fullscreen
-restores the clearance.
-
-The e2e_ui harness runs the SPA in plain Chromium, not Electron, so we inject
-a scriptable ``window.omnigentDesktop`` stub (before any app script runs) with
-the fullscreen half of the preload bridge, and drive enter/leave transitions
-from Python via ``window.__omniFullScreen.set(...)`` -- modelling the main
-process's ``omnigent:full-screen-changed`` forwarding without a real window.
-The full native path (real ``setFullScreen`` on the Electron main process) is
-covered by ``web/electron/e2e/desktop_fullscreen_sidebar_controls.e2e.js``.
+Chromium models the Electron bridge; the native journey is tested separately.
 """
 
 from __future__ import annotations
@@ -24,10 +11,7 @@ import os
 from playwright.sync_api import Page, expect
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-# Stands in for the Electron preload bridge, macOS flavour: the Macintosh UA
-# engages isMacElectronShell()'s layout, and the fullscreen methods mirror
-# preload.js. Base native methods are guarded no-ops so unrelated calls don't
-# throw under the stub.
+# The macOS UA activates the desktop layout; other bridge methods stay inert.
 _MAC_SHELL_INIT_SCRIPT = """
 (() => {
   Object.defineProperty(navigator, "platform", { value: "MacIntel" });
@@ -103,8 +87,7 @@ def test_fullscreen_realigns_sidebar_header_controls(page: Page, live_server: st
     )
     _linger(page)
 
-    # The window goes fullscreen: the lights are gone, so the cluster must
-    # realign with the left edge instead of keeping the dead 5.5rem strip.
+    # The cluster realigns when fullscreen hides the traffic lights.
     page.evaluate("window.__omniFullScreen.set(true)")
     with contextlib.suppress(PlaywrightTimeoutError):
         _wait_for_cluster_x(page, "<", FULLSCREEN_ALIGNED_MAX_X)

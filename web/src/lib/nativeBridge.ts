@@ -865,11 +865,7 @@ export function onHostStatusChanged(callback: () => void): () => void {
   }
 }
 
-/**
- * Whether the Electron shell's window is currently native-fullscreen.
- * Resolves false outside the shell and on shells that predate the bridge —
- * those keep the windowed (traffic-light clearance) layout.
- */
+/** Read native fullscreen state; older shells and browsers remain windowed. */
 export async function getDesktopFullScreen(): Promise<boolean> {
   const electron = electronApi();
   if (!electron?.isFullScreen) return false;
@@ -881,10 +877,7 @@ export async function getDesktopFullScreen(): Promise<boolean> {
   }
 }
 
-/**
- * Subscribe to the desktop window's native fullscreen transitions. Returns a
- * no-op unsubscribe outside the shell and on shells without the bridge.
- */
+/** Subscribe to fullscreen transitions; older shells and browsers return a no-op. */
 export function onDesktopFullScreenChanged(callback: (fullScreen: boolean) => void): () => void {
   const electron = electronApi();
   if (!electron?.onFullScreenChanged) return () => {};

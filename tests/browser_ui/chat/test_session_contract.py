@@ -6,7 +6,7 @@ import base64
 
 from playwright.sync_api import Page, expect
 
-from tests.browser_ui.chat.session_contract import ChatSessionContract, model_option
+from tests.browser_ui.chat.session_contract import ChatSessionContract, message_item, model_option
 
 _PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="
@@ -117,6 +117,29 @@ def test_contract_can_hold_and_release_session_skills(
     assert response_info.value.json() == {
         "skills": [{"name": "review", "description": "Review the current change."}]
     }
+
+
+def test_contract_set_items_replaces_history_with_copies(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    chat = chat_session_contract
+    chat.set_items([message_item("old", "user", "Old", response_id="old-response")])
+    replacement = message_item("replacement", "user", "New", response_id="new-response")
+    chat.set_items([replacement])
+    replacement["role"] = "assistant"
+    page.goto(chat.url)
+
+    history = page.evaluate(
+        """async sessionId => {
+            const response = await fetch(`/v1/sessions/${sessionId}/items`);
+            return response.json();
+        }""",
+        chat.session_id,
+    )
+
+    assert [item["id"] for item in history["data"]] == ["replacement"]
+    assert history["data"][0]["role"] == "user"
 
 
 def test_contract_records_and_persists_session_patches(

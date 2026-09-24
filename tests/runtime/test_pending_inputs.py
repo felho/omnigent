@@ -483,3 +483,40 @@ def test_claim_forward_lets_exactly_one_caller_paste() -> None:
     # A rolled-back entry no longer blocks a later fresh delivery.
     pending_inputs.resolve("conv_a", pid)
     assert pending_inputs.claim_forward("conv_a", pid) is True
+
+
+def test_dispatch_claim_tracks_delivery_not_persistence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A retry after a failed forward wins the claim; after a success it does not.
+
+    The SDK path persists the item before forwarding, so the store's dedup
+    alone would answer a retry of a rejected forward with success. The claim
+    distinguishes stored from delivered: a released (failed) claim lets the
+    retry dispatch, a finished one does not, an overlapping one waits, and a
+    claim abandoned mid-flight goes stale.
+    """
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+    stable = "b" * 32
+
+    assert pending_inputs.claim_dispatch("conv_a", stable) == "won"
+    assert pending_inputs.claim_dispatch("conv_a", stable) == "in_flight"
+    pending_inputs.finish_dispatch("conv_a", stable, ok=False)
+    assert pending_inputs.claim_dispatch("conv_a", stable) == "won"
+    pending_inputs.finish_dispatch("conv_a", stable, ok=True)
+    assert pending_inputs.claim_dispatch("conv_a", stable) == "done"
+    assert pending_inputs.claim_dispatch("conv_other", stable) == "won"
+
+    # Abandoned in flight: stale after the budget, so a retry is not blocked forever.
+    clock["t"] = 1000.0 + pending_inputs._DISPATCH_IN_FLIGHT_TTL_S - 1
+    assert pending_inputs.claim_dispatch("conv_other", stable) == "in_flight"
+    clock["t"] = 1000.0 + pending_inputs._DISPATCH_IN_FLIGHT_TTL_S + 1
+    assert pending_inputs.claim_dispatch("conv_other", stable) == "won"
+
+
+def test_forget_committed_drops_a_remembered_submission() -> None:
+    """A submission remembered before its append is forgotten when the append deduplicated."""
+    pending_inputs.remember_committed("conv_a", "a" * 32, "item_a")
+    pending_inputs.forget_committed("conv_a", "a" * 32)
+    assert pending_inputs.committed_item_id("conv_a", "a" * 32) is None
+    pending_inputs.forget_committed("conv_a", "z" * 32)  # unknown: no-op

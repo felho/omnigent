@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -12174,5 +12175,159 @@ async def test_native_concurrent_duplicate_posts_paste_once(
                 r for r in runner_requests if r.method == "POST" and r.url.path == events_url
             ]
             assert len(pastes) == 1
+        finally:
+            pending_inputs.reset_for_tests()
+
+
+async def test_retry_after_rejected_forward_dispatches_again(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A re-send of a message whose first forward the runner rejected forwards again.
+
+    The item was persisted before the failed forward, so the store's dedup
+    alone would answer the retry with success and never run the turn. The
+    dispatch claim is released on failure, so the retry reaches the runner.
+    """
+    from omnigent.runtime import pending_inputs
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    forwards: list[httpx.Request] = []
+
+    def runner_handler(request: httpx.Request) -> httpx.Response:
+        forwards.append(request)
+        if len(forwards) == 1:
+            return httpx.Response(500, json={"detail": "runner hiccup"})
+        return httpx.Response(202, json={"queued": True})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(runner_handler), base_url="http://runner"
+    )
+
+    async def get_runner_client(_session_id: str, _runner_router: object) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr("omnigent.server.routes.sessions._get_runner_client", get_runner_client)
+    stable_id = "a" * 32
+    message = {
+        "type": "message",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "deliver me eventually"}],
+            "stable_id": stable_id,
+        },
+    }
+    pending_inputs.reset_for_tests()
+    try:
+        first = await client.post(f"/v1/sessions/{session['id']}/events", json=message)
+        assert first.status_code >= 400, first.text
+        second = await client.post(f"/v1/sessions/{session['id']}/events", json=message)
+        assert second.status_code == 202, second.text
+        third = await client.post(f"/v1/sessions/{session['id']}/events", json=message)
+        assert third.status_code == 202, third.text
+    finally:
+        await fake_runner.aclose()
+        pending_inputs.reset_for_tests()
+
+    # Rejected, then delivered once; the third POST found the delivery done.
+    assert len(forwards) == 2
+    assert second.json()["item_id"] == stable_id
+    assert third.json()["item_id"] == stable_id
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    assert [item["id"] for item in items if item["type"] == "message"] == [stable_id]
+
+
+async def test_native_duplicate_during_transcript_append_does_not_repaste(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A re-send arriving while the mirrored item is being appended pastes nothing.
+
+    Draining the pending entry and appending the committed item are separated
+    by an await. A duplicate POST in that window must still resolve to the
+    committed id (remembered before the await) instead of forwarding.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    runner_requests: list[httpx.Request] = []
+
+    def runner_handler(request: httpx.Request) -> httpx.Response:
+        runner_requests.append(request)
+        return httpx.Response(202, json={})
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._ensure_native_terminal_ready",
+        AsyncMock(return_value=_NativeTerminalEnsureOutcome(error=None)),
+    )
+    monkeypatch.setattr(
+        sessions_module, "_ensure_runner_session_initialized", AsyncMock(return_value=True)
+    )
+    stable_id = "f" * 32
+    content = [{"type": "input_text", "text": "mirror me slowly"}]
+    message = {
+        "type": "message",
+        "data": {"role": "user", "content": content, "stable_id": stable_id},
+    }
+    pending_inputs.reset_for_tests()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner_handler), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(orchestration, "_get_runner_client", AsyncMock(return_value=runner))
+        agent = await create_test_agent(client, name="claude-native-ui")
+        created = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "labels": {"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"},
+            },
+        )
+        assert created.status_code == 201, created.text
+        session_id = created.json()["id"]
+        events_url = f"/v1/sessions/{session_id}/events"
+        try:
+            first = await client.post(events_url, json=message)
+            assert first.status_code == 202, first.text
+            pastes_after_first = sum(
+                1 for r in runner_requests if r.method == "POST" and r.url.path == events_url
+            )
+            assert pastes_after_first == 1
+
+            # Slow the append so the duplicate lands inside the drain→commit window.
+            real_append = SqlAlchemyConversationStore.append
+
+            def slow_append(self: object, *args: object, **kwargs: object) -> object:
+                time.sleep(0.2)
+                return real_append(self, *args, **kwargs)  # type: ignore[arg-type]
+
+            monkeypatch.setattr(SqlAlchemyConversationStore, "append", slow_append)
+            mirror = client.post(
+                events_url,
+                json={
+                    "type": "external_conversation_item",
+                    "data": {
+                        "item_type": "message",
+                        "item_data": {"role": "user", "content": content},
+                    },
+                },
+            )
+
+            async def late_duplicate() -> httpx.Response:
+                await asyncio.sleep(0.05)
+                return await client.post(events_url, json=message)
+
+            echoed, duplicate = await asyncio.gather(mirror, late_duplicate())
+            assert echoed.status_code == 202, echoed.text
+            assert duplicate.status_code == 202, duplicate.text
+            assert duplicate.json() == {"queued": True, "item_id": echoed.json()["item_id"]}
+            pastes = sum(
+                1 for r in runner_requests if r.method == "POST" and r.url.path == events_url
+            )
+            assert pastes == 1
         finally:
             pending_inputs.reset_for_tests()

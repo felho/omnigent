@@ -2533,6 +2533,13 @@ async def _persist_external_conversation_item(
             # source_id from the forwarder takes precedence when both are set.
             if drained.stable_id is not None and item.stable_id is None:
                 item = item.model_copy(update={"stable_id": drained.stable_id})
+            # The entry is gone from the queue from here on, and the append
+            # below is awaited. The store uses ``item.stable_id`` as the item
+            # id, so the committed id is known now: remember it before the
+            # await, or a re-send arriving meanwhile finds neither a pending
+            # entry nor a committed id and pastes again.
+            if drained.stable_id is not None and item.stable_id is not None:
+                pending_inputs.remember_committed(session_id, drained.stable_id, item.stable_id)
         elif item.created_by is None and created_by is not None:
             # No pending entry — direct terminal input. Fall back to the
             # identity authenticated on the forwarder's own request.
@@ -2562,6 +2569,9 @@ async def _persist_external_conversation_item(
         for entry in reversed([*skipped_kiro_pending, drained]):
             if entry is not None:
                 pending_inputs.restore(session_id, entry)
+        # The restored entry belongs to a later message; its id is not committed.
+        if drained is not None and drained.stable_id is not None:
+            pending_inputs.forget_committed(session_id, drained.stable_id)
         return persisted.id
     # Not a duplicate: a drained web submission is now committed, so a client
     # retry of its stable_id resolves to this item instead of a second paste.
@@ -5408,16 +5418,21 @@ async def _forward_event_to_runner(
         session_id,
         [item],
     )
-    if persisted_items[0].deduplicated:
-        # The first delivery already forwarded this message; forwarding again
-        # would run the turn twice. Hand back the committed item instead.
-        _logger.info(
-            "Duplicate message POST for session=%s stable_id=%s; not re-dispatching",
-            session_id,
-            web_stable_id,
-            extra={"session_id": session_id},
-        )
-        return persisted_items[0].id
+    if web_stable_id is not None:
+        # The item is persisted before it is forwarded, so "already stored" is
+        # not "already delivered": a re-send after a rejected forward must
+        # dispatch again, while one that overlaps or follows a successful
+        # forward must not run the turn twice.
+        claim = pending_inputs.claim_dispatch(session_id, web_stable_id)
+        if claim != "won":
+            _logger.info(
+                "Duplicate message POST for session=%s stable_id=%s (%s); not re-dispatching",
+                session_id,
+                web_stable_id,
+                claim,
+                extra={"session_id": session_id},
+            )
+            return persisted_items[0].id
     await _seed_missing_title_from_user_message(
         conv,
         item,
@@ -5885,12 +5900,16 @@ async def _forward_event_to_runner(
                 _reject_error,
                 failure_origin="runner_rejected_event",
             )
+            if web_stable_id is not None:
+                pending_inputs.finish_dispatch(session_id, web_stable_id, ok=False)
             raise OmnigentError(
                 f"Runner rejected the message: {_reject_detail}",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
+        if web_stable_id is not None:
+            pending_inputs.finish_dispatch(session_id, web_stable_id, ok=True)
         _publish_input_consumed(session_id, persisted_items[0])
         _logger.info(
             "turn dispatched to runner for session=%s",
@@ -5996,6 +6015,8 @@ async def _forward_event_to_runner(
             extra={"session_id": session_id},
         )
         _publish_status(session_id, "idle")
+        if web_stable_id is not None:
+            pending_inputs.finish_dispatch(session_id, web_stable_id, ok=False)
         raise OmnigentError(
             "Runner is unreachable; message was persisted but could not be delivered. "
             "The runner may be restarting — retry or spawn a new session.",

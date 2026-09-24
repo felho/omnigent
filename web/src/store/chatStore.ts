@@ -1333,9 +1333,16 @@ interface FailedSend {
  */
 const failedSends = new Map<string, FailedSend>();
 
-/** A fetch that produced no HTTP response at all (network down, connection reset). */
+/**
+ * A failure that says nothing about whether the server took the message: a
+ * fetch that produced no HTTP response at all (network down, connection reset),
+ * or a server-side 5xx without a definitive code — the request may have been
+ * persisted before the error. Only 4xx and the runner-unavailable 503 are
+ * definitive refusals.
+ */
 function isTransportError(err: unknown): boolean {
-  return !(err instanceof ApiError) && err instanceof TypeError;
+  if (err instanceof ApiError) return err.status >= 500 && err.code !== RUNNER_UNAVAILABLE_CODE;
+  return err instanceof TypeError;
 }
 
 function settleSendIdle(set: Setter): void {
@@ -2525,6 +2532,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Native model startup failed or timed out while the draft was still held
     // locally: that path restores the draft itself, so the send is not retained.
     let modelGateFailed = false;
+    // The server rejected an attachment (a 4xx from the upload): the message
+    // needs editing, so it is handed back to the composer, not retained.
+    let uploadRejected = false;
     let initialDispatched = false;
     const initialSendPending = () => {
       const id = postedSessionId ?? submitConversationId;
@@ -2570,7 +2580,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // otherwise). Plain text (if any) appended last. uploadFileBlock reuses
         // a prior successful upload of the same File so a retry after a
         // post-phase failure doesn't re-upload — and orphan — blobs that landed.
-        const fileBlocks = await uploadFileBlocks(sessionId, files ?? []);
+        let fileBlocks: ContentBlock[];
+        try {
+          fileBlocks = await uploadFileBlocks(sessionId, files ?? []);
+        } catch (uploadErr) {
+          // The server refused an attachment: the message needs editing, so it
+          // goes back to the composer with its files rather than to Retry.
+          if (!isTransportError(uploadErr)) uploadRejected = true;
+          throw uploadErr;
+        }
+        // Cancelled while the upload was in flight: don't post it. A codex
+        // `/side` has no bubble of its own to check.
+        if (
+          !opensSideChat &&
+          !setterForState(sessionId)?.pendingUserMessages.some((p) => p.tempId === tempId)
+        ) {
+          if (!alreadyStreaming) settleSendIdle(setterFor(sessionId));
+          return;
+        }
         const serverContent: ContentBlock[] = [
           ...fileBlocks,
           ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
@@ -2691,17 +2718,19 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // it gave one, and leaves the composer alone. A bind failure has no
       // session to retry against, and a caller with its own error UX wants
       // the rollback, so those still hand the text back as a draft.
-      // Two flows keep their own recovery: a draft the native model gate turned
-      // away (startup failed or timed out) restores itself, and a navigate-first
-      // send whose session never bound has nothing to retry against. Everything
-      // else, including a failed re-bind of a dropped stream on an existing
-      // conversation, is re-sendable.
+      // Three cases keep their own recovery: a draft the native model gate
+      // turned away (startup failed or timed out) restores itself, a rejected
+      // attachment needs editing so the message goes back to the composer, and
+      // a navigate-first send whose session never bound has nothing to retry
+      // against. Everything else, including a failed re-bind of a dropped
+      // stream on an existing conversation, is re-sendable.
       let retained = false;
       if (
         deliver !== null &&
         failTarget !== null &&
         !callerHandlesError &&
         !modelGateFailed &&
+        !uploadRejected &&
         (postedSessionId !== null || opts?.reusePendingTempId === undefined)
       ) {
         retained = true;

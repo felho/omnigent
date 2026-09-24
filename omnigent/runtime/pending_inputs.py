@@ -192,6 +192,13 @@ _COMMITTED_MAX_PER_CONVERSATION = 256
 # Insertion-ordered so the cap above evicts the oldest submission.
 _committed: WorkspaceScopedCache[str, dict[str, tuple[str, float]]] = WorkspaceScopedCache()
 
+# SDK-path dispatch state per web submission: conversation_id →
+# {stable_id: ("in_flight" | "done", since)}. A forward that never finished
+# (server crash mid-request) must not block retries forever, so an in-flight
+# claim goes stale after the runner forward budget with margin.
+_dispatch: WorkspaceScopedCache[str, dict[str, tuple[str, float]]] = WorkspaceScopedCache()
+_DISPATCH_IN_FLIGHT_TTL_S: float = 180.0
+
 
 def _evict_stale_locked(conversation_id: str, now: float) -> None:
     """
@@ -376,6 +383,76 @@ def committed_item_id(conversation_id: str, stable_id: str) -> str | None:
             return None
         found = entries.get(stable_id)
         return None if found is None else found[0]
+
+
+def forget_committed(conversation_id: str, stable_id: str) -> None:
+    """
+    Drop a remembered submission (its persist turned out to be a duplicate).
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param stable_id: The client's 32-char hex submission id.
+    """
+    with _lock:
+        entries = _committed.get(conversation_id)
+        if entries is None:
+            return
+        entries.pop(stable_id, None)
+        if not entries:
+            _committed.pop(conversation_id, None)
+
+
+def claim_dispatch(conversation_id: str, stable_id: str) -> str:
+    """
+    Claim the runner dispatch of an SDK-path web submission.
+
+    The user item is persisted before it is forwarded, and the store dedupes
+    a re-send on ``stable_id``. Whether the re-send must forward again depends
+    on what happened to the first delivery, which only this state knows:
+
+    - ``"won"``: no delivery is in flight or done, the caller forwards.
+    - ``"in_flight"``: another request is forwarding right now.
+    - ``"done"``: a forward already succeeded; the message is with the runner.
+
+    A failed forward releases its claim via :func:`finish_dispatch`, so the
+    next retry wins and dispatches. An in-flight claim older than
+    :data:`_DISPATCH_IN_FLIGHT_TTL_S` counts as abandoned.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param stable_id: The client's 32-char hex submission id.
+    :returns: ``"won"``, ``"in_flight"`` or ``"done"``.
+    """
+    now = _now()
+    with _lock:
+        entries = _dispatch.setdefault(conversation_id, {})
+        found = entries.get(stable_id)
+        if found is not None:
+            state, since = found
+            if state == "done" and now - since <= _COMMITTED_TTL_S:
+                return "done"
+            if state == "in_flight" and now - since <= _DISPATCH_IN_FLIGHT_TTL_S:
+                return "in_flight"
+        entries[stable_id] = ("in_flight", now)
+        return "won"
+
+
+def finish_dispatch(conversation_id: str, stable_id: str, *, ok: bool) -> None:
+    """
+    Record the outcome of a dispatch claimed with :func:`claim_dispatch`.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param stable_id: The client's 32-char hex submission id.
+    :param ok: ``True`` when the runner accepted the forward (later re-sends
+        answer without dispatching); ``False`` releases the claim so a retry
+        dispatches again.
+    """
+    with _lock:
+        entries = _dispatch.setdefault(conversation_id, {})
+        if ok:
+            entries[stable_id] = ("done", _now())
+        else:
+            entries.pop(stable_id, None)
+        if not entries:
+            _dispatch.pop(conversation_id, None)
 
 
 def _evict_stale_committed_locked(conversation_id: str, now: float) -> None:
@@ -614,3 +691,4 @@ def reset_for_tests() -> None:
     with _lock:
         _pending.clear()
         _committed.clear()
+        _dispatch.clear()

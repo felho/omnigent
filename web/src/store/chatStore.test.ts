@@ -2906,9 +2906,11 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(state.blocks.filter((b) => b.type === "error")).toHaveLength(0);
   });
 
-  it("carries a non-runner send failure's own message onto the bubble", async () => {
-    // A generic failure (not runner_unavailable) must still become visible,
-    // using the server-provided message and code so it isn't swallowed.
+  it("carries a definitive refusal's own message onto the bubble, but not a plain 5xx", async () => {
+    // A 4xx is the server's final word and its message is shown at once. A
+    // 5xx may have arrived after the message was persisted, so it says
+    // nothing definitive: the bubble is failed without a reason and goes
+    // through the same check re-send as a thrown fetch.
     useChatStore.setState({
       conversationId: "conv_existing",
       abortController: new AbortController(),
@@ -2920,8 +2922,8 @@ describe("chatStore — send (first-send ordering)", () => {
       const url = String(input);
       if (url.endsWith("/v1/sessions/conv_existing/events")) {
         return mockResponse(
-          { error: { code: "internal_error", message: "boom on the server" } },
-          { ok: false, status: 500 },
+          { error: { code: "invalid_input", message: "boom on the server" } },
+          { ok: false, status: 400 },
         );
       }
       return defaultFetchHandler(input, init);
@@ -2935,6 +2937,16 @@ describe("chatStore — send (first-send ordering)", () => {
       attempts: 1,
     });
     expect(state.blocks.filter((b) => b.type === "error")).toHaveLength(0);
+
+    useChatStore.setState({ pendingUserMessages: [], blocks: [] });
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+        return mockResponse({ error: { message: "upstream hiccup" } }, { ok: false, status: 502 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().send("hi again", "agent_xyz");
+    expect(useChatStore.getState().pendingUserMessages[0]!.failed).toEqual({ attempts: 1 });
   });
 
   it("routes a send failure to opts.onError and suppresses the default error block + draft", async () => {
@@ -3198,7 +3210,7 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(real.status).toBe("idle");
     // The failure is surfaced on the retained bubble, not swallowed.
     expect(real.pendingUserMessages).toHaveLength(1);
-    expect(real.pendingUserMessages[0]!.failed).toEqual({ reason: "boom", attempts: 1 });
+    expect(real.pendingUserMessages[0]!.failed).toEqual({ attempts: 1 });
     expect(real.blocks.filter((b) => b.type === "error")).toHaveLength(0);
   });
 
@@ -5223,10 +5235,10 @@ describe("chatStore — send (file attachments)", () => {
     expect(state.pendingUserMessages[0]!.failed).toBeUndefined();
   });
 
-  it("keeps the message in the transcript when the upload is rejected", async () => {
+  it("hands the message back for retry when the upload is rejected", async () => {
     // A 415 on an unsupported attachment must not swallow the typed text: the
-    // bubble stays, carrying the server's reason (not "415") with Retry and
-    // Cancel, and nothing is pushed back into the composer.
+    // optimistic bubble rolls back, so `failedSendDraft` is the only thing
+    // left holding it. The banner carries the server's reason, not "415".
     useChatStore.setState({
       conversationId: "conv_existing",
       abortController: new AbortController(),
@@ -5250,12 +5262,17 @@ describe("chatStore — send (file attachments)", () => {
     await useChatStore.getState().send("summarize these photos", "agent_xyz", [zip]);
 
     const state = useChatStore.getState();
-    expect(state.pendingUserMessages).toHaveLength(1);
-    expect(state.pendingUserMessages[0]!.failed?.reason).toContain(
-      "Unsupported attachment type 'application/zip'",
-    );
-    expect(state.failedSendDraft).toBeNull();
-    expect(state.blocks.filter((b) => b.type === "error")).toHaveLength(0);
+    // Optimistic bubble rolled back — the send never reached the server.
+    expect(state.pendingUserMessages).toEqual([]);
+    expect(state.failedSendDraft).toEqual({
+      conversationId: "conv_existing",
+      text: "summarize these photos",
+      files: [zip],
+      stableId: expect.any(String),
+    });
+    const error = state.blocks.at(-1) as { type: string; message: string };
+    expect(error.type).toBe("error");
+    expect(error.message).toContain("Unsupported attachment type 'application/zip'");
   });
 
   it("keeps quote provenance client-side and retains a refused send in the transcript", async () => {
@@ -5499,6 +5516,35 @@ describe("chatStore — send (failed send)", () => {
     expect(bodies).toHaveLength(1);
     expect(state.pendingUserMessages[0]).toMatchObject({ posted: true });
     expect(state.pendingUserMessages[0]!.failed).toBeUndefined();
+  });
+
+  it("does not post a message that was cancelled while its upload was in flight", async () => {
+    let finishUpload: (() => void) | undefined;
+    const bodies: unknown[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/files") && init?.method === "POST") {
+        return new Promise<Response>((resolve) => {
+          finishUpload = () => resolve(mockResponse({ file_id: "file_1", filename: "a.png" }));
+        });
+      }
+      if (url.endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+        bodies.push(JSON.parse(String(init.body)));
+        return Promise.resolve(mockResponse({ queued: true }));
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const file = new File(["bytes"], "a.png", { type: "image/png" });
+    const sending = useChatStore.getState().send("with a picture", "agent_xyz", [file]);
+    await vi.advanceTimersByTimeAsync(0);
+    const bubble = useChatStore.getState().pendingUserMessages[0]!;
+    useChatStore.getState().cancelPendingSend(bubble.tempId);
+    finishUpload?.();
+    await sending;
+
+    expect(bodies).toEqual([]);
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(useChatStore.getState().status).toBe("idle");
   });
 
   it("does not revive a remembered send the server already shows", () => {

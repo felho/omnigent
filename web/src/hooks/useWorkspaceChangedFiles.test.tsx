@@ -277,10 +277,6 @@ describe("useWorkspaceChangedFiles gating", () => {
   });
 
   it("holds fetches while host liveness is unknown for an offline runner", async () => {
-    // Transient window (e.g. a stream push flipped the runner before host
-    // liveness resolved): the runner is known-offline, so firing now would
-    // just 503 (and get logged server-side). Hold until the host resolves;
-    // if it comes up `true` the host tunnel serves the panel.
     onlineMock.mockReturnValue(false);
     hostOnlineMock.mockReturnValue(undefined);
     fetchMock
@@ -295,7 +291,6 @@ describe("useWorkspaceChangedFiles gating", () => {
     await flushMicrotasks();
     expect(fetchMock).not.toHaveBeenCalled();
 
-    // Host resolves up → the held queries fire over the host tunnel.
     hostOnlineMock.mockReturnValue(true);
     view.rerender(
       <Wrap>
@@ -327,11 +322,6 @@ describe("useWorkspaceChangedFiles gating", () => {
   });
 
   it("holds fetches until runner liveness resolves, then fires", async () => {
-    // Opening a session before the first /health resolves must not fan
-    // out resource GETs: a session whose runner went away (host reboot,
-    // idle-reap) would 503 on every one, each also logged server-side.
-    // The open session is always in the health fallback poll, so the
-    // hold lasts one /health round-trip; on `true` the fetches fire.
     onlineMock.mockReturnValue(undefined);
     fetchMock
       .mockResolvedValueOnce(environmentResponse())
@@ -670,9 +660,6 @@ describe("useWorkspaceDirectory gating", () => {
   });
 
   it("holds the batched directory listings until runner liveness resolves", async () => {
-    // The virtualized tree's batched form shares the singular hook's cache
-    // and must share its gate: expanded dirs on a fresh open must not fire
-    // before the first /health resolves.
     onlineMock.mockReturnValue(undefined);
 
     render(
@@ -1176,9 +1163,6 @@ describe("runner-offline retry liveness gate", () => {
   });
 
   it("does not retry a 503 for an old idle session served over the host tunnel", async () => {
-    // The runner is known-offline but the host can serve, so the query fires
-    // (queries never fire while liveness is unknown - the serveable gate
-    // holds them). An old idle session isn't recovering: one 503, no storm.
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-06-23T00:00:00Z"));
     onlineMock.mockReturnValue(false);
@@ -1193,9 +1177,6 @@ describe("runner-offline retry liveness gate", () => {
   });
 
   it("retries while a fresh session is cold-booting", async () => {
-    // Cold boot: the server reports the runner offline until it registers,
-    // and the host tunnel serves meanwhile. The 503 is worth retrying - the
-    // runner is coming up.
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-06-23T00:00:00Z"));
     onlineMock.mockReturnValue(false);
@@ -1212,8 +1193,6 @@ describe("runner-offline retry liveness gate", () => {
   });
 
   it("retries while the session snapshot is loading", async () => {
-    // Session age unknown (snapshot still loading) -> assume recovering, so
-    // a 503 on a query that fired (runner offline, host serving) retries.
     vi.useFakeTimers();
     onlineMock.mockReturnValue(false);
     hostOnlineMock.mockReturnValue(true);

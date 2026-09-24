@@ -404,12 +404,7 @@ export function useTerminals(
       for (const t of fetched) byId.set(t.id, t);
       return [...byId.values()];
     },
-    // Hold the HTTP seed until the runner is *known* online. The endpoint is
-    // runner-proxied, so firing while liveness is still unknown (a fresh open
-    // of a session whose runner went away) fans out 503s that resolve
-    // nothing; once the first /health lands `true`, `enabled` flips and the
-    // seed fetch runs. SSE deltas land in the cache regardless (setQueryData
-    // works on a disabled query), so live events are never delayed.
+    // Hold the runner-proxied seed until online; SSE cache writes still land.
     enabled: conversationId !== null && runnerOnline === true,
     staleTime: Infinity,
     // One light retry covers a transient network blip during the

@@ -1,19 +1,4 @@
-"""E2E: opening an offline-runner session must not fan out resource 503s.
-
-The ``useSessionRunnerOnline`` gate that stops the steady-state resource-poll
-storm on an offline-runner session is tri-state: ``undefined`` (not yet
-polled) / ``true`` / ``false``, and consumers only block on ``=== false``. So
-while the first ``/health`` poll is still in flight after opening the session,
-the environment/terminal resource fetches fire anyway — and every one of them
-comes back 503 ``runner_unavailable``, hammering a runner the server already
-knows is offline (each hit also lands a per-request server-side WARN).
-
-This drives the real journey: bind a session to the live runner, SIGKILL the
-runner (host reboot / idle-reap), open ``/c/<id>`` in the browser, and record
-every session-scoped response for a window after load. The regression
-assertion is that NO runner-proxied ``/resources/`` request 503s during the
-open — the client must hold those fetches until the runner is known online.
-"""
+"""Check that opening an offline-runner session does not fan out resource 503s."""
 
 from __future__ import annotations
 
@@ -26,23 +11,14 @@ from urllib.parse import urlparse
 import httpx
 from playwright.sync_api import Page
 
-# How long to watch network traffic after the session page loads. Long
-# enough to cover the initial fan-out AND the first react-query retries
-# (observed at ~1s and ~3s after load), short enough to keep the test fast.
+# Include the initial fetches and first query retries.
 _OBSERVE_WINDOW_MS = 10_000
 _OFFLINE_POLL_ATTEMPTS = 20
 _OFFLINE_POLL_INTERVAL_S = 0.5
 
 
 def _find_runner_pids() -> list[int]:
-    """Find this test run's runner PIDs (``omnigent.runner._entry``).
-
-    The fixture spawns the runner as a child of the pytest process, so scope
-    the command-line match to our own children (``-P``) — a bare ``pgrep -f``
-    would match (and get killed as) any other runner on the machine.
-
-    :returns: List of runner PIDs (may be empty).
-    """
+    """Find only this pytest process's child runners before killing them."""
     result = subprocess.run(
         ["pgrep", "-P", str(os.getpid()), "-f", "omnigent[.]runner[.]_entry"],
         capture_output=True,
@@ -57,25 +33,10 @@ def test_open_offline_session_no_resource_503_burst(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Opening a session whose runner is offline must not 503-storm.
-
-    Kills the session's runner, waits until the server reports it offline
-    (so this is the steady "user comes back after a host reboot" open, with
-    no race about the server's own knowledge), then loads ``/c/<id>`` and
-    records every response for the session. Any 503 from a runner-proxied
-    ``/resources/`` endpoint during the observation window is the bug: the
-    client fired a fetch the online-gate should have held.
-
-    :param page: Playwright page fixture.
-    :param seeded_session: ``(base_url, session_id)`` of a pre-created
-        session bound to the running runner.
-    """
+    """Hold runner-proxied requests while an offline session opens."""
     base_url, session_id = seeded_session
 
-    # Verify the runner is online before the kill, so the offline state
-    # below is unambiguously produced by this test.
-    # trust_env=False: the health probes target the local test server and
-    # must bypass any ambient HTTP(S)_PROXY (which can't reach loopback).
+    # Bypass ambient proxies for local health probes.
     health_before = httpx.get(
         f"{base_url}/health",
         params={"session_id": session_id},
@@ -91,8 +52,7 @@ def test_open_offline_session_no_resource_503_burst(
     for pid in runner_pids:
         os.kill(pid, signal.SIGKILL)
 
-    # Wait until the server has deregistered the tunnel and reports the
-    # runner offline — the user's "open a dead session" moment starts here.
+    # Open the page only after the server reports the tunnel down.
     health_after: dict[str, object] = {}
     for _attempt in range(_OFFLINE_POLL_ATTEMPTS):
         time.sleep(_OFFLINE_POLL_INTERVAL_S)
@@ -108,8 +68,7 @@ def test_open_offline_session_no_resource_503_burst(
         f"server never reported the killed runner offline: {health_after}"
     )
 
-    # Record every response for this session (and the health polls, to show
-    # the gate's timeline in the failure message) while the page opens.
+    # Keep a timeline of session requests and health polls for failures.
     observed: list[tuple[float, int, str]] = []
     t0 = time.monotonic()
 

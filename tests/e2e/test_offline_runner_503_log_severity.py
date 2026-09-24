@@ -1,19 +1,4 @@
-"""E2E: an offline-runner resource 503 must not be logged as ERROR + traceback.
-
-A runner going offline (host reboot, idle-reap, tunnel drop) is a normal
-operational state. When a session's runner is offline, every runner-proxied
-resource GET (environment, filesystem, terminals) correctly returns 503
-``runner_unavailable`` — but the server's ``OmnigentError`` handler logs each
-one via its ``http_status >= 500`` band as
-``ERROR [server.app] Internal error: runner … is offline …`` with a full stack
-trace, burying genuine ERRORs under per-hit tracebacks.
-
-This drives the real user journey end to end against a spawned server: bind a
-session to a live runner, SIGKILL the runner (the "host rebooted" moment), hit
-a resource endpoint the session-open fan-out uses, and assert the correct 503
-is returned while the server's application log records NO ERROR-level entry
-and NO traceback for that expected transient condition.
-"""
+"""Check that an offline runner's expected 503 has no ERROR traceback."""
 
 from __future__ import annotations
 
@@ -56,10 +41,7 @@ _OFFLINE_TIMEOUT_S = 15.0
 
 
 def _find_free_port() -> int:
-    """Pick a free TCP port on localhost.
-
-    :returns: An OS-assigned free port number.
-    """
+    """Pick an OS-assigned loopback port."""
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
@@ -68,25 +50,13 @@ def _find_free_port() -> int:
 
 
 def _subprocess_env(extra: dict[str, str]) -> dict[str, str]:
-    """Build a clean env for a spawned server/runner subprocess.
-
-    Strips any ambient runner/host identity vars (they leak in when the test
-    itself runs inside a server-spawned runner and would make the child take
-    the wrong startup path), prepends the worktree and the client SDK to
-    ``PYTHONPATH`` so the subprocess imports the code under test, and merges
-    ``extra`` on top.
-
-    :param extra: Vars to set for this subprocess.
-    :returns: The merged environment mapping.
-    """
+    """Isolate child identity and import the candidate worktree."""
     env = {**os.environ}
     for key in list(env):
         if key.startswith(("OMNIGENT_RUNNER_", "OMNIGENT_HOST_")) or key in (
             "RUNNER_SERVER_URL",
             "OMNIGENT_REMOTE_AUTH_TOKEN",
-            # A leaked parent log path would redirect the spawned server's
-            # application log away from OMNIGENT_DATA_DIR, which this test
-            # reads to assert log severity.
+            # Keep the application log in the test's data directory.
             "OMNIGENT_PROCESS_LOG_FILE",
         ):
             env.pop(key)
@@ -107,18 +77,7 @@ def _subprocess_env(extra: dict[str, str]) -> dict[str, str]:
 def offline_runner_session(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[tuple[str, str, Path]]:
-    """Spawn a server + runner, bind a session, then SIGKILL the runner.
-
-    Self-contained on purpose: the shared session-scoped ``live_server``
-    fixture must keep its runner alive for other tests, and this test also
-    needs the server's application-log file at a known location
-    (``OMNIGENT_DATA_DIR``) to assert on log severity.
-
-    :param tmp_path_factory: Pytest temp factory for the DB, artifacts,
-        data dir, and process logs.
-    :returns: Yields ``(base_url, session_id, app_log_dir)`` with the
-        session's runner already offline.
-    """
+    """Bind a session to an isolated runner, then kill that runner."""
     work = tmp_path_factory.mktemp("offline_503_log")
     port = _find_free_port()
     base_url = f"http://127.0.0.1:{port}"
@@ -150,8 +109,7 @@ def offline_runner_session(
             {
                 "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
                 "OMNIGENT_DATA_DIR": str(data_dir),
-                # No LLM turn is ever driven; a dead base URL keeps any
-                # accidental provider call from reaching the network.
+                # Block accidental provider calls; this test drives no LLM turn.
                 "OPENAI_BASE_URL": "http://127.0.0.1:9/v1",
                 "OPENAI_API_KEY": "test-key",
             }
@@ -216,8 +174,7 @@ def offline_runner_session(
             f"{base_url}/v1/sessions/{session_id}", json={"runner_id": runner_id}
         ).raise_for_status()
 
-        # The "host rebooted / runner idle-reaped" moment: SIGKILL, then wait
-        # for the server to notice the tunnel drop and report offline.
+        # Wait for the server to observe the killed runner's tunnel drop.
         runner.send_signal(signal.SIGKILL)
         runner.wait(timeout=10)
         deadline = time.monotonic() + _OFFLINE_TIMEOUT_S
@@ -249,20 +206,7 @@ def offline_runner_session(
 def test_offline_runner_resource_503_not_logged_as_error(
     offline_runner_session: tuple[str, str, Path],
 ) -> None:
-    """A resource GET on an offline-runner session 503s without an ERROR log.
-
-    Drives the exact request the session-open fan-out sends
-    (``GET /v1/sessions/{id}/resources/environments/default``) against a
-    session whose runner just died, then reads the server's application log.
-
-    The 503 ``runner_unavailable`` response is the *correct* contract and must
-    stay. What must NOT happen is the server treating this expected transient
-    state as an internal error: no ``ERROR``-level "Internal error:" entry and
-    no stack trace for the offline-runner condition.
-
-    :param offline_runner_session: ``(base_url, session_id, app_log_dir)``
-        with the session's runner already offline.
-    """
+    """Preserve the resource 503 without logging an internal error."""
     base_url, session_id, app_log_dir = offline_runner_session
     client = httpx.Client(timeout=10.0, trust_env=False)
     try:
@@ -270,7 +214,6 @@ def test_offline_runner_resource_503_not_logged_as_error(
     finally:
         client.close()
 
-    # The response contract is already correct and must not regress.
     assert resp.status_code == 503, (
         f"expected 503 for an offline-runner resource GET, got {resp.status_code}: "
         f"{resp.text[:500]}"

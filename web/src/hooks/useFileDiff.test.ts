@@ -141,9 +141,6 @@ describe("useFileDiff — enable gate", () => {
   });
 
   it("holds the fetch while liveness is unknown (undefined)", async () => {
-    // The diff endpoint is runner-proxied: firing while liveness is still
-    // unknown would 503 on a session whose runner went away (and be
-    // logged server-side). The gate holds until serveable resolves `true`.
     setHooks({ serveable: undefined, changedPaths: ["a.ts"] });
     fetchMock.mockResolvedValueOnce(
       mockResponse({

@@ -262,10 +262,8 @@ export function computeGithubPollInterval(info: GithubInfo | undefined): number 
 /**
  * Fetch GitHub context (repo, branch, base ref, PR + CI summary) for a session.
  *
- * Held until a serving source is known (runner online, or offline with the
- * host tunnel up) so a fresh open of an offline-runner session doesn't fire
- * a 503. Retries the runner-offline case with capped backoff so a
- * cold-booting runner resolves before any error UI.
+ * Waits for a serving source (runner or host tunnel) before fetching, then
+ * retries transient runner-offline errors with capped backoff.
  *
  * Refetch is driven two ways, both harness-agnostic:
  *   - Turn end: a trailing invalidate on the focused session's active→idle
@@ -277,11 +275,6 @@ export function computeGithubPollInterval(info: GithubInfo | undefined): number 
  *     states poll and which rest. It catches changes a turn boundary can't
  *     (setup fixed outside the app, CI progressing after the turn). Backgrounded
  *     tabs pause (`refetchIntervalInBackground: false`).
- *
- * Held until a serving source is known (runner online, or offline with the
- * host tunnel up) so a fresh open of an offline-runner session doesn't fire
- * a 503. Retries the runner-offline case with capped backoff so a
- * cold-booting runner resolves before any error UI.
  */
 export function useGithubInfo(
   rawConversationId: string | undefined,

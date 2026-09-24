@@ -113,9 +113,6 @@ describe("useGithubInfo turn-end invalidate", () => {
 
 describe("useGithubInfo liveness gating", () => {
   it("holds the fetch until runner liveness resolves, then fires", async () => {
-    // Opening a session before the first /health resolves must not fire the
-    // runner-proxied github fetch: on a session whose runner went away it
-    // would just 503 alongside the other resource queries.
     stubChatStore("conv_open", "idle");
     onlineMock.mockReturnValue(undefined);
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 0 } } });
@@ -128,7 +125,6 @@ describe("useGithubInfo liveness gating", () => {
     await Promise.resolve();
     expect(fetchMock).not.toHaveBeenCalled();
 
-    // First /health lands `true` -> the held fetch fires.
     onlineMock.mockReturnValue(true);
     rerender(
       <QueryClientProvider client={qc}>

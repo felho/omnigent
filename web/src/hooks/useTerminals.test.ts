@@ -437,8 +437,6 @@ describe("useTerminals reconcile poll (stuck-spinner self-heal)", () => {
     fetchMock.mockReset();
     vi.stubGlobal("fetch", fetchMock);
     vi.useFakeTimers();
-    // The seed/poll query is gated on known runner liveness; these tests
-    // exercise the reconcile interval, so start with the runner online.
     runnerOnlineMock.mockReturnValue(true);
   });
   afterEach(() => {
@@ -578,13 +576,8 @@ describe("useTerminals — SSE-primary list, poll corrects on edges", () => {
     });
 
   it("shows a cached terminal immediately even while the poll still reads offline (boot lag)", async () => {
-    // SSE-primary: a terminal already in the cache (in production via a live
-    // `session.resource.created` delta, which setQueryData writes even while
-    // the seed query is held) is openable right away even though runner
-    // liveness still reads `false` during the cold-boot poll lag. A
-    // continuous offline mask would hide it until the next poll — the
-    // "terminal never clickable" bug. `undefined → false` is NOT a
-    // was-online edge, so no correction clears it either.
+    // SSE cache writes remain visible even while the HTTP seed is held.
+    // Unknown → offline is not a was-online edge that clears the cache.
     fetchMock.mockResolvedValue(oneTerminal());
     runnerOnlineMock.mockReturnValue(false);
 
@@ -594,15 +587,10 @@ describe("useTerminals — SSE-primary list, poll corrects on edges", () => {
     await act(async () => void (await vi.advanceTimersByTimeAsync(0)));
 
     expect(result.current.terminals).toEqual([TERMINAL]);
-    // And the held seed never fired a runner-proxied GET at the offline runner.
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("holds the HTTP seed while runner liveness is unknown, then seeds on online", async () => {
-    // Opening a session before the first /health resolves must not fire the
-    // runner-proxied terminals GET: on a session whose runner went away it
-    // would 503 (and be logged server-side). Once liveness lands `true` the
-    // seed runs and populates the list.
     fetchMock.mockResolvedValue(oneTerminal());
     runnerOnlineMock.mockReturnValue(undefined);
 

@@ -34,24 +34,16 @@ export function useSessionActive(conversationId: string | undefined): boolean {
 /**
  * Whether the workspace file panel can be served for this session.
  *
- * Tri-state: `true` when a source can answer (runner online, or runner
- * offline with the host tunnel up), `false` when we *know* neither source
- * can (runner offline AND host down or not host-bound), and `undefined`
- * while liveness is still resolving. Consumers HOLD the query on
- * `undefined` (`enabled: serveable === true`): opening a session whose
- * runner went away must not fan out resource GETs that all 503 before the
- * first `/health` resolves. The open session is always in the health
- * fallback poll, so the unknown window is one `/health` round-trip.
+ * `true` means the runner or host tunnel is online; `false` means neither
+ * can serve; `undefined` means liveness has not resolved. Queries run only
+ * for `true` to avoid 503s while a session's first health poll is pending.
  */
 export function useWorkspaceServeable(conversationId: string | undefined): boolean | undefined {
   const runnerOnline = useSessionRunnerOnline(conversationId);
   const hostOnline = useSessionHostOnline(conversationId);
-  if (runnerOnline === undefined) return undefined; // liveness unknown → hold
+  if (runnerOnline === undefined) return undefined;
   if (runnerOnline) return true;
-  // Runner known-offline: the host tunnel can still serve the workspace,
-  // but only when it is *known* up — while host liveness is unresolved,
-  // keep holding (a fire now would just 503), and `false`/`null` (down /
-  // not host-bound) blocks.
+  // An unresolved host is not yet a serving source.
   if (hostOnline === undefined) return undefined;
   return hostOnline === true;
 }

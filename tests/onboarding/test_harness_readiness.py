@@ -955,6 +955,64 @@ def test_databricks_workspace_url_alone_is_not_a_credential(
     assert result["openai-agents"] == "needs-auth"
 
 
+def test_sdk_harness_ready_via_global_auth_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The user-level global ``auth:`` block counts as an SDK credential source.
+
+    Both SDK builders inherit the global ``config.yaml`` ``auth:`` mapping when
+    the agent spec declares no ``executor.auth`` (workflow's
+    ``_load_global_auth``), so a host configured only through global API-key
+    authentication must not read ``needs-auth`` (which the picker renders as
+    an unselectable row).
+    """
+    _no_clis_installed(monkeypatch)
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"auth": {"type": "api_key", "api_key": "sk-global-test"}})
+    )
+    result = configured_harness_map()
+    assert result["claude-sdk"] is True
+    assert result["openai-agents"] is True
+
+
+def test_malformed_databricks_config_contents_never_reach_logs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Parser errors for Databricks config files must not log file contents.
+
+    ``configparser`` errors embed the offending line, which in a credentials
+    file may be a token, so both the default ``~/.databrickscfg`` reader and
+    the ``DATABRICKS_CONFIG_FILE`` override parser must log only the exception
+    class when a file is malformed.
+    """
+    import importlib
+    import logging
+
+    import omnigent.onboarding.databricks_config as dbc
+
+    _no_clis_installed(monkeypatch)
+    secret = "dapi-super-secret-value"
+    # A token line before any section header makes configparser raise a
+    # MissingSectionHeaderError whose message embeds the line itself.
+    malformed = f"token = {secret}\n[DEFAULT]\nhost = https://example\n"
+    default_cfg = tmp_path / "databrickscfg-default"
+    default_cfg.write_text(malformed)
+    override_cfg = tmp_path / "databrickscfg-override"
+    override_cfg.write_text(malformed)
+    # The autouse fixture stubs list_databricks_profiles; reload to exercise
+    # the real parser, then pin its path at this test's malformed file.
+    importlib.reload(dbc)
+    monkeypatch.setattr(dbc, "_DATABRICKSCFG_PATH", default_cfg)
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(override_cfg))
+    with caplog.at_level(logging.DEBUG):
+        result = configured_harness_map()
+    assert result["claude-sdk"] == "needs-auth"
+    assert secret not in caplog.text
+
+
 def test_databricks_profileless_config_override_is_not_a_credential(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

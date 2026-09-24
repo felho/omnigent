@@ -568,16 +568,39 @@ def _antigravity_credential_configured() -> bool:
     return _google_adc_configured()
 
 
+def _global_auth_configured() -> bool:
+    """Whether the user-level global ``auth:`` block can serve the SDK builders.
+
+    Both SDK executors inherit the ``auth:`` mapping from the user's global
+    ``config.yaml`` (``_load_global_auth`` in :mod:`omnigent.runtime.workflow`)
+    when the agent spec declares no ``executor.auth``, so a parsed global
+    api-key / Databricks auth block is a complete credential source. Local
+    file read only; never raises.
+
+    :returns: ``True`` when the global ``auth:`` block parses into a usable
+        auth configuration.
+    """
+    try:
+        from omnigent.runtime.workflow import _load_global_auth
+
+        return _load_global_auth() is not None
+    except Exception as exc:
+        # Class-only: the auth block (or its parse error) may carry secrets.
+        _logger.debug("readiness: global auth check failed (%s)", type(exc).__name__)
+        return False
+
+
 def _sdk_harness_availability(canonical: str) -> HarnessAvailability:
     """Picker-facing readiness for an in-process SDK harness.
 
     ``True`` when any locally visible credential source could serve the
-    harness at run time, else ``"needs-auth"``. The check errs toward ready:
+    harness at run time, else ``"needs-auth"``. The check errs toward ready
+    and detects credential *sources*, not guaranteed-usable credentials:
     spec-level ``executor.auth`` and other runtime-only sources are invisible
-    here, so only a host where *nothing* local could authenticate reads
-    ``"needs-auth"`` — and that signal warns in the picker, it never blocks
-    the launch (:func:`harness_is_configured` stays ungated for SDK
-    harnesses).
+    here, and a configured source may still fail to resolve at launch. Only
+    a host where *nothing* local could authenticate reads ``"needs-auth"``
+    — and that signal warns in the picker, it never blocks the launch
+    (:func:`harness_is_configured` stays ungated for SDK harnesses).
 
     :param canonical: A canonical SDK harness id from :data:`_SDK_HARNESSES`.
     :returns: ``True`` or ``"needs-auth"``.
@@ -585,6 +608,8 @@ def _sdk_harness_availability(canonical: str) -> HarnessAvailability:
     if canonical == "antigravity":
         return True if _antigravity_credential_configured() else HARNESS_NEEDS_AUTH
     if _family_provider_configured(canonical):
+        return True
+    if _global_auth_configured():
         return True
     family = _HARNESS_FAMILY.get(canonical)
     if family is not None and _ambient_family_env_key_configured(family):

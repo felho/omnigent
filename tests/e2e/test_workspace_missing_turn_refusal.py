@@ -1,39 +1,8 @@
-"""E2E repro: a missing host workspace is logged as an ERROR turn failure.
+"""Exercise missing-workspace refusal through a real server, host, and runner.
 
-Journey (the real user path from the ticket):
-
-1. Bring a host online (``omnigent`` host daemon registers with the server).
-2. Create a session bound to that host in workspace directory ``W`` — the host
-   launches gen1 runner and it connects, which proves ``W`` was valid.
-3. The runner dies (here: SIGKILL, standing in for a host restart / crash) so
-   its tunnel drops and the server declares the runner offline.
-4. ``W`` is deleted on the host (the user removed the git worktree / project dir).
-5. The user sends a message in the session. The runner is gone, so the server
-   asks the still-online host to relaunch — the host checks ``W`` and refuses
-   with the ``workspace_missing`` category.
-
-Observed on the buggy build: the server consumes the message, records a
-structured ``workspace_missing`` error item (correct, and must be preserved),
-**and** publishes a ``failed`` status edge, which logs an ERROR from
-``omnigent.server.routes.sessions._publish_status`` with the message
-
-    session turn failed for <session_id> (origin=host_launch_failed
-        code=workspace_missing prev=...): workspace path does not exist: <W>
-
-That ERROR line is the KPI-counted turn-failure signature: an *expected*,
-upstream host condition (the user deleted their own workspace) is attributed
-as an Omnigent turn-failure defect. The fix reclassifies these expected host
-launch refusals so
-they are no longer logged as ``session turn failed`` at ERROR level, while the
-structured error the user sees is preserved.
-
-This drives the real stack — server subprocess, a real host daemon, a real
-host-launched runner — so the workspace-missing refusal is produced organically
-by the host's own ``workspace.is_dir()`` check, not scripted.
-
-Run::
-
-    .venv/bin/python -m pytest tests/e2e/test_workspace_missing_turn_refusal.py -v
+After a runner dies and its workspace is deleted, the host refuses relaunch.
+The server must retain the structured error without logging a turn-failure
+ERROR for this expected condition. The LLM endpoint is mocked.
 """
 
 from __future__ import annotations
@@ -72,32 +41,20 @@ from tests.e2e.test_host_runner_leak_5182 import (
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# Absolute source roots a host-launched runner must import from. Runners run
-# with cwd=<workspace> (not the repo), so a *relative* PYTHONPATH entry like
-# ``sdks/python-client`` won't resolve there — each root is prepended absolute.
+# Runners start in the workspace, so their import roots must be absolute.
 _SOURCE_ROOTS = (
     _REPO_ROOT,
     _REPO_ROOT / "sdks" / "python-client",
     _REPO_ROOT / "sdks" / "ui",
 )
 
-# The KPI-counted message prefix from the ticket's signature evidence. It is
-# emitted only by the ERROR branch of _publish_status on a ``failed`` edge.
 _KPI_TURN_FAILED_PREFIX = "session turn failed for "
 
 
 def _ensure_worktree_on_pythonpath() -> None:
-    """Let host-launched runners import the branch's source from this worktree.
+    """Prepend this checkout's absolute roots to runner subprocess PYTHONPATH.
 
-    The host daemon builds each runner subprocess env from ``os.environ`` and
-    forwards ``PYTHONPATH`` (it is on ``_RUNNER_ENV_ALLOWLIST``). A launched
-    runner runs with its ``cwd`` set to the *workspace*, not the repo, so
-    unless the worktree source roots are on ``PYTHONPATH`` as absolute paths
-    the runner's bare interpreter cannot resolve ``omnigent`` /
-    ``omnigent_client`` / ``omnigent_ui_sdk`` — it exits with
-    ``ModuleNotFoundError`` before it can connect its tunnel. Prepend the
-    absolute source roots (mirrors what ``apply_server_env`` does for the
-    server) so the daemon's launched runners import this branch's source.
+    The daemon passes PYTHONPATH through, but runners start in the workspace.
     """
     existing = os.environ.get("PYTHONPATH", "")
     parts = existing.split(os.pathsep) if existing else []
@@ -126,19 +83,7 @@ _AGENT_YAML = "\n".join(
 def _spawn_server(
     *, tmp_path: Path, mock_llm_server_url: str
 ) -> tuple[subprocess.Popen, str, Path]:
-    """Spawn an ``omnigent server`` that accepts host-launched runners.
-
-    Unlike the shared ``live_server`` fixture this omits the
-    ``OMNIGENT_RUNNER_TUNNEL_TOKEN`` allow-list (so the host's own
-    per-launch runner tokens are accepted) and owns a known server-log
-    path this test can read to inspect the ERROR line the ticket is about.
-
-    :param tmp_path: Per-test temp dir for the DB, artifacts, and log.
-    :param mock_llm_server_url: Mock LLM base URL for the server + its
-        host-launched runners.
-    :returns: ``(process, base_url, server_log_path)``.
-    :raises RuntimeError: If the server does not pass health in time.
-    """
+    """Spawn a server accepting host runner tokens with a dedicated log path."""
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     tmp_path.mkdir(parents=True, exist_ok=True)
@@ -153,8 +98,7 @@ def _spawn_server(
         "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
     }
     apply_server_env(env, _REPO_ROOT)
-    # No OMNIGENT_RUNNER_TUNNEL_TOKEN: accept any token-bound runner, the
-    # deployed-server posture the host relies on for its launched runners.
+    # Host-generated per-launch runner tokens must be accepted.
     env.pop("OMNIGENT_RUNNER_TUNNEL_TOKEN", None)
 
     log_handle = open(server_log, "w")  # noqa: SIM115 — lives for the Popen lifetime; closed by the caller
@@ -203,11 +147,7 @@ def _spawn_server(
 
 
 def _register_agent(client: httpx.Client) -> str:
-    """Register the openai-agents smoke agent via a bundle-only create.
-
-    :param client: HTTP client pointed at the server.
-    :returns: The durable ``agent_id`` to bind host sessions to.
-    """
+    """Register the smoke agent from its bundle."""
     yaml_bytes = _AGENT_YAML.encode()
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
@@ -239,32 +179,12 @@ def test_missing_workspace_relaunch_is_not_logged_as_turn_failure(
     tmp_path: Path,
     mock_llm_server_url: str,
 ) -> None:
-    """A deleted host workspace must not be logged as an ERROR turn failure.
-
-    The expected/upstream ``workspace_missing`` host
-    refusal is surfaced to the user as a structured error (which this test
-    requires to be preserved), but on the buggy build it is *also* published
-    as a ``failed`` status edge and logged at ERROR as
-    ``session turn failed for <id> ...`` — the KPI-counted signature that
-    misattributes it as an Omnigent turn-failure defect.
-
-    Regression assertions:
-
-    * The structured ``workspace_missing`` error item is preserved with the
-      sanitized ``workspace path does not exist: <W>`` reason (holds before
-      and after the fix).
-    * The server does NOT log an ERROR ``session turn failed for <session_id>``
-      for this expected condition. Fails on the buggy build (the ERROR line is
-      emitted); passes once the refusal is reclassified out of the turn-failure
-      ERROR path.
-    """
+    """Preserve the error item without logging the refusal as an ERROR."""
     server_proc: subprocess.Popen | None = None
     server_log: Path | None = None
     daemon = None
     gen1_pid: int | None = None
     try:
-        # Host-launched runners inherit PYTHONPATH from the daemon; make sure
-        # the worktree is on it so they can import omnigent (see helper).
         _ensure_worktree_on_pythonpath()
 
         server_proc, base_url, server_log = _spawn_server(
@@ -286,8 +206,7 @@ def test_missing_workspace_relaunch_is_not_logged_as_turn_failure(
 
         agent_id = _register_agent(client)
 
-        # A workspace that exists at create time so the host-bound create
-        # launches gen1 successfully (proving W was valid).
+        # The first launch proves the workspace existed before deletion.
         workspace = tmp_path / "worktree" / "universe"
         workspace.mkdir(parents=True)
 
@@ -317,8 +236,7 @@ def test_missing_workspace_relaunch_is_not_logged_as_turn_failure(
         )
         assert _pid_alive(gen1_pid), f"gen1 (pid={gen1_pid}) died before it was superseded"
 
-        # Runner dies (host restart / crash stand-in): its tunnel closes and
-        # the server declares it offline, so the next message must relaunch.
+        # Force the next message to relaunch an offline runner.
         os.kill(gen1_pid, signal.SIGKILL)
         _wait_for(
             lambda: not _runner_online(client, runner_id),
@@ -326,12 +244,10 @@ def test_missing_workspace_relaunch_is_not_logged_as_turn_failure(
             what=f"the server to declare runner {runner_id} offline after it was killed",
         )
 
-        # The user removed the workspace on the host (git worktree cleanup).
         shutil.rmtree(workspace)
         assert not workspace.exists()
 
-        # Sending a message is the real runner-start attempt: the host is
-        # asked to relaunch and refuses because W is gone.
+        # The host should refuse relaunch because the workspace is gone.
         msg = client.post(
             f"/v1/sessions/{session_id}/events",
             json={
@@ -345,9 +261,7 @@ def test_missing_workspace_relaunch_is_not_logged_as_turn_failure(
         )
         assert msg.status_code in (200, 202), f"unexpected status: {msg.status_code}: {msg.text}"
 
-        # The structured workspace-missing error is surfaced (and must be
-        # preserved by any fix): a single type=error item carrying the
-        # sanitized reason rebuilt from the authorized workspace.
+        # The user still gets the sanitized refusal.
         error_items = _wait_for(
             lambda: _error_items(client, session_id) or None,
             timeout=60.0,
@@ -358,26 +272,14 @@ def test_missing_workspace_relaunch_is_not_logged_as_turn_failure(
         assert err["code"] == "workspace_missing", err
         assert err["message"] == f"workspace path does not exist: {workspace}", err
 
-        # The refusal must be recorded somewhere in the server log (a fix must
-        # not silently swallow the condition) — holds before (ERROR line) and
-        # after (reclassified warning) the fix.
+        # The refusal must remain observable in server logs.
         log_text = server_log.read_text()
         assert str(workspace) in log_text, (
             "the server never logged the workspace-missing refusal at all"
         )
 
-        # THE BUG: the expected *workspace-missing* host refusal must NOT be
-        # logged as ``session turn failed for <session_id> ... workspace_missing``
-        # — the KPI-counted turn-failure signature. Present on the buggy build;
-        # absent once the refusal is reclassified out of the ERROR turn-failure
-        # path.
-        #
-        # Scoped to the workspace_missing signature on purpose: an offline
-        # runner may crash-exit before this point (a distinct, legitimate
-        # ``runner_failed_to_start`` turn failure that the reclassification
-        # does not touch), so a blanket "no turn-failure line" guard would never go
-        # green after the fix. This guard fails on the buggy build for the
-        # workspace-missing line alone and passes once that one is reclassified.
+        # An earlier runner crash may log a separate, legitimate turn failure.
+        # Only the expected workspace_missing signature must be absent.
         offending = [
             line
             for line in log_text.splitlines()

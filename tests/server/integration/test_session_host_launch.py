@@ -2323,15 +2323,7 @@ async def test_message_relaunch_refusal_logs_warning_not_error_funnel(
     refusal_code: str,
     refusal_error: str,
 ) -> None:
-    """A categorical launch refusal is logged as a WARNING, not an ERROR.
-
-    The host deterministically refuses the relaunch (deleted workspace,
-    unconfigured harness); the user gets a structured error card and the
-    remediation is theirs. Error dashboards attribute the generic
-    ERROR-level ``session turn failed for <id>`` funnel in
-    ``_publish_status`` to server defects, so an expected refusal must
-    instead log the categorical ``session turn refused`` WARNING.
-    """
+    """Log each expected host refusal as one bounded WARNING, not an ERROR."""
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
 

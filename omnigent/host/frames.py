@@ -41,9 +41,7 @@ HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 # daemon (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 
-# The safe categorical launch-refusal codes: deterministic, user-remediable
-# refusals the server may surface structurally. Single source for the
-# classifier, the persistence allowlist, and the turn-failure log funnel.
+# Only these categorical refusals are safe to persist and log as expected.
 SAFE_LAUNCH_REFUSAL_CODES = frozenset(
     {HARNESS_NOT_CONFIGURED_ERROR_CODE, WORKSPACE_MISSING_ERROR_CODE}
 )

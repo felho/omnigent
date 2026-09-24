@@ -38,6 +38,7 @@ Run::
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -122,7 +123,9 @@ _AGENT_YAML = "\n".join(
 )
 
 
-def _spawn_server(*, tmp_path: Path, mock_llm_server_url: str) -> tuple[subprocess.Popen, str, Path]:
+def _spawn_server(
+    *, tmp_path: Path, mock_llm_server_url: str
+) -> tuple[subprocess.Popen, str, Path]:
     """Spawn an ``omnigent server`` that accepts host-launched runners.
 
     Unlike the shared ``live_server`` fixture this omits the
@@ -302,7 +305,7 @@ def test_missing_workspace_relaunch_is_not_logged_as_turn_failure(
         runner_id = create.json()["runner_id"]
         assert runner_id is not None, create.text
 
-        gen1_id, gen1_pid = _wait_for(
+        _gen1_id, gen1_pid = _wait_for(
             lambda: (_launches(daemon.daemon_log) or [None])[0],
             timeout=60.0,
             what="the host daemon to log gen1's launch",
@@ -378,20 +381,16 @@ def test_missing_workspace_relaunch_is_not_logged_as_turn_failure(
         offending = [
             line
             for line in log_text.splitlines()
-            if f"{_KPI_TURN_FAILED_PREFIX}{session_id}" in line
-            and "workspace_missing" in line
+            if f"{_KPI_TURN_FAILED_PREFIX}{session_id}" in line and "workspace_missing" in line
         ]
         assert offending == [], (
             "an expected workspace-missing host refusal was logged as a "
-            f"turn failure (KPI-counted). Offending server log line(s):\n"
-            + "\n".join(offending)
+            "turn failure (KPI-counted). Offending server log line(s):\n" + "\n".join(offending)
         )
     finally:
         if gen1_pid is not None and _pid_alive(gen1_pid):
-            try:
+            with contextlib.suppress(ProcessLookupError):
                 os.kill(gen1_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
         if daemon is not None:
             daemon.proc.send_signal(signal.SIGTERM)
             try:

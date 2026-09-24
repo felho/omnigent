@@ -200,54 +200,38 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
     return None
 
 
-# Canonical spellings of the multi-model harnesses whose launch paths still
-# cannot serve every validated id, so best-effort parent-model inheritance
-# checks servability before pushing an id through (an explicit ``args.model``
-# keeps its fail-loud contract at the harness instead).
+# opencode resolves a model's provider from the id's own ``provider/`` prefix,
+# so a bare id has nowhere to route; best-effort parent-model inheritance
+# checks that before pushing one through (an explicit ``args.model`` keeps its
+# fail-loud contract at the harness instead).
 _OPENCODE_HARNESSES: frozenset[str] = frozenset({"opencode-native", "native-opencode", "opencode"})
-_PI_HARNESSES: frozenset[str] = frozenset({"pi", "pi-native", "native-pi"})
-
-# Provider kinds whose host is a Databricks gateway, where pi's
-# ``databricks-anthropic`` route (``/serving-endpoints/anthropic``) exists.
-# A ``cli-config`` entry is guaranteed by selection to be a Databricks AI
-# Gateway and registers pi's claude family (see
-# ``_apply_cli_config_databricks_to_pi`` in omnigent/runtime/workflow.py).
-_PI_CLAUDE_SERVABLE_PROVIDER_KINDS: frozenset[str] = frozenset({"databricks", "cli-config"})
-
-_ANTHROPIC_PROVIDER_FAMILY = "anthropic"
 
 
 def inherited_model_unservable_reason(
     harness: str,
     model: str,
     *,
-    provider_kind: str | None,
-    provider_family: str | None,
     databricks_profile: str | None,
 ) -> str | None:
     """
     Return why inheriting *model* onto *harness* cannot be served, or ``None``.
 
-    Complements :func:`model_family_mismatch` for the multi-model harnesses it
-    waves through: family compatibility alone does not make an id servable.
+    Complements :func:`model_family_mismatch` for opencode, which it waves
+    through as multi-model: family compatibility alone does not make a bare id
+    servable there. opencode resolves a model's provider from the id's
+    ``provider/`` prefix against its own auth, so a bare id is only usable when
+    a Databricks profile lets the launch synthesize a gateway provider (which
+    re-pins the id to a serving endpoint).
 
-    - opencode resolves a model's provider from the id's ``provider/`` prefix
-      against its own auth, so a bare id is only usable when a Databricks
-      profile lets the launch synthesize a gateway provider (which re-pins
-      the id to a serving endpoint).
-    - pi routes any ``claude`` id to its ``databricks-anthropic`` provider,
-      which only exists on a Databricks gateway host or when the resolved
-      provider configures an Anthropic-family base URL.
+    Other multi-model harnesses (pi, openai-agents) are intentionally not
+    gated here: they route a validated id to the provider their launch
+    configured, so servability is a provider-resolution concern that belongs
+    in the harness, not a second-guess at the dispatch gate.
 
     :param harness: The child's harness id, alias or canonical, e.g.
         ``"opencode-native"``.
     :param model: A model id that already passed
         :func:`validate_model_override`.
-    :param provider_kind: The child's resolved provider kind from
-        :func:`omnigent.models.model_catalog.resolve_model_provider`;
-        ``None`` when unresolvable.
-    :param provider_family: The resolved provider's inline family
-        (``"anthropic"`` / ``"openai"``), else ``None``.
     :param databricks_profile: The Databricks profile the child's launch
         would use (spec ``executor.config.profile``, else the ambient
         ``DATABRICKS_CONFIG_PROFILE``); ``None`` when absent.
@@ -266,19 +250,6 @@ def inherited_model_unservable_reason(
             f"opencode resolves a model's provider from its 'provider/' prefix; "
             f"the bare id {model!r} has none and no Databricks profile is "
             "configured to synthesize a gateway provider for it"
-        )
-    if canon in _PI_HARNESSES:
-        if "claude" not in model.lower():
-            return None
-        if provider_kind in _PI_CLAUDE_SERVABLE_PROVIDER_KINDS:
-            return None
-        if provider_family == _ANTHROPIC_PROVIDER_FAMILY:
-            return None
-        return (
-            f"pi routes any 'claude' id to its Databricks-only "
-            f"'databricks-anthropic' provider, and the resolved provider "
-            f"(kind {provider_kind or 'none'!r}) has no Anthropic route "
-            f"for {model!r}"
         )
     return None
 

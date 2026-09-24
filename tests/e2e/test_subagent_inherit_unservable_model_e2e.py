@@ -1,37 +1,36 @@
-"""A Claude parent model must not be inherited into workers that cannot serve
-it.
+"""A bare Claude id an opencode worker cannot resolve must not be inherited.
 
 Reproduces the reported journey. A user selects a Claude model
 (``claude-opus-5``) for a claude-native orchestrator, then the orchestrator
-fans out to an ``opencode-native`` or ``pi`` worker via ``sys_session_send``
-**without** an explicit ``args.model``. A dispatch gate that only rejects a
-cross-*family* id treats opencode/pi as "multi-model, accept anything" and
-inherits the bare ``claude-opus-5`` id into the child session's
-``model_override``. Neither worker can serve it:
+fans out to an ``opencode-native`` worker via ``sys_session_send`` **without**
+an explicit ``args.model``. A dispatch gate that only rejects a cross-*family*
+id treats opencode as "multi-model, accept anything" and inherits the bare
+``claude-opus-5`` id into the child's ``model_override``. opencode resolves a
+model's provider from the id's own ``provider/`` prefix, so the synthesized
+``opencode.json`` gets a bare ``claude-opus-5`` and the first turn dies with
+``ProviderModelNotFoundError: Model not found: claude-opus-5/``.
 
-* opencode requires a ``provider/model`` id; the synthesized ``opencode.json``
-  gets a bare ``claude-opus-5`` and the first turn dies with
-  ``ProviderModelNotFoundError: Model not found: claude-opus-5/``.
-* pi routes any ``claude`` id to ``databricks-anthropic`` and POSTs to a
-  ``/serving-endpoints/anthropic`` path that only exists on a Databricks host,
-  so a non-Databricks gateway 404s.
+Expected: a dispatch that names no model runs the child on opencode's own
+default -- inheritance should *skip* when a bare id has nowhere to route rather
+than push it through. So the child session must **not** be created with
+``model_override == "claude-opus-5"``.
 
-Expected: a dispatch that names no model runs the child on the
-child harness's own default -- inheritance should *skip* when the id is not
-servable rather than push a bare Claude id through. So the child session must
-**not** be created with ``model_override == "claude-opus-5"``.
+Fail -> pass contract: on the buggy build the child is created with
+``model_override == "claude-opus-5"`` (the unresolvable inherited id), so the
+assertion fails. Once inheritance is servability-aware the child keeps its own
+default and the assertion passes.
 
-Fail -> pass contract: on the buggy build both children are created with
-``model_override == "claude-opus-5"`` (the unservable inherited id), so the
-assertions fail. Once inheritance is made servability-aware (skip or translate)
-the child keeps its own default and the assertions pass.
+(``pi`` is deliberately not exercised here: it routes a validated id to the
+provider its launch configured -- ``_pi_provider_for_model`` sends a claude id
+through the configured generic provider when no Anthropic route exists -- so
+that routing is covered by the ``TestPiProviderForModel`` unit tests instead.)
 
 The claude-native brain is swapped for openai-agents against a mock LLM (the
-standard mock-polly pattern from ``test_polly_e2e``); the opencode/pi workers
-keep their NATIVE harness ids, because the defect lives in how their ids are
-inherited. The plumbing under test -- CLI ``--model`` -> parent session ->
-``sys_session_send`` (no args.model) -> ``_inherited_parent_model`` -> child
-session ``model_override`` -- is the real production path.
+standard mock-polly pattern from ``test_polly_e2e``); the opencode worker keeps
+its NATIVE harness id, because the defect lives in how its id is inherited. The
+plumbing under test -- CLI ``--model`` -> parent session -> ``sys_session_send``
+(no args.model) -> ``_inherited_parent_model`` -> child session
+``model_override`` -- is the real production path.
 
 The opencode child is torn down shortly after creation (its native terminal
 cannot boot on the unservable model here), so the child row is captured while
@@ -66,15 +65,14 @@ from tests.e2e.test_subagent_model_inheritance_e2e import _run_env
 
 # A Claude model the user selects for the claude-native parent session. A
 # canonical vendor id with no ``provider/`` prefix -- opencode cannot resolve
-# it and pi routes it to the Databricks Anthropic surface; neither worker's
-# own provider can serve it.
+# it against its own auth, so its own provider cannot serve it.
 _SELECTED_MODEL = "claude-opus-5"
 
 
 def _harness_bin_dir() -> str | None:
-    """Locate the bootstrapped ``opencode``/``pi`` CLIs the dispatch preflight
-    needs (``missing_harness_cli`` rejects a worker whose binary is missing or
-    outside its version range), returning the dir to prepend to ``PATH``.
+    """Locate the bootstrapped ``opencode`` CLI the dispatch preflight needs
+    (``missing_harness_cli`` rejects a worker whose binary is missing or outside
+    its version range), returning the dir to prepend to ``PATH``.
 
     Searches ``.harness-clis/node_modules/.bin`` up the worktree tree. The
     directory is prepended so the working binary wins over any wrapper shim
@@ -87,7 +85,7 @@ def _harness_bin_dir() -> str | None:
         if cand in seen:
             continue
         seen.add(cand)
-        if (cand / "opencode").exists() and (cand / "pi").exists():
+        if (cand / "opencode").exists():
             return str(cand)
     return None
 
@@ -227,7 +225,7 @@ _HARNESS_BIN_DIR = _harness_bin_dir()
 
 pytestmark = pytest.mark.skipif(
     _HARNESS_BIN_DIR is None,
-    reason="opencode/pi native harness CLIs are not installed on PATH",
+    reason="opencode native harness CLI is not installed on PATH",
 )
 
 
@@ -258,35 +256,4 @@ def test_opencode_worker_does_not_inherit_unservable_claude_model(
         f"makes its first turn fail with 'Model not found'. Inheritance should "
         f"skip an unservable id and let the worker keep its own default, but the "
         f"child session was created with model_override values {overrides!r}."
-    )
-
-
-def test_pi_worker_does_not_inherit_unservable_claude_model(
-    local_polly_server: str,  # noqa: F811  (imported fixture)
-    mock_llm_server_url: str,
-    tmp_path: Any,
-) -> None:
-    """A pi worker dispatched with no model must not inherit a bare Claude id it
-    will misroute to a Databricks-only endpoint.
-
-    Without a servability check the gate inherits ``claude-opus-5``; pi maps any
-    ``claude`` id to the ``databricks-anthropic`` provider whose base URL is a
-    Databricks-only ``/serving-endpoints/anthropic`` path, so on a non-Databricks
-    gateway the turn POSTs to ``<gateway-host>/serving-endpoints/anthropic/...``
-    and 404s. The child should instead keep the pi provider's own default model.
-    """
-    overrides = _observed_child_model_overrides(
-        local_polly_server,
-        mock_llm_server_url,
-        tmp_path,
-        worker_agent="pi",
-    )
-    assert _SELECTED_MODEL not in overrides, (
-        f"pi worker dispatched without args.model inherited the parent's Claude "
-        f"id {_SELECTED_MODEL!r} into its model_override -- pi routes any "
-        f"'claude' id to the databricks-anthropic provider (a Databricks-only "
-        f"'/serving-endpoints/anthropic' path), so on a non-Databricks gateway "
-        f"the turn 404s. Inheritance should skip an unservable id and let the "
-        f"worker keep its provider default, but the child session was created "
-        f"with model_override values {overrides!r}."
     )

@@ -1808,9 +1808,8 @@ async def _inherited_parent_model(
     - a child harness without model-override plumbing runs its default;
     - a parent model outside the child harness's family (e.g. a Claude
       selection dispatched to a codex worker) is not forced across vendors;
-    - a parent model the child's launch path cannot serve (a bare id for
-      opencode, a claude id for pi without an Anthropic route) is skipped —
-      see :func:`inherited_model_unservable_reason`.
+    - a bare parent id an opencode child's launch path cannot resolve is
+      skipped — see :func:`inherited_model_unservable_reason`.
 
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The parent session id.
@@ -1855,11 +1854,6 @@ async def _inherited_parent_model(
         )
         return None
     if child_harness is not None:
-        from omnigent.models.model_catalog import resolve_model_provider
-
-        provider = (
-            resolve_model_provider(sub_spec, child_harness) if sub_spec is not None else None
-        )
         sub_config = getattr(getattr(sub_spec, "executor", None), "config", None)
         spec_profile = sub_config.get("profile") if isinstance(sub_config, dict) else None
         # Profile precedence mirrors the opencode launch path
@@ -1867,8 +1861,6 @@ async def _inherited_parent_model(
         unservable = inherited_model_unservable_reason(
             child_harness,
             parent_model,
-            provider_kind=provider.kind if provider is not None else None,
-            provider_family=provider.family if provider is not None else None,
             databricks_profile=(
                 str(spec_profile)
                 if spec_profile

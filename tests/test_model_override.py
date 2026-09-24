@@ -249,7 +249,7 @@ class TestModelFamilyMismatch:
 
 
 class TestInheritedModelUnservableReason:
-    """Best-effort inheritance skips ids the child's launch cannot serve."""
+    """Best-effort inheritance skips a bare id an opencode child cannot resolve."""
 
     @pytest.mark.parametrize("harness", ["opencode-native", "native-opencode", "opencode"])
     def test_opencode_bare_id_without_profile_is_unservable(self, harness: str) -> None:
@@ -257,8 +257,6 @@ class TestInheritedModelUnservableReason:
         reason = inherited_model_unservable_reason(
             harness,
             "claude-opus-5",
-            provider_kind=None,
-            provider_family=None,
             databricks_profile=None,
         )
         assert reason is not None
@@ -270,8 +268,6 @@ class TestInheritedModelUnservableReason:
             inherited_model_unservable_reason(
                 "opencode-native",
                 "anthropic/claude-sonnet-4-5",
-                provider_kind=None,
-                provider_family=None,
                 databricks_profile=None,
             )
             is None
@@ -283,87 +279,26 @@ class TestInheritedModelUnservableReason:
             inherited_model_unservable_reason(
                 "opencode-native",
                 "databricks-claude-opus-4-8",
-                provider_kind=None,
-                provider_family=None,
                 databricks_profile="oss",
             )
             is None
         )
 
-    @pytest.mark.parametrize("harness", ["pi", "pi-native", "native-pi"])
     @pytest.mark.parametrize(
-        ("provider_kind", "provider_family"),
-        [
-            (None, None),  # provider unresolvable
-            ("none", None),  # no usable provider configured
-            ("gateway", "openai"),  # OpenRouter/LiteLLM-style OpenAI-only gateway
-            ("key", "openai"),
-        ],
+        "harness",
+        ["pi", "pi-native", "native-pi", "claude-sdk", "codex", "openai-agents", "kimi"],
     )
-    def test_pi_claude_id_without_anthropic_route_is_unservable(
-        self,
-        harness: str,
-        provider_kind: str | None,
-        provider_family: str | None,
-    ) -> None:
-        """pi's claude route is Databricks-only; without it the POST 404s."""
-        reason = inherited_model_unservable_reason(
-            harness,
-            "claude-opus-5",
-            provider_kind=provider_kind,
-            provider_family=provider_family,
-            databricks_profile=None,
-        )
-        assert reason is not None
-        assert "databricks-anthropic" in reason
-
-    @pytest.mark.parametrize(
-        ("provider_kind", "provider_family"),
-        [
-            ("databricks", None),  # workspace serves /serving-endpoints/anthropic
-            ("cli-config", None),  # selection guarantees a Databricks AI Gateway
-            ("gateway", "anthropic"),  # provider configures a claude base URL
-            ("key", "anthropic"),
-        ],
-    )
-    def test_pi_claude_id_with_anthropic_route_is_servable(
-        self,
-        provider_kind: str,
-        provider_family: str | None,
-    ) -> None:
-        assert (
-            inherited_model_unservable_reason(
-                "pi",
-                "claude-opus-5",
-                provider_kind=provider_kind,
-                provider_family=provider_family,
-                databricks_profile=None,
-            )
-            is None
-        )
-
-    def test_pi_non_claude_id_is_not_gated(self) -> None:
-        """Non-claude ids route to providers pointed at the configured base URL."""
-        assert (
-            inherited_model_unservable_reason(
-                "pi",
-                "nvidia/nemotron-3-ultra-550b-a55b:free",
-                provider_kind="gateway",
-                provider_family="openai",
-                databricks_profile=None,
-            )
-            is None
-        )
-
-    @pytest.mark.parametrize("harness", ["claude-sdk", "codex", "openai-agents", "kimi"])
     def test_other_harnesses_are_not_gated(self, harness: str) -> None:
-        """Servability here covers only opencode/pi; families gate elsewhere."""
+        """Only opencode is gated here; every other harness routes its own id.
+
+        pi in particular is intentionally excluded: it routes a validated id to
+        the provider its launch configured (see ``_pi_provider_for_model``), so
+        servability is a provider-resolution concern, not a dispatch-gate one.
+        """
         assert (
             inherited_model_unservable_reason(
                 harness,
                 "claude-opus-5",
-                provider_kind="none",
-                provider_family=None,
                 databricks_profile=None,
             )
             is None

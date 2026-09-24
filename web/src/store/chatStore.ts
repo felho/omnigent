@@ -2522,6 +2522,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Upload + POST for this send, defined once the session is bound. A retry
     // re-runs it with the same stable id; null while still binding.
     let deliver: (() => Promise<void>) | null = null;
+    // Native model startup failed or timed out while the draft was still held
+    // locally: that path restores the draft itself, so the send is not retained.
+    let modelGateFailed = false;
     let initialDispatched = false;
     const initialSendPending = () => {
       const id = postedSessionId ?? submitConversationId;
@@ -2550,7 +2553,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             rekey,
           );
           postedSessionId = boundSessionId;
-          if (initialDraft && !(await waitForModelSelection(boundSessionId, tempId))) return;
+          if (initialDraft) {
+            let ready: boolean;
+            try {
+              ready = await waitForModelSelection(boundSessionId, tempId);
+            } catch (gateErr) {
+              modelGateFailed = true;
+              throw gateErr;
+            }
+            if (!ready) return;
+          }
         }
         const sessionId = boundSessionId;
         // Upload any attached files and build the real content blocks with
@@ -2679,16 +2691,17 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // it gave one, and leaves the composer alone. A bind failure has no
       // session to retry against, and a caller with its own error UX wants
       // the rollback, so those still hand the text back as a draft.
-      // First-turn flows keep their own recovery: a local first draft restores
-      // itself, and a navigate-first send whose session never bound has nothing
-      // to retry against. Everything else, including a failed re-bind of a
-      // dropped stream on an existing conversation, is re-sendable.
+      // Two flows keep their own recovery: a draft the native model gate turned
+      // away (startup failed or timed out) restores itself, and a navigate-first
+      // send whose session never bound has nothing to retry against. Everything
+      // else, including a failed re-bind of a dropped stream on an existing
+      // conversation, is re-sendable.
       let retained = false;
       if (
         deliver !== null &&
         failTarget !== null &&
         !callerHandlesError &&
-        !initialDraft &&
+        !modelGateFailed &&
         (postedSessionId !== null || opts?.reusePendingTempId === undefined)
       ) {
         retained = true;

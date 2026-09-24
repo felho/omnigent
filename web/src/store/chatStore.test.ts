@@ -3196,9 +3196,10 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     // Without the fix the entry stays "streaming" forever with no latch; the
     // fix arms the latch on the hydrating send and runs the failure-settle.
     expect(real.status).toBe("idle");
-    expect(real.pendingUserMessages).toEqual([]);
-    // The failure is surfaced, not swallowed.
-    expect(real.blocks.filter((b) => b.type === "error")).toHaveLength(1);
+    // The failure is surfaced on the retained bubble, not swallowed.
+    expect(real.pendingUserMessages).toHaveLength(1);
+    expect(real.pendingUserMessages[0]!.failed).toEqual({ reason: "boom", attempts: 1 });
+    expect(real.blocks.filter((b) => b.type === "error")).toHaveLength(0);
   });
 
   it("B1: a policy-denied first message settles to idle", async () => {

@@ -1477,7 +1477,7 @@ async def test_orphan_sweep_kills_from_persisted_state_after_holder_exit(
     short_tmp_parent: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Persisted reap state drives the kill once lsof sees no holder."""
+    """Persisted reap state kills the member and releases its directory."""
     import json as json_mod
 
     from omnigent.runtime.harnesses import process_manager as pm_mod
@@ -1506,6 +1506,10 @@ async def test_orphan_sweep_kills_from_persisted_state_after_holder_exit(
         sweep_task = asyncio.create_task(pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent))
         await asyncio.to_thread(child.wait, 10)
         swept = await sweep_task
+        deadline = time.monotonic() + 10.0
+        while swept == 0 and instance_dir.exists() and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+            swept = await pm_mod.sweep_orphaned_instance_dirs(short_tmp_parent)
 
         assert swept == 1
         assert not instance_dir.exists()

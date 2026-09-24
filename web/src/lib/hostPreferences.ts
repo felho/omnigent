@@ -14,19 +14,9 @@
 const STORAGE_KEY = "omnigent:last-host-choice";
 const SANDBOX_PROVIDER_KEY = "omnigent:last-sandbox-provider";
 
-// Desktop builds predating the bare-hex host-id format persisted the pick as
-// "host_<32-hex>", while /v1/hosts only ever reports bare ids — so the stored
-// spelling can never match the live list and the picker would wait on it
-// forever. Matches exactly the legacy shape; anything else (including the
-// sandbox sentinel) passes through verbatim.
+// Only the legacy host_<32-hex> spelling can be normalized safely.
 const LEGACY_HOST_ID = /^host_([0-9a-f]{32})$/;
 
-/**
- * Strip the legacy `host_` prefix from a stored host id, mirroring
- * `localHostId()` in the Electron shell and `_validated_host_id` in
- * omnigent/host/identity.py, so a pick persisted by a pre-migration build
- * still matches the bare-hex ids `/v1/hosts` reports.
- */
 function normalizeHostChoice(choice: string): string {
   const match = LEGACY_HOST_ID.exec(choice);
   return match ? match[1] : choice;

@@ -1,17 +1,16 @@
-"""The deploy's app lock must resolve only against the deploy-scoped index.
+"""The deploy's app lock must resolve only from public PyPI.
 
 The generated ``deploy/databricks/src/uv.lock`` installs inside the Databricks
-Apps build runtime, so every registry it references must be reachable from
-there. Two ambient machine settings routinely point somewhere else:
+Apps build runtime, which reaches only public PyPI. Ambient machine settings
+routinely point somewhere else: the generic ``UV_INDEX_URL`` (exported
+globally on machines behind a corporate mirror just to make uv work locally)
+and machine-level uv config ``[[index]]`` entries, which outrank the weak
+``--index-url`` flag and — for non-default entries — even ``--default-index``.
 
-- the generic ``UV_INDEX_URL``, exported globally on machines behind a
-  corporate mirror just to make uv work locally;
-- a machine-level uv config ``[[index]] ... default = true``, which outranks
-  the weak ``--index-url`` flag entirely.
-
-``run_uv_lock`` therefore honors only the deploy-scoped ``DEPLOY_UV_INDEX_URL``,
-pins the index via the strong ``--default-index``/``UV_DEFAULT_INDEX`` knobs,
-and fails loudly when the generated lock still resolved from another registry.
+``run_uv_lock`` therefore locks hermetically: ``--no-config`` shuts out
+machine config, every index env var is stripped from the child env, the index
+is pinned to public PyPI, and the deploy fails loudly when the generated lock
+still resolved from another registry.
 """
 
 from __future__ import annotations
@@ -49,13 +48,13 @@ def deploy_mod() -> Iterator[ModuleType]:
 def _clean_index_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Strip ambient index config so a mirror-configured machine can't skew us."""
     for var in (
-        "DEPLOY_UV_INDEX_URL",
+        "UV_CONFIG_FILE",
+        "UV_DEFAULT_INDEX",
+        "UV_EXTRA_INDEX_URL",
+        "UV_FIND_LINKS",
         "UV_INDEX",
         "UV_INDEX_URL",
-        "UV_EXTRA_INDEX_URL",
-        "UV_DEFAULT_INDEX",
         "UV_NO_CONFIG",
-        "UV_CONFIG_FILE",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -93,44 +92,39 @@ def test_lock_ignores_generic_uv_index_url(
     assert "UV_INDEX_URL" not in lock_call["env"]
 
 
-def test_lock_honors_deploy_scoped_index(
+def test_lock_shuts_out_machine_uv_config(
+    deploy_mod: ModuleType, lock_call: dict[str, Any]
+) -> None:
+    """Machine-level uv config outranks the index flags, so uv must not read it."""
+    deploy_mod.run_uv_lock(lock_call["src"])
+
+    assert "--no-config" in lock_call["cmd"]
+    # --index-url is the deprecated weak form a config default index outranks.
+    assert "--index-url" not in lock_call["cmd"]
+
+
+def test_lock_strips_every_index_env_var(
     deploy_mod: ModuleType, lock_call: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """DEPLOY_UV_INDEX_URL is the one opt-in that redirects the lock."""
-    monkeypatch.setenv("DEPLOY_UV_INDEX_URL", "https://proxy.example/simple")
-    # Rewrite the stub lock to the requested proxy so the registry check passes.
-    src = lock_call["src"]
-
-    def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        lock_call["cmd"] = cmd
-        lock_call["env"] = kwargs["env"]
-        (src / "uv.lock").write_text('source = { registry = "https://proxy.example/simple" }\n')
-        return subprocess.CompletedProcess(cmd, 0)
-
-    monkeypatch.setattr(deploy_mod.subprocess, "run", fake_run)
-
-    deploy_mod.run_uv_lock(src)
-
-    index = lock_call["cmd"][lock_call["cmd"].index("--default-index") + 1]
-    assert index == "https://proxy.example/simple"
-    assert lock_call["env"]["UV_DEFAULT_INDEX"] == "https://proxy.example/simple"
-
-
-def test_lock_pins_strong_index_knobs(
-    deploy_mod: ModuleType, lock_call: dict[str, Any], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The child env pins UV_DEFAULT_INDEX and drops the weaker/stray knobs."""
-    monkeypatch.setenv("UV_INDEX", "corp = https://mirror.corp.example/simple")
-    monkeypatch.setenv("UV_INDEX_URL", "https://mirror.corp.example/simple")
+    """Index env vars survive --no-config, so none may reach the child env."""
+    hostile = {
+        "UV_CONFIG_FILE": "/etc/uv/uv.toml",
+        "UV_DEFAULT_INDEX": "https://mirror.corp.example/simple",
+        "UV_EXTRA_INDEX_URL": "https://mirror.corp.example/simple",
+        "UV_FIND_LINKS": "https://mirror.corp.example/wheels",
+        "UV_INDEX": "corp = https://mirror.corp.example/simple",
+        "UV_INDEX_URL": "https://mirror.corp.example/simple",
+        "UV_NO_CONFIG": "0",
+    }
+    for var, value in hostile.items():
+        monkeypatch.setenv(var, value)
 
     deploy_mod.run_uv_lock(lock_call["src"])
 
-    env = lock_call["env"]
-    assert env["UV_DEFAULT_INDEX"] == _PUBLIC
-    assert "UV_INDEX" not in env
-    assert "UV_INDEX_URL" not in env
-    # --index-url is the deprecated weak form a config default index outranks.
-    assert "--index-url" not in lock_call["cmd"]
+    for var in hostile:
+        assert var not in lock_call["env"]
+    index = lock_call["cmd"][lock_call["cmd"].index("--default-index") + 1]
+    assert index == _PUBLIC
 
 
 def test_lock_fails_loudly_on_foreign_registry(
@@ -190,7 +184,7 @@ def test_registry_check_matches_credentialed_index(deploy_mod: ModuleType, tmp_p
     """A credentialed index must match its own credential-less lock entry.
 
     uv does not persist index userinfo into ``uv.lock`` registry sources, so a
-    deploy locked against ``https://user:token@proxy/simple`` records
+    lock requested against ``https://user:token@proxy/simple`` records
     ``https://proxy/simple`` — a correct lock that must not abort the deploy.
     """
     lock = tmp_path / "uv.lock"

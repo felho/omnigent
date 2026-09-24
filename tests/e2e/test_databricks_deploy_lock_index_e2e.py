@@ -1,21 +1,25 @@
 """Databricks deploy lock generation must not bake a machine mirror index.
 
 Guards the operator journey: a machine whose uv configuration registers a
-private mirror as the *default* index (``[[index]] ... default = true``) and
-whose shell exports the generic ``UV_INDEX_URL`` at that mirror runs the
-Databricks deploy. If either leaks into the generated
-``deploy/databricks/src/uv.lock``, its ``registry`` sources and direct wheel
-``url`` entries point at the mirror host, which the Databricks Apps build runtime
-cannot reach, so the app install fails and the app never starts.
+private mirror — as the *default* index (``[[index]] ... default = true``,
+which outranks ``--index-url``) and as an extra named index (which outranks
+even ``--default-index``) — and whose shell exports the generic
+``UV_INDEX_URL`` at that mirror runs the Databricks deploy. If any of them
+leaks into the generated ``deploy/databricks/src/uv.lock``, its ``registry``
+sources and direct wheel ``url`` entries point at the mirror host, which the
+Databricks Apps build runtime cannot reach, so the app install fails and the
+app never starts.
 
 The test stands up two local "simple" indexes (a stand-in for public PyPI and
 a stand-in for the machine mirror, both serving the same tiny wheel), points a
-machine-level uv config and ``UV_INDEX_URL`` at the mirror, invokes the real
-``run_uv_lock`` from ``deploy/databricks/deploy.py`` with ``DEPLOY_UV_INDEX_URL``
-naming the intended index, and asserts the generated lock never references the
-mirror host. When the lock resolved against the requested index, it also proves
-the Apps-runtime half of the journey: with the mirror down, ``uv sync --locked``
-still installs cleanly.
+machine-level uv config and ``UV_INDEX_URL`` at the mirror, and invokes the
+real ``run_uv_lock`` from ``deploy/databricks/deploy.py`` with its pinned
+public index pointed at the public stand-in. The app pyproject also carries a
+local wheel via ``[tool.uv.sources]``, like the real generated one, proving
+the hermetic lock still honors the project's own path sources. The generated
+lock must never reference the mirror host. When the lock resolved against the
+pinned index, the test also proves the Apps-runtime half of the journey: with
+the mirror down, ``uv sync --locked`` still installs cleanly.
 """
 
 from __future__ import annotations
@@ -55,20 +59,20 @@ def deploy_mod() -> Iterator[ModuleType]:
         sys.modules.pop(spec.name, None)
 
 
-def _probe_wheel_bytes() -> bytes:
-    """Build a minimal valid py3-none-any wheel for the probe package."""
+def _wheel_bytes(name: str) -> bytes:
+    """Build a minimal valid py3-none-any wheel for the named package."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("probepkg/__init__.py", "__version__ = '1.0.0'\n")
+        z.writestr(f"{name}/__init__.py", "__version__ = '1.0.0'\n")
         z.writestr(
-            "probepkg-1.0.0.dist-info/METADATA",
-            "Metadata-Version: 2.1\nName: probepkg\nVersion: 1.0.0\n\n",
+            f"{name}-1.0.0.dist-info/METADATA",
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0.0\n\n",
         )
         z.writestr(
-            "probepkg-1.0.0.dist-info/WHEEL",
+            f"{name}-1.0.0.dist-info/WHEEL",
             "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n\n",
         )
-        z.writestr("probepkg-1.0.0.dist-info/RECORD", "")
+        z.writestr(f"{name}-1.0.0.dist-info/RECORD", "")
     return buf.getvalue()
 
 
@@ -94,7 +98,7 @@ def index_servers(tmp_path: Path) -> Iterator[tuple[str, str, ThreadingHTTPServe
         object is exposed so the test can take the mirror down, modelling the
         Databricks Apps build runtime where it is unreachable.
     """
-    wheel = _probe_wheel_bytes()
+    wheel = _wheel_bytes("probepkg")
     servers: list[ThreadingHTTPServer] = []
     urls: list[str] = []
     for side in ("public", "mirror"):
@@ -122,11 +126,13 @@ def test_generated_app_lock_ignores_machine_mirror_index(
     public_url, mirror_url, mirror_server = index_servers
 
     # The operator's machine: uv config registers a private mirror as the
-    # default index, which overrides --index-url unless the deploy opts out.
+    # default index (outranks --index-url) and as an extra named index
+    # (outranks even --default-index); only --no-config shuts both out.
     machine_config = tmp_path / "xdg" / "uv"
     machine_config.mkdir(parents=True)
     (machine_config / "uv.toml").write_text(
         f'[[index]]\nurl = "{mirror_url}/simple"\ndefault = true\n'
+        f'\n[[index]]\nname = "corp-extra"\nurl = "{mirror_url}/simple"\n'
     )
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     for var in (
@@ -135,6 +141,7 @@ def test_generated_app_lock_ignores_machine_mirror_index(
         "UV_INDEX",
         "UV_DEFAULT_INDEX",
         "UV_EXTRA_INDEX_URL",
+        "UV_FIND_LINKS",
     ):
         monkeypatch.delenv(var, raising=False)
     # Keep localhost traffic away from any ambient corporate proxy.
@@ -143,14 +150,16 @@ def test_generated_app_lock_ignores_machine_mirror_index(
     # Corporate shells export the generic UV_INDEX_URL at the mirror just to
     # make uv work locally; the deploy must not let it leak into the lock.
     monkeypatch.setenv("UV_INDEX_URL", f"{mirror_url}/simple")
-    # Only the deploy-scoped variable opts the lock into a specific index; the
-    # generated lock must point at this index, not the machine mirror.
-    monkeypatch.setenv("DEPLOY_UV_INDEX_URL", f"{public_url}/simple")
+    # In production the pinned index is public PyPI; point it at the local
+    # stand-in so the test never leaves the machine.
+    monkeypatch.setattr(deploy_mod, "_UV_DEFAULT_INDEX_URL", f"{public_url}/simple")
 
     # The app source directory, shaped like deploy/databricks/src's generated
-    # pyproject (same name / requires-python), with a registry dependency.
+    # pyproject (same name / requires-python), with a registry dependency and
+    # a local wheel [tool.uv.sources] entry like the real deploy wheels.
     src = tmp_path / "appsrc"
     src.mkdir()
+    (src / "localpkg-1.0.0-py3-none-any.whl").write_bytes(_wheel_bytes("localpkg"))
     (src / "pyproject.toml").write_text(
         "[project]\n"
         'name = "omnigent-databricks-app"\n'
@@ -158,7 +167,10 @@ def test_generated_app_lock_ignores_machine_mirror_index(
         'requires-python = ">=3.12,<3.13"\n'
         "dependencies = [\n"
         '  "probepkg==1.0.0",\n'
-        "]\n"
+        '  "localpkg",\n'
+        "]\n\n"
+        "[tool.uv.sources]\n"
+        'localpkg = { path = "./localpkg-1.0.0-py3-none-any.whl" }\n'
     )
 
     deploy_mod.run_uv_lock(src)
@@ -173,17 +185,22 @@ def test_generated_app_lock_ignores_machine_mirror_index(
     ]
     assert not leaked, (
         "run_uv_lock baked the machine's mirror index into the generated app "
-        f"uv.lock even though DEPLOY_UV_INDEX_URL requested {public_url}/simple; "
-        "the Databricks Apps runtime cannot reach the mirror, so the deployed "
-        "app fails to install. Leaked references:\n" + "\n".join(leaked)
+        "uv.lock; the Databricks Apps runtime cannot reach the mirror, so the "
+        "deployed app fails to install. Leaked references:\n" + "\n".join(leaked)
     )
 
-    # The fix pins the requested index, so the registry dependency must have
-    # resolved from the public stand-in — anything else means the lock points
-    # somewhere the Apps runtime was never promised to reach.
+    # The hermetic lock pins the public index, so the registry dependency must
+    # have resolved from the public stand-in — anything else means the lock
+    # points somewhere the Apps runtime was never promised to reach.
     assert f"{public_url}/simple" in lock_text, (
-        "the generated lock does not reference the requested index "
+        "the generated lock does not reference the pinned public index "
         f"{public_url}/simple; it resolved from somewhere else entirely:\n" + lock_text
+    )
+
+    # --no-config must not disturb the project's own [tool.uv.sources]; the
+    # real generated pyproject ships the omnigent wheels as local paths.
+    assert "localpkg-1.0.0-py3-none-any.whl" in lock_text, (
+        "the hermetic lock dropped the project's local wheel source:\n" + lock_text
     )
 
     # The Databricks Apps build runtime: no machine uv config, and the
@@ -195,7 +212,6 @@ def test_generated_app_lock_ignores_machine_mirror_index(
     empty_config.mkdir()
     monkeypatch.setenv("XDG_CONFIG_HOME", str(empty_config))
     monkeypatch.delenv("UV_INDEX_URL", raising=False)
-    monkeypatch.delenv("DEPLOY_UV_INDEX_URL", raising=False)
     result = subprocess.run(
         ["uv", "sync", "--locked", "--python", "3.12"],
         cwd=src,

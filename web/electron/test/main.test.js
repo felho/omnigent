@@ -41,6 +41,8 @@ function loadNavigationHarness({
   ensureSession = async (_ses, origin) => origin,
   expandWorkspace = async (url) => url,
   realBrowserRegistry = false,
+  arcaPath = null,
+  arcaResult = { ok: true, alreadyRunning: false },
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -50,7 +52,15 @@ function loadNavigationHarness({
     );
   }
   const listeners = new Map();
-  const calls = { loadFile: [], loadURL: [], auth: [], manifests: [], progress: [], reloads: 0 };
+  const calls = {
+    loadFile: [],
+    loadURL: [],
+    auth: [],
+    manifests: [],
+    progress: [],
+    reloads: 0,
+    arcaConnects: [],
+  };
   const pickers = [];
   const ipc = new Map();
   const webRequest = {};
@@ -224,6 +234,17 @@ function loadNavigationHarness({
       chooseDeepLinkStrategy: () => null,
     },
     "./workspace-chrome": { registerWorkspaceChromeHide: () => {} },
+    // Never probe for or spawn a real arca from tests.
+    "./arca": {
+      ...require("../src/arca"),
+      resolveArcaPath: () => arcaPath,
+      resolveArcaPathAsync: async () => arcaPath,
+      isExecutableFile: (p) => p === arcaPath,
+      startArcaConnect: (url) => {
+        calls.arcaConnects.push(url);
+        return { command: "arca ssh", promise: Promise.resolve(arcaResult), cancel: () => {} };
+      },
+    },
     "./databricks-session": {
       ensureDatabricksSession: (...args) => {
         calls.auth.push(args);
@@ -353,6 +374,99 @@ function loadNavigationHarness({
     },
   };
 }
+
+describe("Arca auto-connect wiring", () => {
+  const workspace = "https://workspace.cloud.databricks.com/omnigent";
+  const tick = () =>
+    new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+  const serverEvent = (h) => ({ sender: h.webContents, senderFrame: { url: workspace } });
+
+  it("connects Arca once per launch after loading a managed server with arca installed", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      arcaPath: "/usr/local/bin/arca",
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    await h.api.loadServerUrl(h.win, workspace);
+    await tick();
+    assert.deepEqual(h.calls.arcaConnects, [workspace]);
+    const pushed = h.calls.progress.filter((p) => p.channel === "omnigent:arca-status-changed");
+    assert.deepEqual(
+      pushed.map((p) => p.data.state),
+      ["starting", "online"],
+    );
+
+    const features = await h.ipc.get("omnigent:get-desktop-features")(serverEvent(h));
+    assert.equal(features.arca, true);
+    assert.equal(features.databricksInternalFeatures, false);
+    const status = await h.ipc.get("omnigent:arca-status")(serverEvent(h));
+    assert.equal(status.state, "online");
+
+    // A reload in the same launch doesn't re-run the command.
+    await h.api.loadServerUrl(h.win, workspace);
+    await tick();
+    assert.equal(h.calls.arcaConnects.length, 1);
+  });
+
+  it("stays silent without arca or the MDM flag", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    await h.api.loadServerUrl(h.win, workspace);
+    await tick();
+    assert.deepEqual(h.calls.arcaConnects, []);
+    const features = await h.ipc.get("omnigent:get-desktop-features")(serverEvent(h));
+    assert.equal(features.arca, false);
+    const status = await h.ipc.get("omnigent:arca-status")(serverEvent(h));
+    assert.equal(status.state, "unavailable");
+  });
+
+  it("honors the settings toggle and persists changes to it", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      arcaPath: "/usr/local/bin/arca",
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const off = await h.ipc.get("omnigent:arca-set-auto-connect")(serverEvent(h), false);
+    assert.equal(off.state, "disabled");
+    assert.equal(JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).arca_auto_connect, false);
+    await h.api.loadServerUrl(h.win, workspace);
+    await tick();
+    assert.deepEqual(h.calls.arcaConnects, []);
+  });
+
+  it("retries only a failed run", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      arcaPath: "/usr/local/bin/arca",
+      arcaResult: { ok: false, errorKind: "timeout", error: "timed out" },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    await h.api.loadServerUrl(h.win, workspace);
+    await tick();
+    const failed = await h.ipc.get("omnigent:arca-status")(serverEvent(h));
+    assert.equal(failed.errorKind, "timeout");
+    await h.ipc.get("omnigent:arca-retry")(serverEvent(h));
+    assert.equal(h.calls.arcaConnects.length, 2);
+  });
+
+  it("ignores Arca status IPC from an untrusted frame", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const foreign = { sender: h.webContents, senderFrame: { url: "https://evil.example/" } };
+    assert.equal(await h.ipc.get("omnigent:arca-retry")(foreign), null);
+    assert.equal(await h.ipc.get("omnigent:arca-set-auto-connect")(foreign, false), null);
+  });
+});
 
 describe("Databricks auth mode wiring", () => {
   const workspace = "https://workspace.cloud.databricks.com/omnigent";

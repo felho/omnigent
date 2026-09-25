@@ -115,8 +115,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   controlHost: (action) => ipcRenderer.invoke("omnigent:host-control", action),
   /**
    * Desktop feature gates the server can't know about — currently
-   * `{ databricksInternalFeatures }` from macOS Managed Preferences, scoped
-   * to the window's server (true only on Databricks-managed servers).
+   * `{ databricksInternalFeatures, arca }`, scoped to the window's server
+   * (true only on Databricks-managed servers). `arca` is also true when the
+   * arca CLI is installed, without the MDM flag.
    * Resolves null off a connected server.
    */
   getDesktopFeatures: () => ipcRenderer.invoke("omnigent:get-desktop-features"),
@@ -126,6 +127,27 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * process. Resolves a `{ ok, error?, authError? }` result.
    */
   connectArcaHost: () => ipcRenderer.invoke("omnigent:arca-connect"),
+  /**
+   * Launch-time Arca auto-connect status for the window's server —
+   * `{ state, autoConnect, command, errorKind?, error?, output? }`, or null
+   * off a connected server. The main process starts the run; the SPA only
+   * reads it, retries a failed run, or toggles it for future launches.
+   */
+  getArcaStatus: () => ipcRenderer.invoke("omnigent:arca-status"),
+  retryArcaConnect: () => ipcRenderer.invoke("omnigent:arca-retry"),
+  /** @param {boolean} enabled */
+  setArcaAutoConnect: (enabled) =>
+    ipcRenderer.invoke("omnigent:arca-set-auto-connect", enabled === true),
+  /**
+   * Subscribe to Arca auto-connect status changes. Returns an unsubscribe.
+   * @param {(status: object) => void} callback
+   * @returns {() => void}
+   */
+  onArcaStatusChanged: (callback) => {
+    const listener = (_event, status) => callback(status);
+    ipcRenderer.on("omnigent:arca-status-changed", listener);
+    return () => ipcRenderer.removeListener("omnigent:arca-status-changed", listener);
+  },
 
   /**
    * Subscribe to host status-change pings. Fired only on real events (a host

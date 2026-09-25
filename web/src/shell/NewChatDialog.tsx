@@ -252,8 +252,11 @@ import {
   getHostIdentity,
   isElectronShell,
   onHostStatusChanged,
+  retryArcaConnect,
+  setArcaAutoConnect,
   type HostIdentity,
 } from "@/lib/nativeBridge";
+import { useArcaStatus } from "@/hooks/useArcaAutoConnect";
 import {
   useAvailableAgents,
   prefetchAvailableAgentDetails,
@@ -2405,6 +2408,8 @@ export function NewChatLandingScreen() {
   const [arcaError, setArcaError] = useState<string | null>(null);
   // Mirrors pendingConnectRef for the Arca row: connect after the menu closes.
   const pendingArcaConnectRef = useRef(false);
+  // Live auto-connect status from the desktop shell (null = loading or browser).
+  const arcaAutoConnectStatus = useArcaStatus();
   // Sandbox repository inputs — composed into the managed create's
   // `workspace` string (`<url>[#<branch>]`); both blank = empty
   // server-created workspace.
@@ -2696,7 +2701,8 @@ export function NewChatLandingScreen() {
     if (!isElectronShell()) return;
     let cancelled = false;
     void getDesktopFeatures().then((features) => {
-      if (!cancelled) setArcaEnabled(features?.databricksInternalFeatures === true);
+      if (!cancelled)
+        setArcaEnabled(features?.arca === true || features?.databricksInternalFeatures === true);
     });
     return () => {
       cancelled = true;
@@ -6571,15 +6577,27 @@ export function NewChatLandingScreen() {
                         {showArcaOption && (
                           <DropdownMenuItem
                             onSelect={() => {
-                              pendingArcaConnectRef.current = true;
+                              if (arcaAutoConnectStatus?.state === "failed") {
+                                void retryArcaConnect();
+                              } else {
+                                pendingArcaConnectRef.current = true;
+                              }
                             }}
-                            disabled={connectingArca}
+                            disabled={connectingArca || arcaAutoConnectStatus?.state === "starting"}
                             data-testid="new-chat-landing-run-on-arca"
                           >
                             <span className="flex size-4 shrink-0 items-center justify-center">
                               <MonitorCloudIcon className="size-3.5 text-muted-foreground" />
                             </span>
-                            <span>{connectingArca ? "Connecting to Arca…" : "Run on Arca"}</span>
+                            <span>
+                              {arcaAutoConnectStatus?.state === "starting"
+                                ? "Arca · Starting…"
+                                : arcaAutoConnectStatus?.state === "failed"
+                                  ? "Couldn't connect Arca · Retry"
+                                  : connectingArca
+                                    ? "Connecting to Arca…"
+                                    : "Run on Arca"}
+                            </span>
                           </DropdownMenuItem>
                         )}
                         {hasCloudOptions && <DropdownMenuSeparator />}
@@ -6632,6 +6650,20 @@ export function NewChatLandingScreen() {
                           <PlusIcon className="size-4" />
                           Connect new host
                         </DropdownMenuItem>
+                        {arcaEnabled &&
+                          arcaAutoConnectStatus !== null &&
+                          arcaAutoConnectStatus.state !== "unavailable" && (
+                            <>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuCheckboxItem
+                                checked={arcaAutoConnectStatus.autoConnect}
+                                onCheckedChange={(checked) => void setArcaAutoConnect(checked)}
+                                data-testid="new-chat-landing-arca-autoconnect-toggle"
+                              >
+                                Connect Arca at launch
+                              </DropdownMenuCheckboxItem>
+                            </>
+                          )}
                       </DropdownMenuContent>
                     </DropdownMenu>
 

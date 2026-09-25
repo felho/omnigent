@@ -512,6 +512,18 @@ def strip_browser_tool_schemas(schemas: list[_JsonObject]) -> list[_JsonObject]:
     return kept
 
 
+def _schema_only_cwd() -> str:
+    """Return a directory that is guaranteed to exist, for schema-only OS environments.
+
+    A runner can outlive its process cwd (its session's git worktree removed).
+    Schema extraction never executes tools, so any existing directory works.
+    """
+    try:
+        return os.getcwd()
+    except OSError:
+        return tempfile.gettempdir()
+
+
 def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]:
     """Build the flat Omnigent tool surface for native harness bridges.
 
@@ -572,7 +584,15 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     if spec is not None:
         from omnigent.tools.manager import ToolManager
 
-        for schema in ToolManager(spec).get_tool_schemas():
+        schema_spec = spec
+        if spec.os_env is not None and spec.os_env.cwd is None:
+            # ``ToolManager`` would otherwise resolve this to ``os.getcwd()``,
+            # which a runner whose session worktree was removed can't provide.
+            schema_spec = dataclasses.replace(
+                spec, os_env=dataclasses.replace(spec.os_env, cwd=_schema_only_cwd())
+            )
+
+        for schema in ToolManager(schema_spec).get_tool_schemas():
             function = _string_object_dict(schema.get("function"))
             if function is not None and function.get("name") in _NATIVE_RELAY_BUILTIN_TOOLS:
                 _append(function)
@@ -607,7 +627,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
 
     _os_spec = OSEnvSpec(
         type="caller_process",
-        cwd=str(Path.cwd()),
+        cwd=_schema_only_cwd(),
         sandbox=OSEnvSandboxSpec(type="none"),
         fork=False,
     )

@@ -35,7 +35,14 @@ def load_global_config(path: Path | None = None) -> _Config:
 
 def load_local_config(path: Path | None = None) -> _Config:
     """Load the project-level config, returning an empty mapping when absent."""
-    resolved_path = path or Path.cwd() / _LOCAL_CONFIG_RELPATH
+    if path is not None:
+        resolved_path = path
+    else:
+        try:
+            resolved_path = Path.cwd() / _LOCAL_CONFIG_RELPATH
+        except OSError:
+            # Runner outlived its cwd (session worktree removed) — no project dir.
+            return {}
     if not resolved_path.exists():
         return {}
     with resolved_path.open() as config_file:

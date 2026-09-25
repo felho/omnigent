@@ -12,6 +12,7 @@ from omnigent.config import (
     global_config_path,
     load_effective_config,
     load_global_config,
+    load_local_config,
     save_global_config,
     set_github_account_preference,
 )
@@ -87,6 +88,19 @@ def test_effective_config_merges_project_over_user(
     monkeypatch.chdir(project)
 
     assert load_effective_config() == {"profile": "local", "model": "global-model"}
+
+
+@pytest.mark.posix_only
+def test_load_local_config_survives_deleted_working_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A runner whose session worktree was removed has no project dir, not a crash."""
+    removed = tmp_path / "removed"
+    removed.mkdir()
+    with monkeypatch.context() as context:
+        context.chdir(removed)
+        removed.rmdir()
+        assert load_local_config() == {}
 
 
 def test_github_account_preference_round_trip(tmp_path: Path) -> None:

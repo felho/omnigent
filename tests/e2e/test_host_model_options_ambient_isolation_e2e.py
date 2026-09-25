@@ -1,12 +1,13 @@
-"""E2E regression: host model-options tests must ignore ambient provider config.
+"""E2E regression: host model-options tests must ignore ambient provider state.
 
 Reproduces the developer journey from the bug report "tests/host/test_connect.py
 model-options tests fail on machines whose ambient pi default is a subscription":
 
-1. the machine's ambient omnigent config sets subscription provider defaults —
-   the pi surface pinned to Pi's own CLI login (``default: pi`` on a
-   ``kind: subscription, cli: pi`` entry), with claude/codex subscription
-   logins defaulted alongside (the keyring-login-rich developer machine),
+1. the machine carries ambient provider state — an omnigent config whose pi
+   surface is pinned to Pi's own CLI login (``default: pi`` on a
+   ``kind: subscription, cli: pi`` entry), claude/codex subscription logins
+   defaulted alongside, and vendor API keys exported in the environment (the
+   credential-rich developer machine),
 2. the developer runs the host model-options tests on an unpatched tree::
 
        pytest tests/host/test_connect.py -k "handle_model_options or model_options_frame"
@@ -18,12 +19,12 @@ model-options tests fail on machines whose ambient pi default is a subscription"
    local runs look broken, and unrelated patches get blamed.
 
 This test drives that journey in a nested pytest whose config home carries the
-ambient subscription defaults, and requires the nested run to be green: the
-model-options tests must isolate the source-resolution seam (or otherwise stop
-absorbing the machine's ambient config). ``$OMNIGENT_CONFIG_HOME`` is the
-onboarding layer's own config-home relocation, so the nested run resolves the
-staged config through exactly the code path a real ``~/.omnigent/config.yaml``
-takes.
+ambient subscription defaults and whose environment carries vendor API keys,
+and requires the nested run to be green: the model-options tests must isolate
+the whole source-resolution seam — both ``load_config()`` (relocated by
+``$OMNIGENT_CONFIG_HOME``, the onboarding layer's own config-home seam, so the
+staged config takes exactly the code path a real ``~/.omnigent/config.yaml``
+takes) and ambient-credential detection (which reads vendor env keys).
 
 No LLM and no live server are needed — this is pure host-side resolution — so
 it runs without ``--llm-api-key``::
@@ -61,6 +62,13 @@ providers:
     default: true
 """
 
+# Vendor keys ambient-credential detection would adopt as provider defaults
+# when the config declares none (obviously fake values).
+_AMBIENT_DETECTION_ENV = {
+    "ANTHROPIC_API_KEY": "test-anthropic-key",
+    "OPENAI_API_KEY": "test-openai-key",
+}
+
 # The exact selection from the bug report's journey. Every model-options test
 # rides through HostProcess._handle_model_options, the seam that resolves the
 # ambient provider config.
@@ -75,17 +83,20 @@ def test_model_options_tests_ignore_ambient_subscription_defaults(tmp_path: Path
     """The host model-options tests must pass on a subscription-default machine.
 
     Stages a config home whose providers resolve subscription defaults for the
-    pi/anthropic/openai surfaces, then runs the real developer command against
-    it. Without seam isolation this FAILS: the frames gain
-    ``source={'kind': 'subscription', ...}`` on every model row and the
-    exact-frame assertions report failures on a pristine tree.
+    pi/anthropic/openai surfaces plus detectable vendor env keys, then runs the
+    real developer command against them. Without seam isolation this FAILS: the
+    frames gain ``source={'kind': 'subscription', ...}`` on every model row and
+    the exact-frame assertions report failures on a pristine tree.
     """
     config_home = tmp_path / "ambient-omnigent-home"
     config_home.mkdir()
     (config_home / "config.yaml").write_text(_AMBIENT_SUBSCRIPTION_CONFIG, encoding="utf-8")
 
-    env = os.environ.copy()
+    # Drop the outer runner's pytest vars so the nested run starts clean, then
+    # stage the ambient machine state.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}
     env["OMNIGENT_CONFIG_HOME"] = str(config_home)
+    env.update(_AMBIENT_DETECTION_ENV)
 
     nested = subprocess.run(
         [
@@ -115,8 +126,8 @@ def test_model_options_tests_ignore_ambient_subscription_defaults(tmp_path: Path
     # no-tests-collected code (5), which must read as a broken guard, not green.
     passed = re.search(r"(\d+) passed", output)
     assert nested.returncode == 0 and passed and int(passed.group(1)) > 0, (
-        "host model-options tests absorbed the machine's ambient provider config "
-        "(subscription source decoration leaked into the model-options frames) "
+        "host model-options tests absorbed the machine's ambient provider state "
+        "(subscription/key source decoration leaked into the model-options frames) "
         f"instead of isolating it — nested pytest exited {nested.returncode}:\n"
         f"{output}"
     )

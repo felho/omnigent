@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from omnigent.harnesses.pi_native.model_scope import ScopableModel, scope_models
 
 _SONNET = ScopableModel("anthropic", "claude-sonnet-4-5", "Claude Sonnet 4.5")
@@ -81,3 +83,43 @@ def test_patterns_union_without_duplicates() -> None:
 def test_unmatched_patterns_select_nothing() -> None:
     """Patterns that match nothing yield an empty scope (callers fall back)."""
     assert scope_models(["mistral/devstral-large"], _CATALOG) == []
+
+
+def test_invalid_character_class_selects_nothing_without_raising() -> None:
+    """A class the regex engine rejects matches nothing, like minimatch.
+
+    minimatch resolves a reversed range (``[z-a]``) to "matches nothing";
+    Python's ``re`` raises on it instead. The mirror must swallow that
+    difference: a bad class silently selects nothing rather than crashing
+    catalog resolution for the whole picker.
+    """
+    assert scope_models(["[z-a]"], _CATALOG) == []
+    assert scope_models(["x[b-a]y"], _CATALOG) == []
+    assert scope_models(["anthropic/[z-a]*"], _CATALOG) == []
+
+
+def test_invalid_class_pattern_keeps_other_patterns_selecting() -> None:
+    """One bad pattern never poisons the rest of the curation."""
+    assert scope_models(["[z-a]", "anthropic/claude-sonnet-4-5"], _CATALOG) == [_SONNET]
+
+
+def test_wildcard_heavy_patterns_resolve_without_backtracking_blowup() -> None:
+    """Adjacent/interleaved wildcards must not backtrack catastrophically.
+
+    ``********X`` against a long id used to hang the naive translation
+    (each ``*`` compiled to an independent ``[^/]*``). Wall-clock bound: the
+    hardened translation resolves these in microseconds; well under a second
+    even on a loaded machine, versus effectively-forever before.
+    """
+    long_id_catalog = [*_CATALOG, ScopableModel("openai", "a" * 80, "long id")]
+    start = time.perf_counter()
+    assert scope_models(["*" * 8 + "X"], long_id_catalog) == []
+    assert scope_models(["*?" * 8 + "X"], long_id_catalog) == []
+    assert scope_models(["*a*a*a*a*a*a*X"], long_id_catalog) == []
+    assert time.perf_counter() - start < 5.0
+
+
+def test_wildcard_runs_still_match_like_single_stars() -> None:
+    """Collapsed ``*`` runs keep single-star semantics."""
+    assert scope_models(["anthropic/claude-s***5"], _CATALOG) == [_SONNET]
+    assert scope_models(["anthropic/claude-[!o]*"], _CATALOG) == [_SONNET]

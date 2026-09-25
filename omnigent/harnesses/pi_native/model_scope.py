@@ -19,7 +19,12 @@ resolver's observable semantics:
 
 Patterns that match nothing select nothing; Pi treats an entirely unmatched
 scope as "no curation", so callers should fall back to the unscoped catalog
-when the result is empty.
+when the result is empty. Like minimatch, a character class the regex engine
+rejects (e.g. a reversed range ``[z-a]``) makes its pattern match nothing
+rather than raise.
+
+Verified against Pi 0.84.2 (``core/model-resolver.js``, minimatch 10);
+re-verify when the pinned Pi resolver changes.
 """
 
 from __future__ import annotations
@@ -77,6 +82,8 @@ def _match_pattern(pattern: str, models: Sequence[ScopableModel]) -> list[Scopab
         if exact is not None:
             return [exact]
         regex = _glob_regex(glob)
+        if regex is None:
+            return []
         return [
             model
             for model in models
@@ -162,8 +169,12 @@ def _is_alias(model_id: str) -> bool:
     return re.search(r"-\d{8}$", model_id) is None
 
 
-def _glob_regex(pattern: str) -> re.Pattern[str]:
-    """Compile a minimatch-style glob: ``*``/``?`` stay within one ``/`` segment."""
+def _glob_regex(pattern: str) -> re.Pattern[str] | None:
+    """Compile a minimatch-style glob: ``*``/``?`` stay within one ``/`` segment.
+
+    :returns: The compiled pattern, or ``None`` when it cannot match anything
+        (minimatch resolves patterns its regex engine rejects to no matches).
+    """
     segments = pattern.split("/")
     parts: list[str] = []
     for index, segment in enumerate(segments):
@@ -175,33 +186,67 @@ def _glob_regex(pattern: str) -> re.Pattern[str]:
         parts.append(_segment_regex(segment))
         if not last:
             parts.append("/")
-    return re.compile("".join(parts), re.IGNORECASE)
+    try:
+        return re.compile("".join(parts), re.IGNORECASE)
+    except re.error:
+        return None
 
 
 def _segment_regex(segment: str) -> str:
-    """Translate one glob segment to regex (``[...]`` classes pass through)."""
-    out: list[str] = []
+    """Translate one glob segment to regex (``[...]`` classes pass through).
+
+    Wildcard runs collapse into single gaps and the fixed pieces between them
+    are committed at their leftmost occurrence (atomic groups), so wildcard-
+    heavy patterns match in linear time instead of backtracking
+    catastrophically. A class Python's ``re`` rejects (e.g. ``[z-a]``)
+    becomes a never-matching atom, like minimatch.
+    """
+    # Fixed-width regex runs, split wherever one or more ``*`` appeared.
+    pieces: list[str] = [""]
+    prev_star = False
     index = 0
     while index < len(segment):
         char = segment[index]
         if char == "*":
-            out.append("[^/]*")
-        elif char == "?":
-            out.append("[^/]")
+            if not prev_star:
+                pieces.append("")
+            prev_star = True
+            index += 1
+            continue
+        prev_star = False
+        if char == "?":
+            pieces[-1] += "[^/]"
         elif char == "[":
             closing = _find_class_end(segment, index)
             if closing is None:
-                out.append(re.escape(char))
+                pieces[-1] += re.escape(char)
             else:
                 inner = segment[index + 1 : closing]
                 if inner.startswith("!"):
                     inner = "^" + inner[1:]
-                out.append(f"[{inner}]")
+                pieces[-1] += _class_regex(inner)
                 index = closing
         else:
-            out.append(re.escape(char))
+            pieces[-1] += re.escape(char)
         index += 1
-    return "".join(out)
+    if len(pieces) == 1:
+        return pieces[0]
+    parts = [pieces[0]]
+    for piece in pieces[1:-1]:
+        parts.append(f"(?>[^/]*?{piece})")
+    parts.append("[^/]*")
+    parts.append(pieces[-1])
+    return "".join(parts)
+
+
+def _class_regex(inner: str) -> str:
+    """A validated ``[...]`` class, or a never-matching atom when invalid."""
+    candidate = f"[{inner}]"
+    try:
+        re.compile(candidate)
+    except re.error:
+        return "(?!)"
+    return candidate
 
 
 def _find_class_end(segment: str, start: int) -> int | None:

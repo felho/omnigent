@@ -27,7 +27,7 @@ def test_metadata_survives_deleted_cwd(
 ) -> None:
     """Unlinked cwd preserves request/relay schemas, all grants, and optional gates."""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("omnigent.runtime.get_terminal_registry", lambda: Mock())
+    monkeypatch.setattr("omnigent.runtime.get_terminal_registry", Mock)
     spec = AgentSpec(
         spec_version=1,
         os_env=os_env,

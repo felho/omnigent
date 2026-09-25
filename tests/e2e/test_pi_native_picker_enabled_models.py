@@ -37,6 +37,7 @@ no turn is driven), but launching the real Pi terminal needs ``pi`` /
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -56,8 +57,6 @@ from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.helpers import POLL_INTERVAL_S
 from tests.e2e.test_pi_native_unmanaged_model import (
-    _bridge_marker,
-    _kill_pi_processes,
     _UnmanagedPiHost,
     _wait_for_host_online,
 )
@@ -402,7 +401,6 @@ def test_in_session_picker_honors_pis_enabled_models(
     )
     assert create.status_code in (200, 201), f"session create failed: {create.text}"
     session_id = str(create.json()["session_id"])
-    marker = _bridge_marker(session_id)
 
     options: list[dict[str, object]] = []
     deadline = time.monotonic() + 150.0
@@ -443,4 +441,6 @@ def test_in_session_picker_honors_pis_enabled_models(
             f"the session's model buried among them."
         )
     finally:
-        _kill_pi_processes(marker)
+        # Deleting the session lets the daemon tear down its pi/tmux tree.
+        with contextlib.suppress(httpx.HTTPError):
+            http_client.delete(f"/v1/sessions/{session_id}", timeout=10.0)

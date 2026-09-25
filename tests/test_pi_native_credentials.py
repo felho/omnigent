@@ -586,6 +586,34 @@ def test_inline_databricks_gateway_listed_default_follows_the_workspace_surface(
     assert [m["id"] for m in rendered["omnigent-openai"]["models"]] == ["system.ai.gpt-5"]
 
 
+def test_inline_databricks_gateway_unlisted_override_is_routed_like_databricks_kind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the configured default carries the entry's declared surface.
+
+    Any other override the listing omits is routed exactly as the
+    databricks-kind path routes it: by the model's family classification.
+    """
+    from omnigent.models.pi_model_compatibility import databricks_pi_surface_for_model
+
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: ([{"id": "system.ai.claude-opus-5"}], [], [], []),
+    )
+    override = "system.ai.gpt-5-mini"
+    expected_provider = creds._SURFACE_PROVIDER_IDS[databricks_pi_surface_for_model(override)]
+
+    provider = creds.resolve_pi_native_provider(
+        model=override, config_loader=_databricks_openai_gateway_config
+    )
+
+    assert provider is not None
+    assert provider.model == override
+    rendered = provider.to_models_config()["providers"]
+    assert [m["id"] for m in rendered[expected_provider]["models"]] == [override]
+
+
 def test_inline_dedicated_gateway_host_stays_single_family(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

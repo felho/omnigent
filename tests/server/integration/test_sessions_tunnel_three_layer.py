@@ -1805,6 +1805,71 @@ async def test_runner_disconnect_fails_after_rehome_window_when_retired_by_serve
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_runner_disconnect_retired_by_server_without_live_state_store_keeps_short_grace(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server-retired runner keeps the short grace when no live-state store is wired.
+
+    Without a store ``touch_runner_liveness`` records no stamp, so the
+    disconnect handler sees ``None`` from ``last_liveness_stamp`` and must fall
+    back to ``RUNNER_DISCONNECT_GRACE_S``, not the longer rehome window.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+
+    grace = 0.1
+    rehome = 30.0
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_REHOME_WINDOW_S", rehome)
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+
+    # Disable the live-state store before the runner connects so
+    # touch_runner_liveness() records no stamp on connect or on the
+    # retirement-time touch inside _on_runner_disconnect.
+    monkeypatch.setattr(session_live_state, "_store", None)
+
+    create_resp = await ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _build_harness_agent_bundle(),
+                "application/gzip",
+            ),
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+    runner_id = "runner-retired-no-live-state-store"
+    get_conversation_store().replace_runner_id(session_id, runner_id)
+    # Remove any residual in-process stamp for this runner id.
+    session_live_state._last_liveness_stamp.pop(runner_id, None)
+
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    sessions_module._session_status_cache[session_id] = "running"
+
+    try:
+        ap_app.state.tunnel_registry.deregister(runner_id)
+        await communicator.wait(timeout=budget(2.0))
+
+        async def _marked_failed() -> None:
+            while sessions_module._session_status_cache.get(session_id) != "failed":
+                await asyncio.sleep(0.02)
+
+        await asyncio.wait_for(_marked_failed(), timeout=budget(grace * 20))
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
 async def test_runner_disconnect_grace_ignores_rehome_window_for_ordinary_disconnect(
     tunnel_three_layer_stack: _TunnelStack,
     monkeypatch: pytest.MonkeyPatch,

@@ -85,3 +85,29 @@ def test_native_relay_os_schemas_keep_explicit_spec_cwd_when_process_cwd_is_dele
         relayed = _os_env_schemas(spec)
 
     assert relayed.keys() == _OS_ENV_TOOL_NAMES
+
+
+@pytest.mark.posix_only
+def test_native_relay_os_schemas_never_fork_a_tree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A ``fork: true`` spec must not copy a tree just to extract schemas.
+
+    With the cwd gone the schema-only root is the temp dir, so a fork would copy
+    the whole temp dir into itself on every turn.
+    """
+
+    def _no_copy(src: Path, dst: Path) -> None:
+        raise AssertionError(f"schema extraction copied {src} -> {dst}")
+
+    monkeypatch.setattr("omnigent.inner.os_env._copy_tree", _no_copy)
+    spec = AgentSpec(spec_version=1, os_env=OSEnvSpec(fork=True))
+
+    removed = tmp_path / "removed"
+    removed.mkdir()
+    with monkeypatch.context() as context:
+        context.chdir(removed)
+        removed.rmdir()
+        relayed = _os_env_schemas(spec)
+
+    assert relayed.keys() == _OS_ENV_TOOL_NAMES

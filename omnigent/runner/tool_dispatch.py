@@ -584,12 +584,13 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     if spec is not None:
         from omnigent.tools.manager import ToolManager
 
-        schema_spec = spec
-        if spec.os_env is not None and spec.os_env.cwd is None:
+        schema_spec = _surface_only_spec(spec)
+        if schema_spec.os_env is not None and schema_spec.os_env.cwd is None:
             # ``ToolManager`` would otherwise resolve this to ``os.getcwd()``,
             # which a runner whose session worktree was removed can't provide.
             schema_spec = dataclasses.replace(
-                spec, os_env=dataclasses.replace(spec.os_env, cwd=_schema_only_cwd())
+                schema_spec,
+                os_env=dataclasses.replace(schema_spec.os_env, cwd=_schema_only_cwd()),
             )
 
         for schema in ToolManager(schema_spec).get_tool_schemas():

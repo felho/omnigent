@@ -8787,6 +8787,7 @@ def create_runner_app(
                     _tmgr = ToolManager(
                         cached_spec,
                         workdir=_resolved_workdir_for_spec(cached_spec_entry, runner_workspace),
+                        os_env_schema_only=True,
                     )
                     all_tools.extend(_tmgr.get_tool_schemas())
                 except (

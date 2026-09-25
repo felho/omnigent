@@ -31,7 +31,7 @@ from playwright.async_api import Route, async_playwright, expect
 
 from tests.e2e_ui.start_session.test_start_session import (
     _HOST_ID,
-    _open_entry_config,
+    _open_entry_models,
     _pi_native_agents_body,
     _register_common_routes,
     _run_in_fresh_loop,
@@ -65,9 +65,9 @@ def test_pi_native_prelaunch_picker_offers_only_the_curated_scope(
     """The Configure-Pi model picker lists the curated scope, not a flood.
 
     With the host's ``pi-native`` model-options answering the curated scope a
-    multi-login host now returns, the pre-launch picker must render exactly
-    those rows — the enabled model visible, no OpenRouter multi-vendor rows —
-    so the dialog matches what Pi's own Ctrl+P picker cycles.
+    multi-login host now returns, the pre-launch Edit > Model menu must
+    render exactly those rows — the enabled model visible, no OpenRouter
+    multi-vendor rows — so the picker matches what Pi's own Ctrl+P cycles.
 
     :param seeded_session: ``(base_url, session_id)`` from the spawned server.
     """
@@ -137,30 +137,32 @@ async def _drive_curated_pi_picker(base_url: str, session_id: str) -> None:
                 state="visible", timeout=30_000
             )
 
-            # Open the Configure-Pi dialog (Pi auto-selects as the sole agent).
-            await _open_entry_config(page, "ag_pi_e2e")
-            model_trigger = page.get_by_test_id("new-chat-landing-config-model")
-            await expect(model_trigger).to_be_visible()
-
-            # Open the picker popover and inspect its rows.
-            await model_trigger.click()
-            await page.get_by_test_id("new-chat-landing-config-model-search").wait_for(
-                state="visible", timeout=10_000
-            )
+            # Open Pi's Edit > Model menu (Pi auto-selects as the sole agent).
+            await _open_entry_models(page, "ag_pi_e2e")
+            models_menu = page.get_by_test_id("new-chat-landing-agent-models")
+            await expect(models_menu).to_be_visible()
 
             # The fix, made observable: the picker offers exactly the curated
             # scope -- the enabled model is immediately visible, and none of
             # the multi-vendor OpenRouter catalog floods the list.
-            enabled_row = page.locator(f'[data-model-id="{_ENABLED_MODEL}"]')
+            enabled_row = page.get_by_test_id(f"new-chat-landing-agent-model-{_ENABLED_MODEL}")
             await expect(enabled_row).to_be_visible(timeout=10_000)
-            model_rows = page.locator("[data-model-id]")
+            # The menu leads with its own "Harness default" row, then the
+            # catalog: exactly the curated options and nothing else.
+            await expect(
+                page.get_by_test_id("new-chat-landing-agent-model-default")
+            ).to_be_visible()
+            model_rows = models_menu.get_by_role("menuitemcheckbox")
             row_count = await model_rows.count()
-            assert row_count == len(curated), (
+            assert row_count == len(curated) + 1, (
                 "the pre-launch pi-native picker did not honor the curated "
                 f"scope: it rendered {row_count} model rows for a "
-                f"{len(curated)}-row catalog."
+                f"{len(curated)}-row catalog (+ the harness-default row)."
             )
-            assert await page.locator('[data-model-id^="openrouter/"]').count() == 0, (
+            openrouter_rows = models_menu.locator(
+                '[data-testid^="new-chat-landing-agent-model-openrouter/"]'
+            )
+            assert await openrouter_rows.count() == 0, (
                 "the OpenRouter multi-vendor flood leaked back into the picker"
             )
 

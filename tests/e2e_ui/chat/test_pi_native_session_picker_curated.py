@@ -45,8 +45,8 @@ def test_pi_native_session_picker_offers_only_the_curated_scope(
     """The in-session Model picker lists the pushed scope, not a flood.
 
     With the session snapshot carrying the curated ``model_options`` the
-    fixed extension pushes for a scoped Pi, the composer's Model picker must
-    render exactly those rows — the enabled model visible, no OpenRouter
+    fixed extension pushes for a scoped Pi, the composer's Edit > Model menu
+    must render exactly those rows — the enabled model visible, no OpenRouter
     multi-vendor rows — so the web picker matches what Pi's own Ctrl+P picker
     cycles.
 
@@ -69,16 +69,16 @@ def test_pi_native_session_picker_offers_only_the_curated_scope(
 
     expect(page.get_by_test_id("composer-config-gear")).to_be_visible(timeout=15_000)
     page.get_by_test_id("composer-config-gear").click()
-    page.get_by_test_id("composer-advanced-settings").click()
-    expect(page.get_by_test_id("composer-config-modal")).to_be_visible(timeout=10_000)
-    page.get_by_test_id("composer-config-model").click()
+    page.get_by_test_id("composer-agent-edit").click()
+    models_menu = page.get_by_test_id("composer-agent-models")
+    expect(models_menu).to_be_visible(timeout=10_000)
 
     # The fix, made observable: the picker offers exactly the curated scope.
-    enabled_row = page.locator(f'[role="option"][data-model-id="{_ENABLED_MODEL}"]')
+    enabled_row = models_menu.locator(f'[data-model-id="{_ENABLED_MODEL}"]')
     expect(enabled_row).to_be_visible(timeout=10_000)
-    rows = page.locator('[role="option"][data-model-id]')
+    rows = models_menu.locator("[data-model-id]")
     expect(rows).to_have_count(len(_CURATED_OPTIONS))
-    expect(page.locator('[role="option"][data-model-id^="openrouter/"]')).to_have_count(0)
+    expect(models_menu.locator('[data-model-id^="openrouter/"]')).to_have_count(0)
 
     # Pick the curated model so the recording ends on the visible outcome.
     enabled_row.click()

@@ -25,7 +25,6 @@ import {
   WandSparklesIcon,
   CornerUpLeftIcon,
   FileTextIcon,
-  FolderIcon,
   Loader2Icon,
   MessagesSquareIcon,
   TriangleAlertIcon,
@@ -42,10 +41,10 @@ import {
   ChatComposer,
   type ComposerKeyIntent,
   COMPOSER_COLUMN_WIDTH,
-  ComposerChipRow,
   ComposerFeedbackRow,
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
+import { ComposerMentionChips } from "@/components/composer/ComposerMentionChips";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { BackgroundTaskIndicator } from "@/components/composer/BackgroundTaskIndicator";
 import { SubagentTaskIndicator } from "@/components/composer/SubagentTaskIndicator";
@@ -120,7 +119,6 @@ import {
   buildMentionPreamble,
   detectMentionAt,
   type MentionItem,
-  mentionItemPath,
   mentionMarkerFor,
   type MentionState,
   parseMentionToken,
@@ -257,13 +255,7 @@ import {
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
 import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
-import {
-  GoalDialog,
-  CommandGoalDialog,
-  GoalStatusPill,
-  useGoalState,
-  type Goal,
-} from "@/components/goal";
+import { GoalDialog, CommandGoalDialog, GoalStatusPill, useGoalState } from "@/components/goal";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { ConnectionIndicator } from "./ChatIndicators";
@@ -2245,15 +2237,14 @@ export function composerHarnessLabel(
  * Pulled up behind the card so a shelf peeks below; skips render when empty.
  * Session cost lives in the header agent-info popover, not here.
  */
-function ComposerStatusLine({ goal }: { goal: Goal | null }) {
+function ComposerStatusLine() {
   const conversationId = useChatStore((s) => s.conversationId);
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
 
-  // The PR link and context ring now live in the workspace bar; this line
-  // carries only the plan-mode marker and the goal pill.
+  // The PR link, context ring, and goal indicator live in the workspace bar;
+  // this line carries only the plan-mode marker.
   const showPlanMode = !!conversationId && codexPlanMode;
-  const showGoal = !!conversationId && goal != null;
-  if (!showPlanMode && !showGoal) return null;
+  if (!showPlanMode) return null;
 
   return (
     <div
@@ -2274,7 +2265,6 @@ function ComposerStatusLine({ goal }: { goal: Goal | null }) {
             <span>Plan mode</span>
           </span>
         )}
-        {showGoal && goal && <GoalStatusPill goal={goal} />}
       </div>
     </div>
   );
@@ -3644,6 +3634,7 @@ function ComposerImpl(
             >
               <BackgroundTaskIndicator />
               <SubagentTaskIndicator conversationId={conversationId} />
+              {goal && <GoalStatusPill goal={goal} onOpen={() => setGoalDialogOpen(true)} />}
             </div>
             <ComposerContextRing
               contextWindow={composerContextWindow}
@@ -3842,40 +3833,13 @@ function ComposerImpl(
                 <ComposerFeedbackRow tone="error">{attachmentError}</ComposerFeedbackRow>
               )}
               {/* "@"-mention chips — one per tagged workspace file/folder. Each is
-            delivered as a "[Attached: <path>]" marker at send time. */}
-              {mentionedItems.length > 0 && (
-                <ComposerChipRow className="gap-1.5">
-                  {mentionedItems.map((item, i) => (
-                    <span
-                      key={mentionItemPath(item)}
-                      className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                    >
-                      {item.isDir ? (
-                        <FolderIcon className="size-3 shrink-0" />
-                      ) : (
-                        <FileTextIcon className="size-3 shrink-0" />
-                      )}
-                      <span className="max-w-[200px] truncate" title={mentionItemPath(item)}>
-                        @{item.path}
-                        {item.isDir ? "/" : ""}
-                      </span>
-                      {item.lineRange && (
-                        <span className="shrink-0">
-                          :{item.lineRange.start}-{item.lineRange.end}
-                        </span>
-                      )}
-                      <button
-                        type="button"
-                        onClick={() => removeMentionedItem(i)}
-                        className="ml-0.5 rounded-full hover:text-foreground"
-                        aria-label={`Remove ${item.path}`}
-                      >
-                        <XIcon className="size-3" />
-                      </button>
-                    </span>
-                  ))}
-                </ComposerChipRow>
-              )}
+            delivered as a "[Attached: <path>]" marker at send time. Ranged
+            spans (from "Attach to agent") show their line range. */}
+              <ComposerMentionChips
+                items={mentionedItems}
+                onRemove={removeMentionedItem}
+                showLineRange
+              />
               {/* Inline slash-command feedback: errors and /help output */}
               {commandError !== null && <ComposerFeedbackRow>{commandError}</ComposerFeedbackRow>}
             </>
@@ -4056,7 +4020,7 @@ function ComposerImpl(
           />
         )
       )}
-      <ComposerStatusLine goal={goal} />
+      <ComposerStatusLine />
     </form>
   );
 }

@@ -19,6 +19,7 @@ import {
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import {
   COMPOSER_HARNESS_MENU_SIZE,
+  HarnessMenuNavigationLabel,
   PickerSectionHeader,
 } from "@/components/composer/HarnessMenuRow";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
@@ -32,10 +33,10 @@ import {
   ChatComposer,
   COMPOSER_COLUMN_WIDTH,
   COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS,
-  ComposerChipRow,
   ComposerFeedbackRow,
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
+import { ComposerMentionChips } from "@/components/composer/ComposerMentionChips";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   MonitorCloudIcon,
@@ -46,7 +47,6 @@ import {
   ChevronsUpDownIcon,
   GitBranchIcon,
   LockIcon,
-  FileTextIcon,
   FolderGit2Icon,
   FolderIcon,
   FolderOpenIcon,
@@ -300,7 +300,6 @@ import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
   buildMentionPreamble,
   detectMentionAt,
-  mentionItemPath,
   type MentionState,
   parseMentionToken,
   rankMentionEntries,
@@ -666,7 +665,7 @@ export function composerWorktreeHeaderState({
       : `main repository${selectedWorktree.branch ? ` branch: ${selectedWorktree.branch}` : ""}`;
     return {
       repositoryLabel,
-      branchLabel: "New",
+      branchLabel: "Choose",
       branchDescription: `Create or select a worktree from ${mainState}`,
     };
   }
@@ -1710,14 +1709,14 @@ export function AgentHarnessPicker({
       : "Other...";
 
   // Split the agents group: built-in bundle agents (Polly / Debby) stay inline
-  // in the main list; user-registered custom agents fold into a "Custom agents"
+  // in the main list; user-registered custom agents fold into an "Other..."
   // submenu so a long roster doesn't crowd out the recommended picks.
   const { builtins: bundleEntries, customs: customEntries } = useMemo(
     () => partitionAgentsByKind(agentEntries),
     [agentEntries],
   );
 
-  // Existing custom / pending agents fold into a "Custom agents" submenu so a
+  // Existing custom / pending agents fold into an "Other..." submenu so a
   // long roster doesn't crowd the recommended picks. When there are none, the
   // submenu would hold only the create action — which is a poor place to
   // discover it — so we surface "Create custom agent" as a top-level row
@@ -1910,7 +1909,7 @@ export function AgentHarnessPicker({
             className="items-center font-medium"
           >
             <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
-            <span className="truncate">Custom agents</span>
+            <span className="truncate">Other</span>
           </DropdownMenuItem>
           <DropdownMenuSeparator />
           {customAgentsBody}
@@ -1932,7 +1931,12 @@ export function AgentHarnessPicker({
                 className="group/routing items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
               >
                 <WandSparklesIcon className="size-4" aria-hidden="true" />
-                <span className="min-w-0 flex-1 truncate text-left">{SMART_ROUTING_LABEL}</span>
+                <span
+                  data-harness-menu-choice-label=""
+                  className="min-w-0 flex-1 truncate text-left"
+                >
+                  {SMART_ROUTING_LABEL}
+                </span>
                 <span className="min-w-0 truncate text-right text-xs text-muted-foreground opacity-0 group-hover/routing:opacity-100 group-focus/routing:opacity-100">
                   Harness + model
                 </span>
@@ -1957,7 +1961,7 @@ export function AgentHarnessPicker({
                     }}
                     className="items-center"
                   >
-                    <span className="flex-1 pl-6 text-left">{otherHarnessLabel}</span>
+                    <HarnessMenuNavigationLabel>{otherHarnessLabel}</HarnessMenuNavigationLabel>
                     <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
                   </DropdownMenuItem>
                 ) : (
@@ -1977,7 +1981,7 @@ export function AgentHarnessPicker({
                         }
                       }}
                     >
-                      <span className="flex-1 pl-6 text-left">{otherHarnessLabel}</span>
+                      <HarnessMenuNavigationLabel>{otherHarnessLabel}</HarnessMenuNavigationLabel>
                     </DropdownMenuSubTrigger>
                     <HarnessPickerSubContent
                       sideOffset={-4}
@@ -1993,14 +1997,14 @@ export function AgentHarnessPicker({
           {/* Agents group — built-in bundle agents (Polly / Debby) inline. */}
           <PickerSectionHeader>Agents</PickerSectionHeader>
           {bundleEntries.map(renderEntry)}
-          {/* Existing custom agents fold into a "Custom agents" submenu (with
+          {/* Existing custom agents fold into an "Other..." submenu (with
             the pending upload and the create action). With no custom agents the
             submenu would hold only "Create custom agent", so we surface that as
             a top-level row instead — otherwise creation is invisible on a fresh
             server. A managed sandbox has no create path, so neither appears. */}
           {hasCustomGroup &&
             (isMobile ? (
-              // Touch: drill into a "Custom agents" page in place (with Back).
+              // Touch: drill into the custom-agent page in place (with Back).
               <DropdownMenuItem
                 data-testid="new-chat-landing-custom-agents"
                 onSelect={(e) => {
@@ -2009,7 +2013,7 @@ export function AgentHarnessPicker({
                 }}
                 className="items-center"
               >
-                <span className="flex-1 pl-6 text-left">Custom agents...</span>
+                <HarnessMenuNavigationLabel>Other...</HarnessMenuNavigationLabel>
                 <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
               </DropdownMenuItem>
             ) : (
@@ -2019,7 +2023,7 @@ export function AgentHarnessPicker({
                   data-testid="new-chat-landing-custom-agents"
                   className="cursor-pointer items-center"
                 >
-                  <span className="flex-1 pl-6 text-left">Custom agents...</span>
+                  <HarnessMenuNavigationLabel>Other...</HarnessMenuNavigationLabel>
                 </DropdownMenuSubTrigger>
                 <HarnessPickerSubContent
                   sideOffset={-4}
@@ -6412,34 +6416,7 @@ export function NewChatLandingScreen() {
                     {/* "@"-mention chips — one per tagged workspace file/folder. Each is
                 delivered as an "[Attached: <path>]" marker prepended to the
                 first message at create time. */}
-                    {mentionedItems.length > 0 && (
-                      <ComposerChipRow className="gap-1.5">
-                        {mentionedItems.map((item, i) => (
-                          <span
-                            key={mentionItemPath(item)}
-                            className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                          >
-                            {item.isDir ? (
-                              <FolderIcon className="size-3 shrink-0" />
-                            ) : (
-                              <FileTextIcon className="size-3 shrink-0" />
-                            )}
-                            <span className="max-w-[200px] truncate" title={mentionItemPath(item)}>
-                              @{item.path}
-                              {item.isDir ? "/" : ""}
-                            </span>
-                            <button
-                              type="button"
-                              onClick={() => removeMentionedItem(i)}
-                              className="ml-0.5 rounded-full hover:text-foreground"
-                              aria-label={`Remove ${item.path}`}
-                            >
-                              <XIcon className="size-3" />
-                            </button>
-                          </span>
-                        ))}
-                      </ComposerChipRow>
-                    )}
+                    <ComposerMentionChips items={mentionedItems} onRemove={removeMentionedItem} />
                     {/* Pending attachments — image thumbnails (click to view) + file rows. */}
                     <ComposerAttachments files={files} onRemove={removeFile} />
                     {/* Rejected-attachment feedback: unsupported type or too large */}

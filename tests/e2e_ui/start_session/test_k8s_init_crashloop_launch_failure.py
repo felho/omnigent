@@ -214,8 +214,10 @@ async def _drive_launch_to_failure(base_url: str, outcome: dict[str, Any]) -> No
             # Enter commits the URL like the Add button, which re-renders with
             # the popover's repo-list state and flakes pointer clicks.
             await repo_input.press("Enter")
+            # The repo list re-renders after Enter commits the URL; allow a
+            # slow CI box more than expect()'s 5s default before flaking.
             await expect(repository).to_have_attribute(
-                "aria-label", "Sandbox repositories: omnigent"
+                "aria-label", "Sandbox repositories: omnigent", timeout=15_000
             )
             await page.keyboard.press("Escape")
 

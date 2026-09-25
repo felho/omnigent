@@ -248,6 +248,8 @@ class FakeGitHub:
         self._certdir = tempfile.TemporaryDirectory(prefix="fake-github-")
         cert, key = _make_github_cert(Path(self._certdir.name))
         self.ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        # Loopback stand-in still refuses the TLS versions real github.com refuses.
+        self.ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
         self.ssl_context.load_cert_chain(certfile=str(cert), keyfile=str(key))
         self.ssl_context.set_alpn_protocols(["http/1.1"])
         self._server = _ThreadingProxy(("127.0.0.1", 0), _ProxyHandler)

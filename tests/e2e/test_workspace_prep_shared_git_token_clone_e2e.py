@@ -50,8 +50,6 @@ import contextlib
 import datetime
 import json
 import os
-import re
-import shlex
 import socket
 import socketserver
 import ssl
@@ -66,7 +64,7 @@ import httpx
 import pytest
 import yaml
 
-from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
+from omnigent.host.identity import HOST_ID_ENV_VAR, MANAGED_HOST_TOKEN_HEADER
 from tests.e2e._k8s_stub_sdk import CAPTURE_ENV_VAR as _CAPTURE_ENV_VAR
 from tests.e2e._k8s_stub_sdk import STUB_FILES as _STUB_FILES
 
@@ -243,7 +241,7 @@ class _ConnectProxyHandler(socketserver.BaseRequestHandler):
                         break
                     dst.sendall(buf)
             except OSError:
-                pass
+                pass  # either side closing the tunnel mid-pump is normal teardown
             finally:
                 with contextlib.suppress(OSError):
                     dst.shutdown(socket.SHUT_WR)
@@ -264,6 +262,8 @@ def _start_fake_github(
     httpd.expected_token = _GIT_TOKEN  # type: ignore[attr-defined]
     httpd.project_root = project_root  # type: ignore[attr-defined]
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    # Loopback stand-in still refuses the TLS versions real github.com refuses.
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(certfile=cert_path, keyfile=key_path)
     httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -373,27 +373,28 @@ def _spawn_server(
         ),
     }
     log_path = tmp_path / "server.log"
-    log_handle = open(log_path, "w")  # noqa: SIM115 — lives for the Popen's lifetime
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "omnigent.cli",
-            "server",
-            "--port",
-            str(port),
-            "--database-uri",
-            f"sqlite:///{tmp_path / 'e2e.db'}",
-            "--artifact-location",
-            str(tmp_path / "artifacts"),
-            "--config",
-            str(config_path),
-        ],
-        env=env,
-        cwd=str(_REPO_ROOT),
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-    )
+    # The child keeps its own descriptor; the parent's copy closes right away.
+    with open(log_path, "w") as log_handle:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "omnigent.cli",
+                "server",
+                "--port",
+                str(port),
+                "--database-uri",
+                f"sqlite:///{tmp_path / 'e2e.db'}",
+                "--artifact-location",
+                str(tmp_path / "artifacts"),
+                "--config",
+                str(config_path),
+            ],
+            env=env,
+            cwd=str(_REPO_ROOT),
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
     return proc, log_path
 
 
@@ -410,7 +411,7 @@ def _wait_for_health(proc: subprocess.Popen[bytes], base_url: str, log_path: Pat
             if httpx.get(f"{base_url}/health", timeout=2.0).status_code == 200:
                 return
         except httpx.HTTPError:
-            pass
+            pass  # expected while the server is still booting; retry until deadline
         time.sleep(_POLL_INTERVAL_S)
     pytest.fail(f"server did not become healthy:\n{log_path.read_text()[-2000:]}")
 
@@ -491,19 +492,15 @@ def test_workspace_prep_clone_authenticates_with_git_token(tmp_path: Path) -> No
             "the workspace-prep init container no longer projects the harness "
             f"Secret (GIT_TOKEN): envFrom={init.get('envFrom')!r}"
         )
-        # The script shell-quotes the broker wire; recover the host id through
-        # shlex so the probe below hits the same endpoint the init container
-        # does. Lenient when absent: a fix may legitimately skip the wire when
-        # GIT_TOKEN is provided, and then there is no probe to race.
-        wire_line = next(
-            (ln for ln in script.splitlines() if "configure_clone_credentials" in ln), None
-        )
+        # Recover the host id from the host container's env (the same id the
+        # broker wire step probes with), not by parsing the shell-quoted wire
+        # — its rendering varies across revisions. Lenient when absent: a fix
+        # may legitimately skip the wire when GIT_TOKEN is provided, and then
+        # there is no probe to race.
         host_id = ""
-        if wire_line is not None:
-            wire = shlex.split(wire_line)[2]
-            match = re.search(r"configure_clone_credentials\('([^']*)', '([^']*)'\)", wire)
-            assert match is not None, f"unparseable broker wire: {wire!r}"
-            host_id = match.group(2)
+        if "configure_clone_credentials" in script:
+            host = pod["containers"][0]
+            host_id = next(e["value"] for e in host["env"] if e["name"] == HOST_ID_ENV_VAR)
 
         # The launch token must already resolve when the init container starts:
         # the launcher arms it against the host row BEFORE creating the Job. A

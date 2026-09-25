@@ -980,6 +980,44 @@ def test_inline_databricks_gateway_selection_follows_the_model_across_discovery(
     assert args[:4] == ["--provider", expected_provider, "--model", "system.ai.gpt-5"]
 
 
+def test_inline_databricks_gateway_default_launches_with_thinking_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """After enumeration the GPT default is gateway-routed, so effort is dropped with a notice.
+
+    The default now lives in the generated OpenAI provider rather than the
+    primary, so the launch takes the same gateway-routed branch as the
+    databricks-kind path: thinking off, and a warning when an effort was set.
+    """
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: (
+            [{"id": "system.ai.claude-opus-5"}],
+            [{"id": "system.ai.gpt-5"}],
+            [],
+            [],
+        ),
+    )
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_openai_gateway_config)
+    assert provider is not None
+    _, args, effort_warning = creds.pi_native_provider_launch(
+        tmp_path / "pi-agent", provider, reasoning_effort="high"
+    )
+
+    assert args == [
+        "--provider",
+        "omnigent-openai",
+        "--model",
+        "system.ai.gpt-5",
+        "--thinking",
+        "off",
+    ]
+    assert effort_warning is not None
+    assert "system.ai.gpt-5" in effort_warning
+
+
 def test_provider_launch_rejects_unavailable_qualified_selection(tmp_path: Path) -> None:
     """A stale picker value must not silently launch the provider default."""
     provider = creds.PiProviderConfig(

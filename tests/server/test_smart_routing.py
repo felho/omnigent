@@ -1444,7 +1444,7 @@ _SELF_CALL_404_BODY = {
 
 
 def test_router_permanently_disabled_matches_the_self_call_config_404() -> None:
-    """A relayed self-call 4xx is configuration; a relayed 5xx is retriable."""
+    """A relayed self-call 404 is configuration; anything else is retriable."""
     from omnigent.server.smart_routing import router_permanently_disabled
 
     assert router_permanently_disabled(404, json.dumps(_SELF_CALL_404_BODY)) is True
@@ -1453,6 +1453,45 @@ def test_router_permanently_disabled_matches_the_self_call_config_404() -> None:
     # The extraction model erroring out is an outage, not configuration.
     flaky = {"message": "responses self-call returned status 500: upstream overloaded"}
     assert router_permanently_disabled(404, json.dumps(flaky)) is False
+
+
+def test_a_relayed_transient_self_call_4xx_is_not_latched() -> None:
+    """Only a relayed 404 proves the selection model is unserved; a relayed
+    rate limit, timeout, or request-specific error may clear on its own."""
+    from omnigent.server.smart_routing import router_permanently_disabled
+
+    for inner in (
+        "responses self-call returned status 429: too many requests",
+        "responses self-call returned status 408: request timeout",
+        "responses self-call returned status 400: bad request",
+    ):
+        assert router_permanently_disabled(404, json.dumps({"message": inner})) is False
+
+
+@pytest.mark.asyncio
+async def test_a_relayed_self_call_429_is_retried_on_the_next_turn() -> None:
+    """A rate-limited extraction call must not disable routing for the process."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    served = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        nonlocal served
+        served += 1
+        return httpx.Response(
+            404, json={"message": "responses self-call returned status 429: rate limited"}
+        )
+
+    client = ExternalRoutingClient(base_url="https://host/v1", router_name="task_v1")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        assert await client.route("hi", {"h": ["m"]}) is None
+        assert client.permanently_unavailable is False
+        assert await client.route("hi again", {"h": ["m"]}) is None
+    assert served == 2
+    assert client.permanently_unavailable is False
 
 
 @pytest.mark.asyncio

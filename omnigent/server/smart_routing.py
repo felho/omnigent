@@ -758,19 +758,20 @@ def _router_error_detail(body: str) -> str:
 
 
 # The gateway relays a failure of the router's own extraction call as
-# ``responses self-call returned status <code>: ...``. A 4xx there means the
+# ``responses self-call returned status <code>: ...``. A relayed 404 means the
 # selection model is not served on this workspace — configuration, not an
-# outage — whereas a relayed 5xx is the model having a bad moment and stays
-# retriable.
-_SELF_CALL_CONFIG_FAILURE = re.compile(r"self-call returned status 4\d\d")
+# outage. Any other relayed status (429 rate limit, 408 timeout, 400
+# request-specific, 5xx outage) may clear on its own and stays retriable.
+_SELF_CALL_CONFIG_FAILURE = re.compile(r"self-call returned status 404")
 
 
 def router_selection_model_unserved(status_code: int, body: str) -> bool:
-    """Whether the router's own extraction (self-)call failed on configuration.
+    """Whether the router's own extraction (self-)call 404d on configuration.
 
     Happens when ``routing.selection_model`` names a model the workspace does
     not serve — or is unset and the router's frozen default does. Every later
-    call fails identically until the deployment config changes.
+    call fails identically until the deployment config changes. Only a relayed
+    404 qualifies; other relayed statuses may be transient and stay retriable.
 
     :param status_code: The response status.
     :param body: The raw response text.
@@ -787,7 +788,7 @@ def router_permanently_disabled(status_code: int, body: str) -> bool:
     Two shapes qualify. A workspace without the routing API answers
     ``routes:select`` with a 404 saying it is not enabled for the account. And
     a router whose own extraction call cannot run — its selection model is not
-    served here — relays that inner 4xx in a 404 body
+    served here — relays that inner 404 in a 404 body
     (:func:`router_selection_model_unserved`). Both are configuration, not an
     outage: every later call would 404 identically, so the client latches it
     and the deployment's other backend answers instead. Any other 404 stays
@@ -1929,7 +1930,8 @@ class ExternalRoutingClient:
                     )
                     self.last_error = (
                         f"{selector} is not served on this workspace "
-                        f"(set routing.selection_model to a served model): {self.last_error}"
+                        f"(set routing.selection_model to a served model and "
+                        f"restart the server): {self.last_error}"
                     )
                 _logger.warning(
                     "ExternalRoutingClient: %s reported a permanent configuration "

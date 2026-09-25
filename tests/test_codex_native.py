@@ -12376,6 +12376,68 @@ def test_rollout_records_preserve_function_call_across_repeated_compactions() ->
     ] == ["call_slow"]
 
 
+def test_rollout_records_do_not_carry_interrupted_call_across_compaction() -> None:
+    """An interrupted tool interaction is absent from resumed history."""
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            {
+                "id": "fc_cancelled",
+                "response_id": "codex_turn_cancelled",
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": '{"cmd":"cancelled-command"}',
+                "call_id": "call_cancelled",
+            },
+            {
+                "id": "cmp_1",
+                "response_id": "compact_1",
+                "type": "compaction",
+                "summary": "cancelled command was still running",
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "run it"}],
+                    }
+                ],
+            },
+            {
+                "id": "fco_cancelled",
+                "response_id": "codex_turn_cancelled",
+                "type": "function_call_output",
+                "call_id": "call_cancelled",
+                "output": "finished after cancellation",
+            },
+            {
+                "id": "msg_cancelled",
+                "response_id": "codex_turn_cancelled",
+                "type": "message",
+                "role": "assistant",
+                "interrupted": True,
+                "content": [{"type": "output_text", "text": "cancelled"}],
+            },
+        ],
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.154.0",
+    )
+
+    replacement_history = next(record for record in records if record["type"] == "compacted")[
+        "payload"
+    ]["replacement_history"]
+    assert not any(
+        item.get("call_id") == "call_cancelled"
+        for item in replacement_history
+        if isinstance(item, dict)
+    )
+    assert not any(
+        record["type"] == "response_item" and record["payload"].get("call_id") == "call_cancelled"
+        for record in records
+    )
+
+
 def test_rollout_records_downgrade_image_stripped_by_compaction_storage() -> None:
     """A stored Responses image marker cannot poison Codex replacement history."""
     pixels = bytes(range(256)) * 3

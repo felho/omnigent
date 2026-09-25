@@ -4137,12 +4137,12 @@ def create_runner_app(
             # The session's override outranks the spec: resolving from the spec
             # alone made init spawn a harness the turns never ask for, evicting
             # the override's live subprocess (entries are keyed by conversation).
-            harness_name = (
+            raw_harness = (
                 _session_harness_overrides.get(session_id)
                 or spec.executor.config.get("harness")
                 or spec.executor.type
             )
-            harness_name = canonicalize_harness(harness_name) or harness_name
+            harness_name = canonicalize_harness(raw_harness) or raw_harness
 
             _start_verdict = await _evaluate_agent_start_gate(spec, harness_name)
             if _start_verdict is not None:
@@ -4184,14 +4184,21 @@ def create_runner_app(
                 if init_context.envelope is not None
                 else await _fetch_session_model_override(session_id)
             )
-            spawn_env = _build_spawn_env_from_spec(
-                spec,
-                harness_name,
-                workdir=_resolved_spec_workdir(spec_entry),
-                cwd=await _session_runtime_cwd(session_id),
-                session_id=session_id,
-                model_override=_model_override,
-            )
+            try:
+                spawn_env = _build_spawn_env_from_spec(
+                    spec,
+                    raw_harness,
+                    workdir=_resolved_spec_workdir(spec_entry),
+                    cwd=await _session_runtime_cwd(session_id),
+                    session_id=session_id,
+                    model_override=_model_override,
+                )
+            except OmnigentError as exc:
+                # The relay also needs the failure when init precedes the first turn.
+                _publish_turn_status(
+                    session_id, "failed", error={"code": exc.code, "message": str(exc)}
+                )
+                raise
             if spawn_env is None:
                 spawn_env = await _resolve_native_spawn_env(
                     harness_name,
@@ -5667,9 +5674,7 @@ def create_runner_app(
         """
         if not harness_override or harness_override == "auto":
             return
-        _session_harness_overrides[conv_id] = (
-            canonicalize_harness(harness_override) or harness_override
-        )
+        _session_harness_overrides[conv_id] = harness_override
 
     def _session_harness_name(conv_id: str) -> str | None:
         # The override wins: a routed session runs the harness the server
@@ -5679,7 +5684,7 @@ def create_runner_app(
         # the parent inbox (the native path that owes it never ran).
         override = _session_harness_overrides.get(conv_id)
         if override is not None:
-            return override
+            return canonicalize_harness(override) or override
         spec = _session_spec_cache.get(conv_id)
         if spec is None:
             return None
@@ -8623,6 +8628,7 @@ def create_runner_app(
             _session_spec_cache[conv] = cached_spec_entry
 
         harness_name: str | None = None
+        raw_harness: str | None = None
         spawn_env: dict[str, str] | None = None
         instructions: str | None = None
         _note_session_harness_override(conv, cast(str | None, msg_body.get("harness_override")))
@@ -8632,13 +8638,13 @@ def create_runner_app(
             # per-event harness_override, so resolving from the body alone
             # dropped a later turn back onto the spec's harness and evicted
             # the override harness mid-session.
-            h = (
+            raw_harness = (
                 _session_harness_overrides.get(conv)
                 or cast(str | None, msg_body.get("harness_override"))
                 or cached_spec.executor.config.get("harness")
                 or cached_spec.executor.type
             )
-            harness_name = canonicalize_harness(h) or h
+            harness_name = canonicalize_harness(raw_harness) or raw_harness
 
         if conv not in _session_histories:
             _session_histories[conv] = (
@@ -8648,7 +8654,7 @@ def create_runner_app(
         if cached_spec is not None:
             spawn_env = _build_spawn_env_from_spec(
                 cached_spec,
-                cast(str, harness_name),
+                cast(str, raw_harness),
                 workdir=cached_spec_workdir,
                 cwd=await _session_runtime_cwd(conv),
                 model_override=cast(str | None, msg_body.get("model_override")),
@@ -13357,11 +13363,13 @@ async def _resolve_harness_config(
                 else:
                     spec = _unwrap_resolved_spec(sub_entry)
                     workdir = _resolved_spec_workdir(sub_entry)
-            harness = harness_override or spec.executor.config.get("harness") or spec.executor.type
-            harness = canonicalize_harness(harness) or harness
+            raw_harness = (
+                harness_override or spec.executor.config.get("harness") or spec.executor.type
+            )
+            harness = canonicalize_harness(raw_harness) or raw_harness
             spawn_env = _build_spawn_env_from_spec(
                 spec,
-                harness,
+                raw_harness,
                 cwd=cwd,
                 workdir=workdir,
                 model_override=model_override,
@@ -13486,7 +13494,7 @@ def _build_spawn_env_from_spec(
     """Build spawn-env from spec — mirrors workflow.py's helpers.
 
     :param spec: The resolved agent spec.
-    :param harness: Canonical harness name, e.g. ``"claude-sdk"``.
+    :param harness: Requested harness, including any ``acp:<slug>`` selection.
     :param cwd: Runtime working directory for harnesses that need it.
     :param workdir: Bundle workdir, threaded to the builders.
     :param session_id: Session/conversation id, used to hand the harness
@@ -13503,9 +13511,16 @@ def _build_spawn_env_from_spec(
     """
     # Namespaced generic-ACP ids (``acp:<slug>``) canonicalize to ``acp`` so the
     # dispatch, model-key lookup, and logging below all key off the base harness;
-    # the concrete agent's slug is read from the spec by ``_build_acp_spawn_env``.
+    # the concrete agent's slug must also reach the command and model resolvers.
     requested_harness = harness
     harness = canonicalize_harness(harness) or harness
+    if requested_harness.startswith("acp:"):
+        spec = dataclasses.replace(
+            spec,
+            executor=dataclasses.replace(
+                spec.executor, config={**spec.executor.config, "harness": requested_harness}
+            ),
+        )
     effective_spec = spec
     from omnigent.inference_config import load_runtime_inference_config, parse_inference_config
 

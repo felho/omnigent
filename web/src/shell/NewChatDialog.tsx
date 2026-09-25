@@ -6586,18 +6586,42 @@ export function NewChatLandingScreen() {
                             disabled={connectingArca || arcaAutoConnectStatus?.state === "starting"}
                             data-testid="new-chat-landing-run-on-arca"
                           >
-                            <span className="flex size-4 shrink-0 items-center justify-center">
+                            <span
+                              className={cn(
+                                "flex size-4 shrink-0 items-center justify-center",
+                                // Keep the icon on the first line of a two-line failure row.
+                                arcaAutoConnectStatus?.state === "failed" && "mt-0.5 self-start",
+                              )}
+                            >
                               <MonitorCloudIcon className="size-3.5 text-muted-foreground" />
                             </span>
-                            <span>
-                              {arcaAutoConnectStatus?.state === "starting"
-                                ? "Arca · Starting…"
-                                : arcaAutoConnectStatus?.state === "failed"
-                                  ? "Couldn't connect Arca · Retry"
-                                  : connectingArca
-                                    ? "Connecting to Arca…"
-                                    : "Run on Arca"}
-                            </span>
+                            {arcaAutoConnectStatus?.state === "starting" ? (
+                              <span className="whitespace-nowrap">
+                                Arca
+                                <span className="text-xs text-muted-foreground">
+                                  {" "}
+                                  • Running isaac omni host…
+                                </span>
+                              </span>
+                            ) : arcaAutoConnectStatus?.state === "failed" ? (
+                              <span className="flex min-w-0 max-w-64 flex-1 flex-col">
+                                <span>
+                                  Couldn&apos;t connect Arca
+                                  <span className="text-xs text-muted-foreground"> • Retry</span>
+                                </span>
+                                {arcaAutoConnectStatus.error && (
+                                  <span
+                                    className="line-clamp-3 whitespace-normal text-xs text-muted-foreground"
+                                    title={arcaAutoConnectStatus.error}
+                                    data-testid="new-chat-landing-arca-autoconnect-error"
+                                  >
+                                    {arcaAutoConnectStatus.error}
+                                  </span>
+                                )}
+                              </span>
+                            ) : (
+                              <span>{connectingArca ? "Connecting to Arca…" : "Run on Arca"}</span>
+                            )}
                           </DropdownMenuItem>
                         )}
                         {hasCloudOptions && <DropdownMenuSeparator />}

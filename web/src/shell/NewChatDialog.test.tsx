@@ -3090,7 +3090,7 @@ describe("Run on Arca — auto-connect UI extensions", () => {
     expect(await screen.findByTestId("new-chat-landing-run-on-arca")).toBeTruthy();
   });
 
-  it("disables and labels the Arca row as 'Arca · Starting…' while auto-connect is starting", async () => {
+  it("disables the Arca row and names the running command while auto-connect is starting", async () => {
     vi.mocked(useArcaStatus).mockReturnValue({
       state: "starting",
       autoConnect: true,
@@ -3101,7 +3101,7 @@ describe("Run on Arca — auto-connect UI extensions", () => {
     await openHostMenu();
 
     const item = await screen.findByTestId("new-chat-landing-run-on-arca");
-    expect(item.textContent).toContain("Arca · Starting…");
+    expect(item.textContent).toContain("Arca • Running isaac omni host…");
     expect(item).toHaveAttribute("aria-disabled", "true");
   });
 
@@ -3119,7 +3119,10 @@ describe("Run on Arca — auto-connect UI extensions", () => {
     await openHostMenu();
 
     const item = await screen.findByTestId("new-chat-landing-run-on-arca");
-    expect(item.textContent).toContain("Couldn't connect Arca · Retry");
+    expect(item.textContent).toContain("Couldn't connect Arca • Retry");
+    expect(screen.getByTestId("new-chat-landing-arca-autoconnect-error").textContent).toBe(
+      "Timed out.",
+    );
 
     // Selecting calls retryArcaConnect, not the manual consent flow.
     fireEvent.click(item);

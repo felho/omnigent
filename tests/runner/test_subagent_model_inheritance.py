@@ -355,6 +355,7 @@ async def test_multi_model_child_of_different_multi_parent_skips(
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
+    _stub_worker_launchable(monkeypatch)
     bodies = await _dispatch_without_model(
         monkeypatch,
         agent_spec=_spec_with_worker("pi"),
@@ -381,6 +382,7 @@ async def test_multi_model_child_same_harness_as_parent_inherits(
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
+    _stub_worker_launchable(monkeypatch)
     bodies = await _dispatch_without_model(
         monkeypatch,
         agent_spec=_spec_with_worker("pi"),
@@ -492,6 +494,7 @@ async def test_binding_lets_foreign_multi_model_child_inherit(
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
+    _stub_worker_launchable(monkeypatch)
     config: dict[str, Any] = {
         "providers": {"gw": {}},
         "inference": {

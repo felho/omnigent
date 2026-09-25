@@ -3191,6 +3191,7 @@ export function NewChatLandingScreen() {
             id: option.id,
             model: option.model,
             displayName: nativeModelLabel(option),
+            isDefault: option.isDefault,
             source: option.source,
           })),
     [availablePiModels, sandboxSelected, sandboxCatalog],
@@ -3286,7 +3287,7 @@ export function NewChatLandingScreen() {
     if (supportsModelPicker && !supportsPermissionMode) {
       const modelValue =
         piModelOptions.find((model) => model.id === pickedModel)?.displayName ??
-        (sandboxInferenceConfigured ? defaultModelLabel(piModelOptions) : "Default");
+        defaultModelLabel(piModelOptions);
       const thinkingLevelValue = normalizeEffortLabel(pickedEffort);
       return [
         { label: "Model", value: modelValue },

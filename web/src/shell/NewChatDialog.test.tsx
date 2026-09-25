@@ -4679,6 +4679,50 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
+  it("names the Pi default model in the harness trigger from the host catalog", () => {
+    mockAgents([
+      ...DEFAULT_LANDING_AGENTS,
+      {
+        id: "a4",
+        name: "pi-native-ui",
+        display_name: "Pi",
+        description: null,
+        harness: "pi-native",
+        skills: [],
+      },
+    ]);
+    mockModelQueries((harness) =>
+      harness === "pi-native"
+        ? {
+            ...SUCCESS_QUERY_STATE,
+            data: [
+              {
+                id: "omnigent/system.ai.claude-opus-5",
+                model: "omnigent/system.ai.claude-opus-5",
+                displayName: "system.ai.claude-opus-5",
+                isDefault: false,
+              },
+              {
+                id: "omnigent-openai/system.ai.gpt-5-5-pro",
+                model: "omnigent-openai/system.ai.gpt-5-5-pro",
+                displayName: "system.ai.gpt-5-5-pro",
+                isDefault: true,
+              },
+            ],
+          }
+        : CLAUDE_MODEL_OPTIONS_RESULT,
+    );
+    renderLanding();
+    selectUnconfiguredAgent("a4");
+
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    expect(picker).toHaveAccessibleName("Pi, Model gpt-5-5-pro");
+    expect(within(picker).getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent(
+      "gpt-5-5-pro",
+    );
+    expect(picker).not.toHaveTextContent("Models unavailable");
+  });
+
   it.each([false, true])(
     "resumes typing on the first outside click with harness config open=%s",
     async (configOpen) => {

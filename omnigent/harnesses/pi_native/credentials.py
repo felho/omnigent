@@ -505,6 +505,22 @@ def pi_own_login_model_arg(selection: str) -> str | None:
     return None if "/" in split[1] else split[1]
 
 
+def _default_model_provider_id(provider: PiProviderConfig, rendered: _PiModelsConfig) -> str:
+    """Return the rendered provider Pi opens ``provider.model`` on without a selection.
+
+    Non-Claude models (GLM, GPT, Llama…) register on a secondary provider and
+    everything else on the primary. The launch and the pre-launch picker both
+    resolve the default here, so the picker's ``isDefault`` row is the model
+    Pi actually opens.
+    """
+    for provider_id, payload in rendered["providers"].items():
+        if provider_id == provider.provider_id:
+            continue
+        if any(model.get("id") == provider.model for model in payload["models"]):
+            return provider_id
+    return provider.provider_id
+
+
 def pi_native_model_options(
     *,
     config_loader: Callable[[], dict[str, object]] | None = None,
@@ -524,7 +540,8 @@ def pi_native_model_options(
         :func:`resolve_pi_native_provider`.
     :param transport: Optional httpx transport override for tests, forwarded to
         the live listing fetch.
-    :returns: One pre-launch option per model, sorted by qualified id.
+    :returns: One pre-launch option per model, sorted by qualified id. The row
+        Pi opens when no model is selected carries ``isDefault``.
     """
     # Forward only the config_loader seam: tests replace the module-level
     # resolver with a zero-argument callable, so a bare picker call must stay
@@ -540,8 +557,10 @@ def pi_native_model_options(
         provider, extra_models=_live_family_model_entries(provider, transport=transport)
     )
 
+    rendered = provider.to_models_config()
+    default_option = f"{_default_model_provider_id(provider, rendered)}/{provider.model}"
     options: dict[str, dict[str, object]] = {}
-    for provider_id, payload in provider.to_models_config()["providers"].items():
+    for provider_id, payload in rendered["providers"].items():
         for model in payload["models"]:
             model_id = model["id"]
             qualified = f"{provider_id}/{model_id}"
@@ -549,6 +568,7 @@ def pi_native_model_options(
                 "id": qualified,
                 "model": qualified,
                 "displayName": model.get("name") or model_id,
+                "isDefault": qualified == default_option,
             }
     return [options[model_id] for model_id in sorted(options)]
 
@@ -1954,7 +1974,6 @@ def pi_native_provider_launch(
     # (GLM, GPT, Llama…) are in secondary providers; Claude models are in the
     # primary provider. Read the rendered config so family fallbacks agree.
     selected_model = provider.model
-    model_provider_id = provider.provider_id
     selection_parts = (
         None if provider.inference_bound else _split_pi_native_model_selection(selection)
     )
@@ -1976,12 +1995,7 @@ def pi_native_provider_launch(
         model_provider_id = candidate_provider if candidate_provider in serving else serving[0]
         selected_model = candidate_model
     else:
-        for extra_id, extra_cfg in rendered["providers"].items():
-            if extra_id == provider.provider_id:
-                continue
-            if any(m.get("id") == provider.model for m in extra_cfg.get("models", [])):
-                model_provider_id = extra_id
-                break
+        model_provider_id = _default_model_provider_id(provider, rendered)
     write_pi_models_config(agent_dir, provider, rendered)
     # Copy the user's global Pi settings but suppress defaultThinkingLevel.
     # In TUI mode Pi applies the setting from ~/.pi/agent/settings.json; for

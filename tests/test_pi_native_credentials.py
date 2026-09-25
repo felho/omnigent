@@ -1183,7 +1183,11 @@ def test_key_provider_model_options_degrade_to_default_when_listing_fails(
 def test_pi_native_model_options_lists_only_managed_models(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Pre-launch choices come only from the provider built by ``omni setup``."""
+    """Pre-launch choices come only from the provider built by ``omni setup``.
+
+    The configured model is the one Pi opens without a selection, so its row
+    alone is the default.
+    """
     provider = creds.PiProviderConfig(
         provider_id="omnigent",
         base_url="https://api.anthropic.com",
@@ -1207,13 +1211,45 @@ def test_pi_native_model_options_lists_only_managed_models(
             "id": "omnigent-openai/gpt-5.6-sol",
             "model": "omnigent-openai/gpt-5.6-sol",
             "displayName": "GPT 5.6 Sol",
+            "isDefault": False,
         },
         {
             "id": "omnigent/claude-sonnet-4-6",
             "model": "omnigent/claude-sonnet-4-6",
             "displayName": "claude-sonnet-4-6",
+            "isDefault": True,
         },
     ]
+
+
+def test_pi_native_model_options_default_row_is_the_no_selection_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Exactly one row is the default: the model a launch without a selection opens.
+
+    After enumeration the configured GPT default lives in the generated OpenAI
+    provider, so the default row must follow it there instead of naming the
+    primary provider, and it must agree with the launch's ``--provider``.
+    """
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: (
+            [{"id": "system.ai.claude-opus-5"}],
+            [{"id": "system.ai.gpt-5"}],
+            [],
+            [],
+        ),
+    )
+    config = _databricks_openai_gateway_config()
+
+    options = creds.pi_native_model_options(config_loader=lambda: config)
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+    _, args, _ = creds.pi_native_provider_launch(tmp_path / "pi-agent", provider)
+
+    assert [o["id"] for o in options if o["isDefault"]] == ["omnigent-openai/system.ai.gpt-5"]
+    assert args[:4] == ["--provider", "omnigent-openai", "--model", "system.ai.gpt-5"]
 
 
 def test_openai_chat_wire_api_resolves_to_completions(monkeypatch: pytest.MonkeyPatch) -> None:

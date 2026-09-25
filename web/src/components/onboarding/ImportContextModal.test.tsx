@@ -109,12 +109,12 @@ describe("ImportContextModal – confirm with partial selection", () => {
 
     // Deselected MCP must be absent; others preserved in input order.
     expect(mcps).not.toContain("cursor:confluence");
-    expect(mcps).toContain("claude-code:databricks-v2");
+    expect(mcps).toContain("claude:databricks-v2");
     expect(mcps).toContain("codex:github");
 
     // Deselected skill must be absent; others preserved in input order.
-    expect(skills).not.toContain("claude-code:create-kafka-topic");
-    expect(skills).toContain("claude-code:create-system");
+    expect(skills).not.toContain("claude:create-kafka-topic");
+    expect(skills).toContain("claude:create-system");
 
     // Dialog closes after confirming.
     expect(onOpenChange).toHaveBeenCalledWith(false);

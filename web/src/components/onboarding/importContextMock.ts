@@ -18,25 +18,25 @@ const SKILL_NAMES = [
 
 export const MOCK_IMPORT_CONTEXT: ImportContext = {
   credentials: [
-    { harness: "claude-code", source: "Databricks AI Gateway" },
+    { harness: "claude", source: "Databricks AI Gateway" },
     { harness: "codex", source: "Databricks (dbc-a5d4177a-49dc)" },
     { harness: "cursor", source: "Cursor Enterprise" },
   ],
   mcps: [
     { id: "cursor:confluence", name: "confluence", harness: "cursor", toolCount: 9 },
     {
-      id: "claude-code:databricks-v2",
+      id: "claude:databricks-v2",
       name: "databricks-v2",
-      harness: "claude-code",
+      harness: "claude",
       toolCount: 18,
     },
     { id: "codex:github", name: "github", harness: "codex", toolCount: 4 },
     { id: "cursor:glean", name: "glean", harness: "cursor", toolCount: 7 },
     { id: "cursor:google", name: "google", harness: "cursor", toolCount: 70 },
-    { id: "claude-code:jira", name: "jira", harness: "claude-code", toolCount: 4 },
-    { id: "claude-code:safe", name: "safe", harness: "claude-code", toolCount: 5 },
+    { id: "claude:jira", name: "jira", harness: "claude", toolCount: 4 },
+    { id: "claude:safe", name: "safe", harness: "claude", toolCount: 5 },
     { id: "cursor:slack", name: "slack", harness: "cursor", toolCount: 5 },
-    { id: "claude-code:web-search", name: "web-search", harness: "claude-code", toolCount: 1 },
+    { id: "claude:web-search", name: "web-search", harness: "claude", toolCount: 1 },
     { id: "codex:web_search", name: "web_search", harness: "codex", toolCount: 1 },
     {
       id: "cursor:plugin:figma:figma",
@@ -46,8 +46,8 @@ export const MOCK_IMPORT_CONTEXT: ImportContext = {
     },
   ],
   skills: SKILL_NAMES.map((name) => ({
-    id: `claude-code:${name}`,
+    id: `claude:${name}`,
     name,
-    harness: "claude-code" as const,
+    harness: "claude" as const,
   })),
 };

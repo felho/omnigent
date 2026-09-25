@@ -3,15 +3,17 @@
 // credentials are already adopted (read-only); MCPs and skills are opt-in
 // checkboxes, all selected by default, applied on Confirm.
 
-import { useState, type ReactNode } from "react";
-// Colored (brand) harness glyphs — the Color subpath keeps antd out of the
-// bundle. Cursor has no Color variant, so it uses Mono.
-import ClaudeCodeColor from "@lobehub/icons/es/ClaudeCode/components/Color";
-import CodexColor from "@lobehub/icons/es/Codex/components/Color";
-import CursorMono from "@lobehub/icons/es/Cursor/components/Mono";
+import { useId, useState, type ReactNode } from "react";
 import { ArrowRight, Check, XIcon } from "lucide-react";
 import omnigentLogo from "@/assets/omnigent-starfish-icon.png";
 import BlobGraphic from "@/components/onboarding/BlobGraphic";
+import {
+  BRAND_HARNESSES,
+  type BrandHarness,
+  HarnessBrandIcon,
+  HarnessIconTile,
+  harnessDisplayName,
+} from "@/components/onboarding/harnessBrand";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -22,8 +24,9 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { cn } from "@/lib/utils";
 
-export type ImportHarness = "claude-code" | "codex" | "cursor";
+export type ImportHarness = BrandHarness;
 
 export interface ImportCredential {
   harness: ImportHarness;
@@ -56,25 +59,6 @@ export interface ImportSelection {
   skills: string[];
 }
 
-const HARNESSES: Record<ImportHarness, { label: string; icon: (size: number) => ReactNode }> = {
-  "claude-code": { label: "Claude Code", icon: (size) => <ClaudeCodeColor size={size} /> },
-  codex: { label: "Codex", icon: (size) => <CodexColor size={size} /> },
-  cursor: { label: "Cursor", icon: (size) => <CursorMono size={size} /> },
-};
-
-const BAND_HARNESSES: ImportHarness[] = ["claude-code", "codex", "cursor"];
-
-function BandTile({ children, zIndex }: { children: ReactNode; zIndex?: number }) {
-  return (
-    <span
-      className="relative flex size-12 items-center justify-center rounded-xl border border-border bg-background"
-      style={{ zIndex }}
-    >
-      {children}
-    </span>
-  );
-}
-
 /** Harness icons → Omnigent starfish, over the onboarding blob graphic. */
 function ImportBand() {
   return (
@@ -82,16 +66,16 @@ function ImportBand() {
       <BlobGraphic />
       <div className="absolute inset-0 flex items-center justify-center gap-5" aria-hidden="true">
         <div className="flex -space-x-1">
-          {BAND_HARNESSES.map((harness, index) => (
-            <BandTile key={harness} zIndex={index + 1}>
-              {HARNESSES[harness].icon(32)}
-            </BandTile>
+          {BRAND_HARNESSES.map((harness) => (
+            <HarnessIconTile key={harness}>
+              <HarnessBrandIcon harness={harness} size={32} />
+            </HarnessIconTile>
           ))}
         </div>
         <ArrowRight className="size-4 text-muted-foreground" />
-        <BandTile>
+        <HarnessIconTile>
           <img src={omnigentLogo} alt="" className="size-8 object-contain" />
-        </BandTile>
+        </HarnessIconTile>
       </div>
     </div>
   );
@@ -101,21 +85,27 @@ function EmptyTab({ label }: { label: string }) {
   return <p className="py-6 text-center text-xs text-muted-foreground">No {label} detected</p>;
 }
 
+/** Shared row chrome so credential and checkbox rows keep one divider/gap contract. */
+function ImportRow({ children, className }: { children: ReactNode; className?: string }) {
+  return (
+    <li className={cn("flex items-center gap-3 border-b border-border last:border-b-0", className)}>
+      {children}
+    </li>
+  );
+}
+
 function CredentialRows({ credentials }: { credentials: ImportCredential[] }) {
   if (credentials.length === 0) return <EmptyTab label="credentials" />;
   return (
     <ul>
       {credentials.map(({ harness, source }) => (
-        <li
-          key={harness}
-          className="flex items-center gap-3 border-b border-border py-3 last:border-b-0"
-        >
+        <ImportRow key={harness} className="py-3">
           <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted">
-            {HARNESSES[harness].icon(16)}
+            <HarnessBrandIcon harness={harness} size={16} />
           </span>
           <span className="flex min-w-0 flex-1 flex-col">
             <span className="truncate text-ui font-medium text-foreground">
-              {HARNESSES[harness].label}
+              {harnessDisplayName(harness)}
             </span>
             <span className="truncate text-xs text-muted-foreground">{source}</span>
           </span>
@@ -123,7 +113,7 @@ function CredentialRows({ credentials }: { credentials: ImportCredential[] }) {
             <Check className="size-3.5 text-success" aria-hidden="true" />
             Imported
           </span>
-        </li>
+        </ImportRow>
       ))}
     </ul>
   );
@@ -137,27 +127,28 @@ interface SelectableRow {
 
 function SelectableRows({
   kind,
+  componentId,
   rows,
   selected,
   onToggle,
 }: {
   kind: string;
+  componentId: string;
   rows: SelectableRow[];
   selected: ReadonlySet<string>;
   onToggle: (id: string, checked: boolean) => void;
 }) {
+  const idPrefix = useId();
   if (rows.length === 0) return <EmptyTab label={kind} />;
   return (
     <ul>
-      {rows.map(({ id, name, metadata }) => {
-        const inputId = `import-${kind}-${id}`.replace(/[^\w-]/g, "-");
+      {rows.map(({ id, name, metadata }, index) => {
+        const inputId = `${idPrefix}-${index}`;
         return (
-          <li
-            key={id}
-            className="flex items-center gap-3 border-b border-border py-2 last:border-b-0"
-          >
+          <ImportRow key={id} className="py-2">
             <Checkbox
               id={inputId}
+              componentId={componentId}
               checked={selected.has(id)}
               onCheckedChange={(checked) => onToggle(id, checked === true)}
             />
@@ -168,7 +159,7 @@ function SelectableRows({
               {name}
             </label>
             <span className="shrink-0 text-xs text-muted-foreground">{metadata}</span>
-          </li>
+          </ImportRow>
         );
       })}
     </ul>
@@ -176,7 +167,7 @@ function SelectableRows({
 }
 
 function mcpMetadata({ harness, toolCount }: ImportMcpServer): string {
-  const label = HARNESSES[harness].label;
+  const label = harnessDisplayName(harness);
   if (toolCount == null) return label;
   return `${toolCount} ${toolCount === 1 ? "tool" : "tools"} · ${label}`;
 }
@@ -259,7 +250,11 @@ function ImportContextBody({
           </DialogDescription>
         </div>
 
-        <Tabs defaultValue="credentials" className="mt-5 min-h-0 flex-1 gap-0">
+        <Tabs
+          defaultValue="credentials"
+          componentId="onboarding.import.tabs"
+          className="mt-5 min-h-0 flex-1 gap-0"
+        >
           <TabsList
             variant="line"
             className="h-9 w-full justify-start gap-4 rounded-none border-b border-border p-0"
@@ -281,6 +276,7 @@ function ImportContextBody({
             <TabsContent value="mcps">
               <SelectableRows
                 kind="MCPs"
+                componentId="onboarding.import.mcp"
                 rows={context.mcps.map((mcp) => ({ ...mcp, metadata: mcpMetadata(mcp) }))}
                 selected={selectedMcps}
                 onToggle={(id, checked) => setSelectedMcps((s) => toggle(s, id, checked))}
@@ -289,10 +285,11 @@ function ImportContextBody({
             <TabsContent value="skills">
               <SelectableRows
                 kind="skills"
+                componentId="onboarding.import.skill"
                 rows={context.skills.map((skill) => ({
                   id: skill.id,
                   name: `$${skill.name}`,
-                  metadata: HARNESSES[skill.harness].label,
+                  metadata: harnessDisplayName(skill.harness),
                 }))}
                 selected={selectedSkills}
                 onToggle={(id, checked) => setSelectedSkills((s) => toggle(s, id, checked))}
@@ -303,7 +300,9 @@ function ImportContextBody({
       </div>
 
       <div className="flex shrink-0 justify-end px-5 pt-4 pb-5">
-        <Button onClick={confirm}>Confirm</Button>
+        <Button onClick={confirm} componentId="onboarding.import.confirm">
+          Confirm
+        </Button>
       </div>
     </>
   );

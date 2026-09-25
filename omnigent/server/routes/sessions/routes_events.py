@@ -2262,7 +2262,7 @@ def register_events_routes(
                         # host-provided log tails.
                         visible_cause = (
                             runner_exit_reports.get_visible(conv.runner_id, user_id)
-                            if runner_exit_reports is not None
+                            if runner_exit_reports is not None and conv.runner_id is not None
                             else None
                         )
                         _logger.error(

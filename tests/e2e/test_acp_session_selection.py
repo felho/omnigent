@@ -25,6 +25,7 @@ _AGENT = r"""
 import json, sys
 from pathlib import Path
 name, record = sys.argv[1:]
+current_model = "unset"
 with Path(record).open("a") as f:
     f.write(name + "\n")
 def send(value):
@@ -36,11 +37,15 @@ for line in sys.stdin:
         result = {"protocolVersion": 1, "agentCapabilities": {}}
     elif method == "session/new":
         result = {"sessionId": "test-session"}
+    elif method == "session/set_config_option":
+        current_model = msg["params"]["value"]
+        result = {"configOptions": [{"id": "model", "currentValue": current_model}]}
     elif method == "session/prompt":
         send({"jsonrpc": "2.0", "method": "session/update", "params": {
             "sessionId": msg["params"]["sessionId"], "update": {
                 "sessionUpdate": "agent_message_chunk",
-                "content": {"type": "text", "text": "Reply from " + name}}}})
+                "content": {"type": "text",
+                    "text": "Reply from " + name + "; model=" + current_model}}}})
         result = {"stopReason": "end_turn"}
     else:
         continue
@@ -48,17 +53,17 @@ for line in sys.stdin:
 """
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="module", params=["empty-server", "conflicting-server-default"])
 def acp_server(
     tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[tuple[httpx.Client, str, Path]]:
+    request: pytest.FixtureRequest,
+) -> Iterator[tuple[httpx.Client, str, Path, bool]]:
     """Run real server/runner processes with different ACP configurations."""
     root = tmp_path_factory.mktemp("acp-selection")
     server_config = root / "server-config"
     runner_config = root / "runner-config"
     for config in (server_config, runner_config):
         config.mkdir()
-    (server_config / "config.yaml").write_text("{}\n")
     executable = root / "agent.py"
     executable.write_text(_AGENT)
     launches = root / "launches.txt"
@@ -71,14 +76,40 @@ def acp_server(
         }
         for name in ("Gemini", "Goose")
     ]
-    (runner_config / "config.yaml").write_text(yaml.safe_dump({"acp": {"agents": entries}}))
+    server_settings: dict = {}
+    runner_settings: dict = {"acp": {"agents": entries}}
+    executor: dict = {"harness": "openai-agents", "model": "gpt-4o"}
+    if request.param == "conflicting-server-default":
+        provider = {
+            "kind": "gateway",
+            "openai": {
+                "base_url": "https://unused.example.invalid/v1",
+                "api_key": "unused-test-key",
+                "models": {"default": "goose-model", "alternate": "gemini-model"},
+            },
+        }
+        server_settings = {
+            "providers": {"curated": provider},
+            "acp": {
+                "agents": [
+                    {"name": name, "command": "must-not-run", "model": "unlisted-server-model"}
+                    for name in ("Gemini", "Goose")
+                ]
+            },
+        }
+        runner_settings["providers"] = {"curated": provider}
+        for entry in entries:
+            entry["model"] = entry["name"].lower() + "-model"
+        executor = {"harness": "openai-agents", "auth": {"type": "provider", "name": "curated"}}
+    (server_config / "config.yaml").write_text(yaml.safe_dump(server_settings))
+    (runner_config / "config.yaml").write_text(yaml.safe_dump(runner_settings))
     spec = root / "selection.yaml"
     spec.write_text(
         yaml.safe_dump(
             {
                 "name": "selection",
                 "prompt": "Say hello",
-                "executor": {"harness": "openai-agents", "model": "gpt-4o"},
+                "executor": executor,
             }
         )
     )
@@ -162,7 +193,7 @@ def acp_server(
                     pytest.fail(
                         (root / "server.log").read_text() + (root / "runner.log").read_text()
                     )
-                yield client, runner_id, launches
+                yield client, runner_id, launches, request.param == "conflicting-server-default"
         finally:
             for process in reversed(processes):
                 process.terminate()
@@ -191,7 +222,7 @@ def _wait_for_reply(client: httpx.Client, session: str, count: int) -> dict:
         replies = [
             i for i in items if i["type"] == "message" and i["data"].get("role") == "assistant"
         ]
-        if snapshot["status"] == "failed" or (
+        if (snapshot["status"] == "failed" and snapshot.get("last_task_error")) or (
             len(replies) >= count and snapshot["status"] == "idle"
         ):
             return snapshot
@@ -203,9 +234,9 @@ def _wait_for_reply(client: httpx.Client, session: str, count: int) -> dict:
     "override, expected", [("acp:goose", "Goose"), ("acp", "Gemini"), ("acp:missing", None)]
 )
 def test_acp_choice_is_resolved_on_runner(
-    acp_server: tuple[httpx.Client, str, Path], override: str, expected: str | None
+    acp_server: tuple[httpx.Client, str, Path, bool], override: str, expected: str | None
 ) -> None:
-    client, runner_id, launches = acp_server
+    client, runner_id, launches, has_model_policy = acp_server
     agents = client.get("/v1/agents").json()["data"]
     agent = next(a for a in agents if a["name"] == "selection")
     before = launches.read_text() if launches.exists() else ""
@@ -242,6 +273,10 @@ def test_acp_choice_is_resolved_on_runner(
             ]
             assert len(replies) == turn, items
             assert all(f"Reply from {expected}" in json.dumps(i) for i in replies), items
+            if has_model_policy:
+                assert all(f"model={expected.lower()}-model" in json.dumps(i) for i in replies), (
+                    items
+                )
         assert client.get(f"/v1/sessions/{session}").json()["harness"] == override
     finally:
         client.delete(f"/v1/sessions/{session}").raise_for_status()

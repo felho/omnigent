@@ -402,3 +402,78 @@ async def test_rejects_malformed_acp_selection(client: httpx.AsyncClient, overri
     )
     assert response.status_code == 400, response.text
     assert "invalid ACP agent identifier" in response.text
+
+
+@pytest.mark.parametrize("extra", [0, 1, 100])
+@pytest.mark.parametrize("with_other_overrides", [False, True])
+@pytest.mark.parametrize("seed_effort", [False, True])
+async def test_override_storage_limit_is_checked_before_create(
+    client: httpx.AsyncClient, extra: int, with_other_overrides: bool, seed_effort: bool
+) -> None:
+    import json
+
+    from omnigent.db.db_models import SqlConversation
+    from omnigent.runtime import get_conversation_store
+
+    executor = {"type": "omnigent", "config": {"harness": "claude-sdk"}}
+    if seed_effort:
+        executor["reasoning_effort"] = "high"
+    agent = await create_test_agent(client, executor=executor)
+    overrides = {"harness_override": "acp:"}
+    if seed_effort:
+        overrides["reasoning_effort"] = "high"
+    if with_other_overrides:
+        overrides.update(
+            {
+                "model_override": "model-" + "a" * 120,
+                "reasoning_effort": "high",
+                "cost_control_mode_override": "off",
+                "subagent_routing_override": "on",
+            }
+        )
+    limit = SqlConversation.__table__.c.session_overrides.type.length
+    overhead = len(json.dumps(overrides, separators=(",", ":")))
+    overrides["harness_override"] += "a" * (limit - overhead + extra)
+    store = get_conversation_store()
+    before = {conv.id for conv in store.list_conversations().data}
+    requested = dict(overrides)
+    if seed_effort:
+        requested.pop("reasoning_effort", None)
+    response = await client.post("/v1/sessions", json={"agent_id": agent["id"], **requested})
+    after = {conv.id for conv in store.list_conversations().data}
+    if extra:
+        assert after == before, "Oversized input left a persisted session"
+        assert response.status_code == 400, response.text
+        assert "session overrides" in response.text.lower()
+    else:
+        assert response.status_code == 201, response.text
+        assert after - before == {response.json()["id"]}
+        assert response.json()["harness"] == overrides["harness_override"]
+
+
+async def test_override_growth_rejects_patch_without_mutation(client: httpx.AsyncClient) -> None:
+    import json
+
+    from omnigent.db.db_models import SqlConversation
+    from omnigent.runtime import get_conversation_store
+
+    agent = await create_test_agent(client)
+    limit = SqlConversation.__table__.c.session_overrides.type.length
+    harness = "acp:" + "a" * (
+        limit - len(json.dumps({"harness_override": "acp:"}, separators=(",", ":")))
+    )
+    created = await client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "harness_override": harness}
+    )
+    assert created.status_code == 201, created.text
+    session = created.json()["id"]
+    response = await client.patch(
+        f"/v1/sessions/{session}",
+        json={"model_override": "another-model", "title": "must not persist"},
+    )
+    assert response.status_code == 400, response.text
+    assert "session overrides" in response.text.lower()
+    conv = get_conversation_store().get_conversation(session)
+    assert conv.harness_override == harness
+    assert conv.model_override is None
+    assert conv.title != "must not persist"

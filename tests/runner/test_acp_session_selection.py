@@ -84,6 +84,10 @@ async def test_acp_selection_survives_init_and_turn_without_override(
                 and "not configured on this runner" in event["error"]["message"]
                 for event in statuses
             ), statuses
+            for _ in range(2):
+                snapshot = await client.get("/v1/sessions/selection")
+                assert snapshot.status_code == 200, snapshot.text
+                assert snapshot.json()["status"] == "failed"
             await client.delete("/v1/sessions/selection")
             return
         assert response.status_code == 201, response.text

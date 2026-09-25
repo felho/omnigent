@@ -4872,6 +4872,9 @@ def create_runner_app(
             )
         has_turn = session_id in _active_turns or process_manager.has_active_turn(session_id)
         status = "running" if has_turn else "idle"
+        # A failed setup has no active turn; retain its failure in server status probes.
+        if not has_turn and _native_pane_status.get(session_id) == "failed":
+            status = "failed"
         agent_id = _session_agent_ids.get(session_id)
         if agent_id is None:
             # An agent-cache reset retires the binding while the session

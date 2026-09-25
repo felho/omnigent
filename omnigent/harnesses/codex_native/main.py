@@ -13,6 +13,7 @@ import shutil
 import socket
 import time
 import uuid
+from collections import Counter
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -2226,9 +2227,22 @@ def _codex_rollout_records_from_session_items(
     seen_turn_ids: set[str] = set()
     open_function_calls: dict[str, _JsonObject] = {}
     interrupted_response_ids = _interrupted_response_ids_from_session_items(items)
+    remaining_function_outputs = _codex_function_output_counts(
+        items,
+        interrupted_response_ids=interrupted_response_ids,
+    )
     for index, item in enumerate(items):
         if _session_item_response_id(item) in interrupted_response_ids:
             continue
+        item_call_id = item.get("call_id")
+        if (
+            item.get("type") == "function_call_output"
+            and isinstance(item_call_id, str)
+            and item_call_id
+        ):
+            remaining_function_outputs[item_call_id] -= 1
+            if remaining_function_outputs[item_call_id] <= 0:
+                del remaining_function_outputs[item_call_id]
         # Compaction items carry the post-compaction context. Emit a
         # Compacted rollout record and discard all prior records — the
         # replacement_history replaces them.
@@ -2253,16 +2267,13 @@ def _codex_rollout_records_from_session_items(
                     and message.get("type") == "function_call"
                     and isinstance(message.get("call_id"), str)
                 }
-                future_output_call_ids = _codex_function_output_call_ids(
-                    items[index + 1 :],
-                    interrupted_response_ids=interrupted_response_ids,
-                )
                 # A tool can finish after the snapshot. Keep its open call so
                 # Codex does not discard the later output as an orphan.
                 replacement_history.extend(
                     payload
                     for call_id, payload in open_function_calls.items()
-                    if call_id in future_output_call_ids and call_id not in replacement_call_ids
+                    if call_id in remaining_function_outputs
+                    and call_id not in replacement_call_ids
                 )
                 compacted_payload: _JsonObject = {
                     "message": item.get("summary", ""),
@@ -2325,20 +2336,20 @@ def _codex_rollout_records_from_session_items(
     return records
 
 
-def _codex_function_output_call_ids(
+def _codex_function_output_counts(
     items: Sequence[_JsonObject],
     *,
     interrupted_response_ids: set[str],
-) -> set[str]:
-    """Return function call ids with outputs in the remaining resumed history."""
-    call_ids: set[str] = set()
+) -> Counter[str]:
+    """Count persisted outputs by call id, excluding interrupted responses."""
+    counts: Counter[str] = Counter()
     for item in items:
         if _session_item_response_id(item) in interrupted_response_ids:
             continue
         call_id = item.get("call_id")
         if item.get("type") == "function_call_output" and isinstance(call_id, str) and call_id:
-            call_ids.add(call_id)
-    return call_ids
+            counts[call_id] += 1
+    return counts
 
 
 def _codex_open_function_calls(items: Sequence[object]) -> dict[str, _JsonObject]:

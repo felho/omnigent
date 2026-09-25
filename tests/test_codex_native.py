@@ -12309,6 +12309,73 @@ def test_rollout_records_do_not_duplicate_function_call_in_compaction() -> None:
     ] == ["call_slow"]
 
 
+def test_rollout_records_preserve_function_call_across_repeated_compactions() -> None:
+    """An open call survives every compaction before its delayed output."""
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            {
+                "id": "fc_slow",
+                "response_id": "codex_turn_slow",
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": '{"cmd":"slow-command"}',
+                "call_id": "call_slow",
+            },
+            {
+                "id": "cmp_1",
+                "response_id": "compact_1",
+                "type": "compaction",
+                "summary": "slow command still running",
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "run it"}],
+                    }
+                ],
+            },
+            {
+                "id": "cmp_2",
+                "response_id": "compact_2",
+                "type": "compaction",
+                "summary": "slow command is still running",
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "run it"}],
+                    }
+                ],
+            },
+            {
+                "id": "fco_slow",
+                "response_id": "codex_turn_slow",
+                "type": "function_call_output",
+                "call_id": "call_slow",
+                "output": "finished after both compactions",
+            },
+        ],
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.154.0",
+    )
+
+    compacted_records = [record for record in records if record["type"] == "compacted"]
+    assert len(compacted_records) == 1
+    replacement_history = compacted_records[0]["payload"]["replacement_history"]
+    assert [
+        item.get("call_id") for item in replacement_history if item.get("type") == "function_call"
+    ] == ["call_slow"]
+    assert [
+        record["payload"].get("call_id")
+        for record in records
+        if record["type"] == "response_item"
+        and record["payload"].get("type") == "function_call_output"
+    ] == ["call_slow"]
+
+
 def test_rollout_records_downgrade_image_stripped_by_compaction_storage() -> None:
     """A stored Responses image marker cannot poison Codex replacement history."""
     pixels = bytes(range(256)) * 3

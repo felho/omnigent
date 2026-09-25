@@ -62,7 +62,7 @@ export interface ImportSelection {
 /** Harness icons → Omnigent starfish, over the onboarding blob graphic. */
 function ImportBand() {
   return (
-    <div className="relative h-[200px] shrink-0 overflow-hidden">
+    <div className="relative h-[200px] max-h-[25vh] shrink-0 overflow-hidden">
       <BlobGraphic />
       <div className="absolute inset-0 flex items-center justify-center gap-5" aria-hidden="true">
         <div className="flex -space-x-1">
@@ -196,7 +196,7 @@ export function ImportContextModal({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         showCloseButton={false}
-        className="flex h-[640px] flex-col gap-0 overflow-hidden rounded-[20px] p-0 sm:max-w-[560px]"
+        className="flex h-[640px] max-h-[85vh] flex-col gap-0 overflow-hidden rounded-[20px] p-0 sm:max-w-[560px]"
       >
         {/* Content unmounts on close, so the selection resets to all-checked
             each time the modal reopens. */}
@@ -240,7 +240,8 @@ function ImportContextBody({
         </Button>
       </DialogClose>
 
-      <div className="flex min-h-0 flex-1 flex-col px-5 pt-5">
+      {/* On short viewports the body scrolls so the Confirm footer stays reachable. */}
+      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-5 pt-5">
         <div className="flex flex-col items-center gap-1 py-2 text-center">
           <DialogTitle className="min-h-0 pr-0 text-2xl leading-8 font-normal tracking-[-0.02em]">
             Your imports are ready
@@ -253,7 +254,7 @@ function ImportContextBody({
         <Tabs
           defaultValue="credentials"
           componentId="onboarding.import.tabs"
-          className="mt-5 min-h-0 flex-1 gap-0"
+          className="mt-5 min-h-36 flex-1 gap-0"
         >
           <TabsList
             variant="line"

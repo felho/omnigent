@@ -208,3 +208,34 @@ describe("ImportContextModal – close button", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 });
+
+describe("ImportContextModal – checkbox identity", () => {
+  it("toggles only the clicked row when item ids differ only by punctuation", () => {
+    const context: ImportContext = {
+      credentials: [],
+      mcps: [
+        { id: "cursor:plugin-foo", name: "plugin-foo", harness: "cursor" },
+        { id: "cursor:plugin:foo", name: "plugin:foo", harness: "cursor" },
+      ],
+      skills: [],
+    };
+    const onConfirm = vi.fn();
+    render(
+      <ImportContextModal open onOpenChange={vi.fn()} context={context} onConfirm={onConfirm} />,
+    );
+
+    switchTab("MCPs");
+    fireEvent.click(screen.getByText("plugin:foo"));
+
+    expect(screen.getByRole("checkbox", { name: "plugin-foo" })).toHaveAttribute(
+      "data-state",
+      "checked",
+    );
+    expect(screen.getByRole("checkbox", { name: "plugin:foo" })).toHaveAttribute(
+      "data-state",
+      "unchecked",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    expect(onConfirm).toHaveBeenCalledWith({ mcps: ["cursor:plugin-foo"], skills: [] });
+  });
+});
